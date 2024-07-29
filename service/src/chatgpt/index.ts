@@ -50,12 +50,6 @@ export async function initApi(key: KeyConfig, {
     apiKey: key.key,
   })
   const messages: OpenAI.ChatCompletionMessageParam[] = []
-  if (systemMessage) {
-    messages.push({
-      role: 'system',
-      content: systemMessage,
-    })
-  }
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId)
       break
@@ -68,6 +62,13 @@ export async function initApi(key: KeyConfig, {
     })
     lastMessageId = message.parentMessageId
   }
+  if (systemMessage) {
+    messages.push({
+      role: 'system',
+      content: systemMessage,
+    })
+  }
+  messages.reverse()
   messages.push({
     role: 'user',
     content,
@@ -133,6 +134,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       systemMessage,
       lastMessageId: lastContext.parentMessageId,
     })
+    processThreads.push({ userId, abort, messageId })
 
     let text = ''
     api.on('chunk', async (chunk) => {
@@ -145,7 +147,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         parentMessageId: lastContext.parentMessageId,
       })
     })
-    processThreads.push({ userId, abort, messageId })
 
     const response = await api.finalChatCompletion()
 
@@ -224,33 +225,6 @@ async function chatConfig() {
     data: config,
   })
 }
-
-// export async function setupProxy(options: ChatGPTAPIOptions | ChatGPTUnofficialProxyAPIOptions) {
-//   const config = await getCacheConfig()
-//   if (isNotEmptyString(config.socksProxy)) {
-//     const agent = new SocksProxyAgent({
-//       hostname: config.socksProxy.split(':')[0],
-//       port: Number.parseInt(config.socksProxy.split(':')[1]),
-//       userId: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[0] : undefined,
-//       password: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[1] : undefined,
-
-//     })
-//     options.fetch = (url, options) => {
-//       return fetch(url, { agent, ...options })
-//     }
-//   }
-//   else {
-//     if (isNotEmptyString(config.httpsProxy)) {
-//       const httpsProxy = config.httpsProxy
-//       if (httpsProxy) {
-//         const agent = new HttpsProxyAgent(httpsProxy)
-//         options.fetch = (url, options) => {
-//           return fetch(url, { agent, ...options })
-//         }
-//       }
-//     }
-//   }
-// }
 
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
