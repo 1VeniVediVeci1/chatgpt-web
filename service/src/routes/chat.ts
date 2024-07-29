@@ -3,7 +3,7 @@ import type { TiktokenModel } from 'gpt-token'
 import { textTokens } from 'gpt-token'
 import Router from 'express'
 import type OpenAI from 'openai'
-import type { ChatMessage } from 'src/chatgpt/types'
+import type { ChatMessage, ChatResponse } from 'src/chatgpt/types'
 import { limiter } from '../middleware/limiter'
 import { abortChatProcess, chatReplyProcess, containsSensitiveWords } from '../chatgpt'
 import { auth } from '../middleware/auth'
@@ -234,7 +234,11 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   const model = room.chatModel
 
   let lastResponse
-  let result
+  let result: null | {
+    message: string
+    data: ChatResponse
+    status: string
+  }
   let message: ChatInfo
   let user = await getUserById(userId)
   try {
@@ -299,8 +303,8 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
         result.data.detail = {}
       result.data.detail.usage = new UsageResponse()
       // if no usage data, calculate using Tiktoken library
-      result.data.detail.usage.prompt_tokens = textTokens(prompt, model as TiktokenModel)
-      result.data.detail.usage.completion_tokens = textTokens(result.data.text, model as TiktokenModel)
+      result.data.detail.usage.prompt_tokens = textTokens(prompt, 'gpt-3.5-turbo' as TiktokenModel)
+      result.data.detail.usage.completion_tokens = textTokens(result.data.text, 'gpt-3.5-turbo' as TiktokenModel)
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
@@ -315,7 +319,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       if (result == null || result === undefined || result.status !== 'Success') {
         if (result && result.status !== 'Success')
           lastResponse = { text: result.message }
-        result = { data: lastResponse }
+        result = { data: lastResponse, message: lastResponse.text, status: 'Fail' }
       }
 
       if (result.data === undefined)
@@ -343,7 +347,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       }
 
       if (result.data.detail?.usage) {
-        await insertChatUsage(new ObjectId(req.headers.userId),
+        await insertChatUsage(ObjectId.createFromHexString(req.headers.userId),
           roomId,
           message._id,
           result.data.id,

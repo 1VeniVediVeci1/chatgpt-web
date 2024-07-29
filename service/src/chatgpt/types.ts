@@ -1,6 +1,6 @@
 import type OpenAI from 'openai'
 import type { ChatCompletionChunk, ChatCompletionRole } from 'openai/resources'
-import type { ChatRoom, UserInfo } from 'src/storage/model'
+import type { ChatRoom, UsageResponse, UserInfo } from 'src/storage/model'
 
 export interface ChatMessage {
   id: string
@@ -32,3 +32,11 @@ export interface BalanceResponse {
   total_usage: number
 }
 export type MessageContent = string | Array<OpenAI.ChatCompletionContentPart>
+
+export type ChatResponse = OpenAI.ChatCompletion & {
+  text: string
+  detail?: {
+    usage?: UsageResponse
+  }
+  conversationId?: string
+}

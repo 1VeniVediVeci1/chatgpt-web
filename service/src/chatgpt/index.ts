@@ -11,7 +11,7 @@ import { sendResponse } from '../utils'
 import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { JWT, ModelConfig } from '../types'
 import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
-import type { ChatMessage, MessageContent, RequestOptions } from './types'
+import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
 
 dotenv.config()
 
@@ -89,7 +89,7 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
-async function chatReplyProcess(options: RequestOptions) {
+async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const userId = options.user._id.toString()
@@ -149,7 +149,19 @@ async function chatReplyProcess(options: RequestOptions) {
 
     const response = await api.finalChatCompletion()
 
-    return sendResponse({ type: 'Success', data: response })
+    return sendResponse({
+      type: 'Success',
+      data: {
+        ...response,
+        text,
+        detail: {
+          usage: {
+            ...response.usage,
+            estimated: false,
+          },
+        },
+      },
+    })
   }
   catch (error: any) {
     const code = error.statusCode
