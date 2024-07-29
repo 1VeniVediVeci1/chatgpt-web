@@ -12,7 +12,7 @@ const chatStore = useChatStore()
 const currentChatHistory = computed(() => chatStore.getChatHistoryByCurrentActive)
 const ms = useMessage()
 const testing = ref(false)
-const title = `Prompt For [${currentChatHistory.value?.title}]`
+const title = `系统提示词 [${currentChatHistory.value?.title}]`
 
 interface Props {
   visible: boolean

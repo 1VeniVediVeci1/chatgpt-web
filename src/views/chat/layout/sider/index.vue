@@ -6,7 +6,7 @@ import List from './List.vue'
 import Footer from './Footer.vue'
 import { useAppStore, useAuthStore, useChatStore } from '@/store'
 import { useBasicLayout } from '@/hooks/useBasicLayout'
-import { GithubSite, PromptStore, Watermark } from '@/components/common'
+import { PromptStore, Watermark } from '@/components/common'
 import { fetchAnnouncement } from '@/api'
 import type { AnnounceConfig } from '@/components/common/Setting/model'
 
@@ -133,7 +133,7 @@ onMounted(async () => {
         </div>
       </main>
       <Footer />
-      <GithubSite class="flex-col-2 text-center m-0" />
+      <!-- <GithubSite class="flex-col-2 text-center m-0" /> -->
     </div>
   </NLayoutSider>
   <template v-if="isMobile">

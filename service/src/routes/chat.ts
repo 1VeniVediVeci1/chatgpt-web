@@ -250,7 +250,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       // If global usage count limit is enabled, check can use amount before process chat.
       if (config.siteConfig?.usageCountLimit) {
         const useAmount = user ? (user.useAmount ?? 0) : 0
-        if (Number(useAmount) <= 0 && user.limit_switch) {
+        if (useAmount <= 0 && user.limit_switch) {
           res.send({ status: 'Fail', message: '提问次数用完啦 | Question limit reached', data: null })
           return
         }

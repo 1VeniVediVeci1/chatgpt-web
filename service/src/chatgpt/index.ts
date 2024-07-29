@@ -137,8 +137,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     processThreads.push({ userId, abort, messageId })
 
     let text = ''
+    let chatIdRes = null
+    let modelRes = ''
+
     api.on('chunk', async (chunk) => {
+      // Fix many model responses, do not include `finish_reason: 'stop'`
+      if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
+        console.error('[chunk] unknown chunk', chunk)
+        return
+      }
+
       text += chunk.choices[0]?.delta.content ?? ''
+      chatIdRes = chunk.id
+      modelRes = chunk.model
+
+      console.warn('[chunk]', chunk)
       process?.({
         ...chunk,
         text,
@@ -148,21 +161,48 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     })
 
-    const response = await api.finalChatCompletion()
-
-    return sendResponse({
-      type: 'Success',
-      data: {
-        ...response,
-        text,
-        detail: {
-          usage: {
-            ...response.usage,
-            estimated: false,
+    try {
+      const response = await api.finalChatCompletion()
+      console.warn('[final]', response)
+      return sendResponse({
+        type: 'Success',
+        data: {
+          ...response,
+          text,
+          detail: {
+            usage: {
+              ...response.usage,
+              estimated: false,
+            },
           },
+          conversationId: lastContext.conversationId,
         },
-      },
-    })
+      })
+    }
+    catch (error: any) {
+      console.error('Error:', error)
+      return sendResponse({
+        type: 'Success',
+        data: {
+          object: 'chat.completion',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: text,
+            },
+            finish_reason: 'stop',
+            index: 0,
+            logprobs: null,
+          }],
+          created: Date.now(),
+          conversationId: lastContext.conversationId,
+          model: modelRes,
+          text,
+          id: chatIdRes,
+          detail: {},
+        },
+      })
+    }
   }
   catch (error: any) {
     const code = error.statusCode

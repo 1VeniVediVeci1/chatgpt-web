@@ -76,15 +76,18 @@ async function updateUserInfo(options: Partial<UserInfo>) {
   await userStore.updateUserInfo(true, options)
   ms.success(`更新个人信息 ${t('common.success')}`)
 }
+
 // 更新并兑换，这里图页面设计方便暂时先放一起了，下方页面新增了两个输入框
 async function redeemandupdateUserInfo(options: { avatar: string; name: string; description: string; useAmount: number; redeemCardNo: string }) {
   const { avatar, name, description, useAmount, redeemCardNo } = options
   let add_amt = 0
   let message = ''
   try {
-    const res = await decode_redeemcard(redeemCardNo)
-    add_amt = Number(res.data)
-    message = res.message ?? ''
+    if (redeemCardNo) {
+      const res = await decode_redeemcard(redeemCardNo)
+      add_amt = Number.parseInt(res.data)
+      message = res.message ?? ''
+    }
   }
   catch (error: any) {
     add_amt = 0
@@ -95,7 +98,7 @@ async function redeemandupdateUserInfo(options: { avatar: string; name: string; 
 
   await updateUserInfo(new_options)
   userStore.readUserAmt()
-  ms.success(`兑换码：${message},本次充值${add_amt.toString()}次，总计${new_useAmount.toString()}次`)
+  ms.success(`兑换码：${message}，本次充值 ${add_amt.toString()} 次，总计 ${new_useAmount.toString()} 次`)
 }
 
 async function updateUserChatModel(chatModel: string) {
