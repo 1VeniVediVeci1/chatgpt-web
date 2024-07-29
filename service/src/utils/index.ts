@@ -1,4 +1,4 @@
-interface SendResponseOptions<T = any> {
+export interface SendResponseOptions<T = any> {
   type: 'Success' | 'Fail'
   message?: string
   data?: T

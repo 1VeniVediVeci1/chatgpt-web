@@ -2,6 +2,7 @@
   "name": "chatgpt-web",
   "version": "2.13.3",
   "private": false,
+  "packageManager": "pnpm@9.5.0",
   "description": "ChatGPT Web",
   "author": "ChatGPT Web Contributors <dev@chatgpt-web.dev>",
   "keywords": [

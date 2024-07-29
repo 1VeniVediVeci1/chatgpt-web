@@ -1,9 +1,5 @@
 import * as dotenv from 'dotenv'
-import type { ChatGPTAPIOptions, ChatMessage, SendMessageOptions } from 'chatgpt'
-import { ChatGPTAPI, ChatGPTUnofficialProxyAPI } from 'chatgpt'
-import { SocksProxyAgent } from 'socks-proxy-agent'
-import httpsProxyAgent from 'https-proxy-agent'
-import fetch from 'node-fetch'
+import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
@@ -13,117 +9,86 @@ import { textAuditServices } from '../utils/textAudit'
 import { getCacheApiKeys, getCacheConfig, getOriginConfig } from '../storage/config'
 import { sendResponse } from '../utils'
 import { hasAnyRole, isNotEmptyString } from '../utils/is'
-import type { ChatContext, ChatGPTUnofficialProxyAPIOptions, JWT, ModelConfig } from '../types'
-import { getChatByMessageId, updateRoomAccountId, updateRoomChatModel } from '../storage/mongo'
-import type { RequestOptions } from './types'
-
-const { HttpsProxyAgent } = httpsProxyAgent
+import type { JWT, ModelConfig } from '../types'
+import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
+import type { ChatMessage, MessageContent, RequestOptions } from './types'
 
 dotenv.config()
 
 const ErrorCodeMessage: Record<string, string> = {
-  401: '[OpenAI] 提供错误的API密钥 | Incorrect API key provided',
-  403: '[OpenAI] 服务器拒绝访问，请稍后再试 | Server refused to access, please try again later',
-  502: '[OpenAI] 错误的网关 |  Bad Gateway',
-  503: '[OpenAI] 服务器繁忙，请稍后再试 | Server is busy, please try again later',
-  504: '[OpenAI] 网关超时 | Gateway Time-out',
-  500: '[OpenAI] 服务器繁忙，请稍后再试 | Internal Server Error',
+  401: '提供错误的API密钥 | Incorrect API key provided',
+  403: '服务器拒绝访问，请稍后再试 | Server refused to access, please try again later',
+  502: '错误的网关 |  Bad Gateway',
+  503: '服务器繁忙，请稍后再试 | Server is busy, please try again later',
+  504: '网关超时 | Gateway Time-out',
+  500: '服务器繁忙，请稍后再试 | Internal Server Error',
 }
 
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-export async function initApi(key: KeyConfig, chatModel: string, maxContextCount: number) {
-  // More Info: https://github.com/transitive-bullshit/chatgpt-api
-
+export async function initApi(key: KeyConfig, {
+  model,
+  maxContextCount,
+  temperature,
+  top_p,
+  abortSignal,
+  content,
+  systemMessage,
+  lastMessageId,
+}: Pick<OpenAI.ChatCompletionCreateParams, 'temperature' | 'model' | 'top_p'> & {
+  maxContextCount: number
+  content: MessageContent
+  abortSignal?: AbortSignal
+  systemMessage?: string
+  lastMessageId?: string
+}) {
   const config = await getCacheConfig()
-  const model = chatModel as string
-
-  if (key.keyModel === 'ChatGPTAPI') {
-    const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
-
-    let contextCount = 0
-    const options: ChatGPTAPIOptions = {
-      apiKey: key.key,
-      completionParams: { model },
-      debug: !config.apiDisableDebug,
-      messageStore: undefined,
-      getMessageById: async (id) => {
-        if (contextCount++ >= maxContextCount)
-          return null
-        return await getMessageById(id)
-      },
-    }
-
-    // Set the token limits based on the model's type. This is because different models have different token limits.
-    // The token limit includes the token count from both the message array sent and the model response.
-
-    // Check if the model type is GPT-4-turbo or newer
-    if (model.toLowerCase().includes('gpt-4o') || model.toLowerCase().includes('gpt-4-turbo') || model.toLowerCase().includes('-preview')) {
-      // If it's a 'gpt-4o'/'gpt-4-turbo'/'xxxx-preview' model, set the maxModelTokens to 128000
-      options.maxModelTokens = 128000
-      options.maxResponseTokens = 4096
-    }
-    else if (model.toLowerCase().includes('gpt-4')) {
-      // If it's a 'gpt-4' model, set the maxModelTokens and maxResponseTokens to 8192 and 2048 respectively
-      options.maxModelTokens = 8192
-      options.maxResponseTokens = 2048
-    }
-    // Check if the model type includes 'gpt-3.5-turbo'
-    else if (model.toLowerCase().includes('gpt-3.5-turbo-instruct') || model.toLowerCase().includes('gpt-3.5-turbo-0613')) {
-      // If it's a old 'gpt-3.5-turbo' model, set the maxModelTokens to 4096 and maxResponseTokens to 1024
-      options.maxModelTokens = 4096
-      options.maxResponseTokens = 1024
-    }
-    // Check if the model type includes 'gpt-3.5-turbo'
-    else if (model.toLowerCase().includes('gpt-3.5-turbo')) {
-      // If it's a 'gpt-3.5-turbo' model, set the maxModelTokens to 16385 and maxResponseTokens to 4096
-      options.maxModelTokens = 16385
-      options.maxResponseTokens = 4096
-    }
-    // Check if the model type includes '32k'
-    else if (model.toLowerCase().includes('32k')) {
-      // If it's a '32k' model, set the maxModelTokens to 32768 and maxResponseTokens to 8192
-      options.maxModelTokens = 32768
-      options.maxResponseTokens = 8192
-    }
-    // Check if the model type includes '16k'
-    else if (model.toLowerCase().includes('16k')) {
-      // If it's a '16k' model, set the maxModelTokens to 16385 and maxResponseTokens to 4096
-      options.maxModelTokens = 16385
-      options.maxResponseTokens = 4096
-    }
-    // If none of the above, use the default values
-    else {
-      options.maxModelTokens = 4096
-      options.maxResponseTokens = 1024
-    }
-
-    if (isNotEmptyString(OPENAI_API_BASE_URL))
-      options.apiBaseUrl = `${OPENAI_API_BASE_URL}/v1`
-
-    await setupProxy(options)
-
-    return new ChatGPTAPI({ ...options })
+  const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
+  const openai = new OpenAI({
+    baseURL: OPENAI_API_BASE_URL,
+    apiKey: key.key,
+  })
+  const messages: OpenAI.ChatCompletionMessageParam[] = []
+  if (systemMessage) {
+    messages.push({
+      role: 'system',
+      content: systemMessage,
+    })
   }
-  else {
-    const options: ChatGPTUnofficialProxyAPIOptions = {
-      accessToken: key.key,
-      apiReverseProxyUrl: isNotEmptyString(key.baseUrl)
-        ? key.baseUrl
-        : isNotEmptyString(config.reverseProxy)
-          ? config.reverseProxy
-          : 'https://ai.fakeopen.com/api/conversation',
-      model,
-      debug: !config.apiDisableDebug,
-    }
-
-    await setupProxy(options)
-
-    return new ChatGPTUnofficialProxyAPI({ ...options })
+  for (let i = 0; i < maxContextCount; i++) {
+    if (!lastMessageId)
+      break
+    const message = await getMessageById(lastMessageId)
+    if (!message)
+      break
+    messages.push({
+      role: message.role as any,
+      content: message.text,
+    })
+    lastMessageId = message.parentMessageId
   }
+  messages.push({
+    role: 'user',
+    content,
+  })
+  const options: OpenAI.ChatCompletionCreateParams = {
+    model,
+    temperature,
+    top_p,
+    stream: true,
+    stream_options: {
+      include_usage: true,
+    },
+    messages,
+  }
+  return openai.beta.chat.completions.stream(options, {
+    signal: abortSignal,
+  })
 }
+
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
+
 async function chatReplyProcess(options: RequestOptions) {
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
@@ -133,25 +98,11 @@ async function chatReplyProcess(options: RequestOptions) {
   if (key == null || key === undefined)
     throw new Error('没有对应的apikeys配置。请再试一次 | No available apikeys configuration. Please try again.')
 
-  if (key.keyModel === 'ChatGPTUnofficialProxyAPI') {
-    if (!options.room.accountId)
-      updateRoomAccountId(userId, options.room.roomId, getAccountId(key.key))
-
-    if (options.lastContext && ((options.lastContext.conversationId && !options.lastContext.parentMessageId) || (!options.lastContext.conversationId && options.lastContext.parentMessageId)))
-      throw new Error('无法在一个房间同时使用 AccessToken 以及 Api，请联系管理员，或新开聊天室进行对话 | Unable to use AccessToken and Api at the same time in the same room, please contact the administrator or open a new chat room for conversation')
-  }
-
   // Add Chat Record
   updateRoomChatModel(userId, options.room.roomId, model)
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
-  let content: string | {
-    type: string
-    text?: string
-    image_url?: {
-      url: string
-    }
-  }[] = message
+  let content: MessageContent = message
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     content = [
       {
@@ -169,33 +120,35 @@ async function chatReplyProcess(options: RequestOptions) {
     }
   }
 
+  const abort = new AbortController()
+
   try {
-    const timeoutMs = (await getCacheConfig()).timeoutMs
-    let options: SendMessageOptions = { timeoutMs }
-
-    if (key.keyModel === 'ChatGPTAPI') {
-      if (isNotEmptyString(systemMessage))
-        options.systemMessage = systemMessage
-      options.completionParams = { model, temperature, top_p }
-    }
-
-    if (lastContext != null) {
-      if (key.keyModel === 'ChatGPTAPI')
-        options.parentMessageId = lastContext.parentMessageId
-      else
-        options = { ...lastContext }
-    }
-    const api = await initApi(key, model, maxContextCount)
-
-    const abort = new AbortController()
-    options.abortSignal = abort.signal
-    processThreads.push({ userId, abort, messageId })
-    const response = await api.sendMessage(content, {
-      ...options,
-      onProgress: (partialResponse) => {
-        process?.(partialResponse)
-      },
+    const api = await initApi(key, {
+      model,
+      maxContextCount,
+      temperature,
+      top_p,
+      content,
+      abortSignal: abort.signal,
+      systemMessage,
+      lastMessageId: lastContext.parentMessageId,
     })
+
+    let text = ''
+    api.on('chunk', async (chunk) => {
+      text += chunk.choices[0]?.delta.content ?? ''
+      process?.({
+        ...chunk,
+        text,
+        role: chunk.choices[0]?.delta.role || 'assistant',
+        conversationId: lastContext.conversationId,
+        parentMessageId: lastContext.parentMessageId,
+      })
+    })
+    processThreads.push({ userId, abort, messageId })
+
+    const response = await api.finalChatCompletion()
+
     return sendResponse({ type: 'Success', data: response })
   }
   catch (error: any) {
@@ -260,32 +213,32 @@ async function chatConfig() {
   })
 }
 
-async function setupProxy(options: ChatGPTAPIOptions | ChatGPTUnofficialProxyAPIOptions) {
-  const config = await getCacheConfig()
-  if (isNotEmptyString(config.socksProxy)) {
-    const agent = new SocksProxyAgent({
-      hostname: config.socksProxy.split(':')[0],
-      port: Number.parseInt(config.socksProxy.split(':')[1]),
-      userId: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[0] : undefined,
-      password: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[1] : undefined,
+// export async function setupProxy(options: ChatGPTAPIOptions | ChatGPTUnofficialProxyAPIOptions) {
+//   const config = await getCacheConfig()
+//   if (isNotEmptyString(config.socksProxy)) {
+//     const agent = new SocksProxyAgent({
+//       hostname: config.socksProxy.split(':')[0],
+//       port: Number.parseInt(config.socksProxy.split(':')[1]),
+//       userId: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[0] : undefined,
+//       password: isNotEmptyString(config.socksAuth) ? config.socksAuth.split(':')[1] : undefined,
 
-    })
-    options.fetch = (url, options) => {
-      return fetch(url, { agent, ...options })
-    }
-  }
-  else {
-    if (isNotEmptyString(config.httpsProxy)) {
-      const httpsProxy = config.httpsProxy
-      if (httpsProxy) {
-        const agent = new HttpsProxyAgent(httpsProxy)
-        options.fetch = (url, options) => {
-          return fetch(url, { agent, ...options })
-        }
-      }
-    }
-  }
-}
+//     })
+//     options.fetch = (url, options) => {
+//       return fetch(url, { agent, ...options })
+//     }
+//   }
+//   else {
+//     if (isNotEmptyString(config.httpsProxy)) {
+//       const httpsProxy = config.httpsProxy
+//       if (httpsProxy) {
+//         const agent = new HttpsProxyAgent(httpsProxy)
+//         options.fetch = (url, options) => {
+//           return fetch(url, { agent, ...options })
+//         }
+//       }
+//     }
+//   }
+// }
 
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
@@ -303,13 +256,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
     }
     else {
       if (isPrompt) { // prompt
-        let content: string | {
-          type: string
-          text?: string
-          image_url?: {
-            url: string
-          }
-        }[] = chatInfo.prompt
+        let content: MessageContent = chatInfo.prompt
         if (chatInfo.images && chatInfo.images.length > 0) {
           content = [
             {
@@ -386,7 +333,5 @@ function getAccountId(accessToken: string): string {
     return ''
   }
 }
-
-export type { ChatContext, ChatMessage }
 
 export { chatReplyProcess, chatConfig, containsSensitiveWords }
