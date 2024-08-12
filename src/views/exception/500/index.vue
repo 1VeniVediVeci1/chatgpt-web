@@ -18,14 +18,14 @@ function goHome() {
           500
         </h2>
         <p class="text-base text-center text-slate-500 dark:text-slate-500">
-          Server error
+          服务器错误
         </p>
         <div class="flex items-center justify-center text-center">
           <Icon500 class="w-[300px]" />
         </div>
       </header>
       <NButton type="primary" @click="goHome">
-        Go to Home
+        返回首页
       </NButton>
     </div>
   </div>

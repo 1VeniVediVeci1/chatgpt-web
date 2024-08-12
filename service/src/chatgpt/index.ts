@@ -16,12 +16,12 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 dotenv.config()
 
 const ErrorCodeMessage: Record<string, string> = {
-  401: '提供错误的API密钥 | Incorrect API key provided',
-  403: '服务器拒绝访问，请稍后再试 | Server refused to access, please try again later',
-  502: '错误的网关 |  Bad Gateway',
-  503: '服务器繁忙，请稍后再试 | Server is busy, please try again later',
-  504: '网关超时 | Gateway Time-out',
-  500: '服务器繁忙，请稍后再试 | Internal Server Error',
+  401: '提供错误的API密钥',
+  403: '服务器拒绝访问，请稍后再试',
+  502: '错误的网关',
+  503: '服务器繁忙，请稍后再试',
+  504: '网关超时',
+  500: '服务器繁忙，请稍后再试',
 }
 
 let auditService: TextAuditService
@@ -83,7 +83,7 @@ export async function initApi(key: KeyConfig, {
     },
     messages,
   }
-  return openai.beta.chat.completions.stream(options, {
+  return openai.chat.completions.create(options, {
     signal: abortSignal,
   })
 }
@@ -97,7 +97,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
   const messageId = options.messageId
   if (key == null || key === undefined)
-    throw new Error('没有对应的apikeys配置。请再试一次 | No available apikeys configuration. Please try again.')
+    throw new Error('没有对应的 apikeys 配置，请再试一次。')
 
   // Add Chat Record
   updateRoomChatModel(userId, options.room.roomId, model)
@@ -139,8 +139,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let text = ''
     let chatIdRes = null
     let modelRes = ''
+    let usageRes: OpenAI.Completions.CompletionUsage
 
-    api.on('chunk', async (chunk) => {
+    for await (const chunk of api) {
       // Fix many model responses, do not include `finish_reason: 'stop'`
       if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
         console.error('[chunk] unknown chunk', chunk)
@@ -150,6 +151,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       text += chunk.choices[0]?.delta.content ?? ''
       chatIdRes = chunk.id
       modelRes = chunk.model
+      usageRes = usageRes || chunk.usage
 
       console.warn('[chunk]', chunk)
       process?.({
@@ -159,50 +161,33 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
       })
-    })
-
-    try {
-      const response = await api.finalChatCompletion()
-      console.warn('[final]', response)
-      return sendResponse({
-        type: 'Success',
-        data: {
-          ...response,
-          text,
-          detail: {
-            usage: {
-              ...response.usage,
-              estimated: false,
-            },
+    }
+    return sendResponse({
+      type: 'Success',
+      data: {
+        object: 'chat.completion',
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: text,
           },
-          conversationId: lastContext.conversationId,
+          finish_reason: 'stop',
+          index: 0,
+          logprobs: null,
+        }],
+        created: Date.now(),
+        conversationId: lastContext.conversationId,
+        model: modelRes,
+        text,
+        id: chatIdRes,
+        detail: {
+          usage: usageRes && {
+            ...usageRes,
+            estimated: false,
+          },
         },
-      })
-    }
-    catch (error: any) {
-      console.error('Error:', error)
-      return sendResponse({
-        type: 'Success',
-        data: {
-          object: 'chat.completion',
-          choices: [{
-            message: {
-              role: 'assistant',
-              content: text,
-            },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
-          created: Date.now(),
-          conversationId: lastContext.conversationId,
-          model: modelRes,
-          text,
-          id: chatIdRes,
-          detail: {},
-        },
-      })
-    }
+      },
+    })
   }
   catch (error: any) {
     const code = error.statusCode

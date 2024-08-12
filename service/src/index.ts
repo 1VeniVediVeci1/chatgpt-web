@@ -834,7 +834,7 @@ router.post('/setting-base', rootAuth, async (req, res) => {
     await updateConfig(thisConfig)
     clearConfigCache()
     const response = await chatConfig()
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: response.data })
+    res.send({ status: 'Success', message: '操作成功', data: response.data })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -849,7 +849,7 @@ router.post('/setting-site', rootAuth, async (req, res) => {
     thisConfig.siteConfig = config
     const result = await updateConfig(thisConfig)
     clearConfigCache()
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: result.siteConfig })
+    res.send({ status: 'Success', message: '操作成功', data: result.siteConfig })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -864,7 +864,7 @@ router.post('/setting-mail', rootAuth, async (req, res) => {
     thisConfig.mailConfig = config
     const result = await updateConfig(thisConfig)
     clearConfigCache()
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: result.mailConfig })
+    res.send({ status: 'Success', message: '操作成功', data: result.mailConfig })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -877,7 +877,7 @@ router.post('/mail-test', rootAuth, async (req, res) => {
     const userId = req.headers.userId as string
     const user = await getUserById(userId)
     await sendTestMail(user.email, config)
-    res.send({ status: 'Success', message: '发送成功 | Successfully', data: null })
+    res.send({ status: 'Success', message: '发送成功', data: null })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -891,7 +891,7 @@ router.post('/setting-announce', rootAuth, async (req, res) => {
     thisConfig.announceConfig = config
     const result = await updateConfig(thisConfig)
     clearConfigCache()
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: result.announceConfig })
+    res.send({ status: 'Success', message: '操作成功', data: result.announceConfig })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -901,7 +901,7 @@ router.post('/setting-announce', rootAuth, async (req, res) => {
 router.post('/announcement', async (req, res) => {
   try {
     const result = await getCacheConfig()
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: result.announceConfig })
+    res.send({ status: 'Success', message: '操作成功', data: result.announceConfig })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -918,7 +918,7 @@ router.post('/setting-audit', rootAuth, async (req, res) => {
     clearConfigCache()
     if (config.enabled)
       initAuditService(config)
-    res.send({ status: 'Success', message: '操作成功 | Successfully', data: result.auditConfig })
+    res.send({ status: 'Success', message: '操作成功', data: result.auditConfig })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -972,7 +972,7 @@ router.post('/setting-advanced', auth, async (req, res) => {
       config.top_p,
       config.maxContextCount,
     ))
-    res.send({ status: 'Success', message: '操作成功 | Successfully' })
+    res.send({ status: 'Success', message: '操作成功' })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -983,7 +983,7 @@ router.post('/setting-reset-advanced', auth, async (req, res) => {
   try {
     const userId = req.headers.userId.toString()
     await updateUserAdvancedConfig(userId, null)
-    res.send({ status: 'Success', message: '操作成功 | Successfully' })
+    res.send({ status: 'Success', message: '操作成功' })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
@@ -1019,7 +1019,7 @@ router.post('/setting-key-upsert', rootAuth, async (req, res) => {
       keyConfig._id = new ObjectId(keyConfig._id)
     await upsertKey(keyConfig)
     clearApiKeyCache()
-    res.send({ status: 'Success', message: '成功 | Successfully' })
+    res.send({ status: 'Success', message: '成功' })
   }
   catch (error) {
     res.send({ status: 'Fail', message: error.message, data: null })
