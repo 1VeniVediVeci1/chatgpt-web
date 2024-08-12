@@ -58,7 +58,7 @@ function readfile(file: Blob) {
   try {
     // const file = event.target.files[0]
     if (file) {
-      ms.info('生成预览中 | Generating Preview')
+      ms.info('生成预览中')
       const reader = new FileReader()
       reader.onload = (e) => {
         const contents = e.target?.result as string
@@ -67,11 +67,11 @@ function readfile(file: Blob) {
       reader.readAsText(file)
     }
     else {
-      ms.info('没有读取到文件 | No file find')
+      ms.info('没有读取到文件')
     }
   }
   catch (error: any) {
-    ms.info(`读取文件出错 | Error reading file | ${error.message}`)
+    ms.info(`读取文件出错：${error.message}`)
   }
 }
 

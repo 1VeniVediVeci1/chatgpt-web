@@ -60,7 +60,7 @@ async function handleSaveChatRoomPrompt() {
     <NInput
       :value="currentChatHistory && currentChatHistory.prompt"
       type="textarea"
-      :autosize="{ minRows: 4, maxRows: 10 }" placeholder="Prompt for this room, If empty will use Settings ->  Advanced -> Role" @input="(val) => { if (currentChatHistory) currentChatHistory.prompt = val }"
+      :autosize="{ minRows: 4, maxRows: 10 }" placeholder="当前对话的系统级别提示词，如果为空则默认为 设置 -> 高级 -> 角色设定" @input="(val) => { if (currentChatHistory) currentChatHistory.prompt = val }"
     />
     <template #footer>
       <NSpace justify="end">

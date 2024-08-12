@@ -86,7 +86,7 @@ function removeCopyEvents() {
   if (textRef.value) {
     const copyBtn = textRef.value.querySelectorAll('.code-block-header__copy')
     copyBtn.forEach((btn) => {
-      btn.removeEventListener('click', () => {})
+      btn.removeEventListener('click', () => { })
     })
   }
 }
@@ -108,7 +108,10 @@ onUnmounted(() => {
   <div class="text-black" :class="wrapClass">
     <div ref="textRef" class="leading-relaxed break-words">
       <div v-if="!inversion" class="flex items-end">
-        <div v-if="!asRawText" class="w-full markdown-body" :class="{ 'markdown-body-generate': loading }" v-html="text" />
+        <div
+          v-if="!asRawText" class="w-full markdown-body" :class="{ 'markdown-body-generate': loading }"
+          v-html="text"
+        />
         <div v-else class="w-full whitespace-pre-wrap" v-text="text" />
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />

@@ -1,5 +1,5 @@
-import type { FetchFn } from 'chatgpt'
 import type { JwtPayload } from 'jsonwebtoken'
+import type fetch from 'node-fetch'
 
 export interface RequestProps {
   roomId: number
@@ -24,7 +24,7 @@ export interface ChatGPTUnofficialProxyAPIOptions {
   model?: string
   debug?: boolean
   headers?: Record<string, string>
-  fetch?: FetchFn
+  fetch?: typeof fetch
 }
 
 export interface ModelConfig {
