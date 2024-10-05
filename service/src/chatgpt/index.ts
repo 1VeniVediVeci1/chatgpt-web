@@ -73,24 +73,28 @@ export async function initApi(key: KeyConfig, {
     role: 'user',
     content,
   })
+
+  // 判断模型是否为 o1，如果是，则禁用 stream 选项
+  const isO1Model = model.includes('o1')
+
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     top_p,
+    stream: !isO1Model,  // 如果是 o1 模型，则禁用流式传输
+    stream_options: isO1Model ? undefined : { include_usage: true },  // 只有在使用流式传输时才包含 stream_options
     messages,
   }
 
   if (!model.includes('o1')) {
     options.temperature = temperature
-    options.stream = true
-    options.stream_options = {
-      include_usage: true,
-    }
   }
 
   return openai.chat.completions.create(options, {
     signal: abortSignal,
   })
 }
+
+const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const model = options.room.chatModel
@@ -138,91 +142,58 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     })
     processThreads.push({ userId, abort, messageId })
 
-    if (model.includes('o1')) {
-      // 非流式处理 o1 模型
-      const response = await api
-      const text = response.choices[0]?.message.content || ''
-      return sendResponse({
-        type: 'Success',
-        data: {
-          object: 'chat.completion',
-          choices: [{
-            message: {
-              role: 'assistant',
-              content: text,
-            },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
-          created: Date.now(),
-          conversationId: lastContext.conversationId,
-          model: response.model,
-          text,
-          id: response.id,
-          detail: {
-            usage: response.usage && {
-              ...response.usage,
-              estimated: false,
-            },
-          },
-        },
-      })
-    } else {
-      // 流式处理其他模型
-      let text = ''
-      let chatIdRes = null
-      let modelRes = ''
-      let usageRes: OpenAI.Completions.CompletionUsage
+    let text = ''
+    let chatIdRes = null
+    let modelRes = ''
+    let usageRes: OpenAI.Completions.CompletionUsage
 
-      for await (const chunk of api) {
-        // Fix many model responses, do not include `finish_reason: 'stop'`
-        if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
-          console.error('[chunk] unknown chunk', chunk)
-          return
-        }
-
-        text += chunk.choices[0]?.delta.content ?? ''
-        chatIdRes = chunk.id
-        modelRes = chunk.model
-        usageRes = usageRes || chunk.usage
-
-        console.warn('[chunk]', chunk)
-        process?.({
-          ...chunk,
-          text,
-          role: chunk.choices[0]?.delta.role || 'assistant',
-          conversationId: lastContext.conversationId,
-          parentMessageId: lastContext.parentMessageId,
-        })
+    for await (const chunk of api) {
+      // Fix many model responses, do not include `finish_reason: 'stop'`
+      if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
+        console.error('[chunk] unknown chunk', chunk)
+        return
       }
-      return sendResponse({
-        type: 'Success',
-        data: {
-          object: 'chat.completion',
-          choices: [{
-            message: {
-              role: 'assistant',
-              content: text,
-            },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
-          created: Date.now(),
-          conversationId: lastContext.conversationId,
-          model: modelRes,
-          text,
-          id: chatIdRes,
-          detail: {
-            usage: usageRes && {
-              ...usageRes,
-              estimated: false,
-            },
-          },
-        },
+
+      text += chunk.choices[0]?.delta.content ?? ''
+      chatIdRes = chunk.id
+      modelRes = chunk.model
+      usageRes = usageRes || chunk.usage
+
+      console.warn('[chunk]', chunk)
+      process?.({
+        ...chunk,
+        text,
+        role: chunk.choices[0]?.delta.role || 'assistant',
+        conversationId: lastContext.conversationId,
+        parentMessageId: lastContext.parentMessageId,
       })
     }
+    return sendResponse({
+      type: 'Success',
+      data: {
+        object: 'chat.completion',
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: text,
+          },
+          finish_reason: 'stop',
+          index: 0,
+          logprobs: null,
+        }],
+        created: Date.now(),
+        conversationId: lastContext.conversationId,
+        model: modelRes,
+        text,
+        id: chatIdRes,
+        detail: {
+          usage: usageRes && {
+            ...usageRes,
+            estimated: false,
+          },
+        },
+      },
+    })
   }
   catch (error: any) {
     const code = error.statusCode
