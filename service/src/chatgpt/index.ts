@@ -100,7 +100,7 @@ export async function initApi(key: KeyConfig, {
   }
 
   // 否则，返回异步可迭代的流
-  return apiResponse as Stream<OpenAI.ChatCompletionChunk>
+  return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk> // 使用 AsyncIterable 代替 Stream
 }
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
@@ -165,7 +165,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       modelRes = completion.model
     } else {
       // 流式传输，逐块处理
-      for await (const chunk of api as Stream<OpenAI.ChatCompletionChunk>) {
+      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
         text += chunk.choices[0]?.delta.content ?? ''
         chatIdRes = chunk.id
         modelRes = chunk.model
