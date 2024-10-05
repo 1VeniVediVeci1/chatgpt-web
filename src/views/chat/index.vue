@@ -138,9 +138,41 @@ async function onConversation() {
   )
   scrollToBottom()
 
-  try {
-    let lastText = ''
-    const fetchChatAPIOnce = async () => {
+  // 修改后的 fetchChatAPIOnce 函数在这里使用
+  const fetchChatAPIOnce = async () => {
+    const isO1Model = currentChatModel.value && currentChatModel.value.includes('o1')
+
+    if (isO1Model) {
+      // 处理非流式传输的情况
+      const response = await fetchChatAPIProcess<Chat.ConversationResponse>({
+        roomId: +uuid,
+        uuid: chatUuid,
+        prompt: message,
+        uploadFileKeys,
+        options,
+        signal: controller.signal,
+      })
+
+      if (response && response.detail && response.detail.choices) {
+        const data = response.detail.choices[0]
+        // 处理完整的响应数据
+        updateChat(
+          +uuid,
+          dataSources.value.length - 1,
+          {
+            dateTime: new Date().toLocaleString(),
+            text: data.text || '',
+            inversion: false,
+            error: false,
+            loading: false,
+            conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+            requestOptions: { prompt: message, options: { ...options } },
+            usage: response.detail.usage,
+          },
+        )
+      }
+    } else {
+      // 处理流式传输的情况
       await fetchChatAPIProcess<Chat.ConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid,
@@ -151,11 +183,11 @@ async function onConversation() {
         onDownloadProgress: ({ event }) => {
           const xhr = event.target
           const { responseText } = xhr
-          // Always process the final line
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
-          if (lastIndex !== -1)
+          if (lastIndex !== -1) {
             chunk = responseText.substring(lastIndex)
+          }
           try {
             const data = JSON.parse(chunk)
             lastChatInfo = data
@@ -192,26 +224,21 @@ async function onConversation() {
             scrollToBottomIfAtBottom()
           }
           catch (error) {
-            //
+            console.error('Error parsing chunk:', error)
           }
         },
       })
-      updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
     }
+    updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
+  }
 
+  try {
     await fetchChatAPIOnce()
   }
   catch (error: any) {
     const errorMessage = error?.message ?? t('common.wrong')
-
     if (error.message === 'canceled') {
-      updateChatSome(
-        +uuid,
-        dataSources.value.length - 1,
-        {
-          loading: false,
-        },
-      )
+      updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
       scrollToBottomIfAtBottom()
       return
     }
