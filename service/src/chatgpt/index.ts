@@ -48,7 +48,7 @@ export async function initApi(key: KeyConfig, {
   const openai = new OpenAI({
     baseURL: OPENAI_API_BASE_URL,
     apiKey: key.key,
-    max_retries: 0,
+    maxRetries: 0,
   })
   const messages: OpenAI.ChatCompletionMessageParam[] = []
   for (let i = 0; i < maxContextCount; i++) {
