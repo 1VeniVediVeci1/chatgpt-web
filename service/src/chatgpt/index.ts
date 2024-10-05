@@ -89,9 +89,18 @@ export async function initApi(key: KeyConfig, {
     options.temperature = temperature
   }
 
-  return openai.chat.completions.create(options, {
+  // 根据是否使用流式传输返回不同的结果
+  const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
   })
+
+  // 如果不使用流式传输，直接返回响应
+  if (isO1Model) {
+    return apiResponse as OpenAI.ChatCompletion // 如果不是流式传输，直接返回完整响应
+  }
+
+  // 否则，返回异步可迭代的流
+  return apiResponse as Stream<OpenAI.ChatCompletionChunk>
 }
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
@@ -147,27 +156,32 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
 
-    for await (const chunk of api) {
-      // Fix many model responses, do not include `finish_reason: 'stop'`
-      if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
-        console.error('[chunk] unknown chunk', chunk)
-        return
+    // 如果是流式传输，使用 for await 迭代 response
+    if (model.includes('o1')) {
+      // 非流式传输，直接处理一次性响应
+      const completion = api as OpenAI.ChatCompletion
+      text = completion.choices[0].message.content
+      chatIdRes = completion.id
+      modelRes = completion.model
+    } else {
+      // 流式传输，逐块处理
+      for await (const chunk of api as Stream<OpenAI.ChatCompletionChunk>) {
+        text += chunk.choices[0]?.delta.content ?? ''
+        chatIdRes = chunk.id
+        modelRes = chunk.model
+        usageRes = usageRes || chunk.usage
+
+        console.warn('[chunk]', chunk)
+        process?.({
+          ...chunk,
+          text,
+          role: chunk.choices[0]?.delta.role || 'assistant',
+          conversationId: lastContext.conversationId,
+          parentMessageId: lastContext.parentMessageId,
+        })
       }
-
-      text += chunk.choices[0]?.delta.content ?? ''
-      chatIdRes = chunk.id
-      modelRes = chunk.model
-      usageRes = usageRes || chunk.usage
-
-      console.warn('[chunk]', chunk)
-      process?.({
-        ...chunk,
-        text,
-        role: chunk.choices[0]?.delta.role || 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
-      })
     }
+
     return sendResponse({
       type: 'Success',
       data: {
@@ -198,7 +212,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   catch (error: any) {
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
-      // access token  Only one message at a time
       if (options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
