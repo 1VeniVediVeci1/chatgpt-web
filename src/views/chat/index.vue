@@ -82,6 +82,11 @@ function handleSubmit() {
 
 const uploadFileKeysRef = ref<string[]>([])
 
+interface FetchChatAPIResponse {
+  data: Chat.ConversationResponse
+  // 其他属性根据实际情况添加
+}
+
 async function onConversation() {
   let message = prompt.value
 
@@ -142,7 +147,7 @@ async function onConversation() {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      if (!isO1Model.value) {  // 修改：仅在非 o1 模型下使用流式处理
+      if (!isO1Model.value) {  // 仅在非 o1 模型下使用流式处理
         await fetchChatAPIProcess<Chat.ConversationResponse>({
           roomId: +uuid,
           uuid: chatUuid,
@@ -159,15 +164,15 @@ async function onConversation() {
             if (lastIndex !== -1)
               chunk = responseText.substring(lastIndex)
             try {
-              const data = JSON.parse(chunk)
+              const data = JSON.parse(chunk) as Chat.ConversationResponse
               lastChatInfo = data
               const usage = (data.detail && data.detail.usage)
                 ? {
-                    completion_tokens: data.detail.usage.completion_tokens || null,
-                    prompt_tokens: data.detail.usage.prompt_tokens || null,
-                    total_tokens: data.detail.usage.total_tokens || null,
-                    estimated: data.detail.usage.estimated || null,
-                  }
+                  completion_tokens: data.detail.usage.completion_tokens || null,
+                  prompt_tokens: data.detail.usage.prompt_tokens || null,
+                  total_tokens: data.detail.usage.total_tokens || null,
+                  estimated: data.detail.usage.estimated || null,
+                }
                 : undefined
               updateChat(
                 +uuid,
@@ -208,21 +213,21 @@ async function onConversation() {
           options,
           signal: controller.signal,
           // 不传递 onDownloadProgress，因为是完整响应
-        })
+        }) as FetchChatAPIResponse  // 确保类型正确
 
         // 直接处理完整响应
-        lastChatInfo = response
-        const usage = response.detail?.usage
+        lastChatInfo = response.data
+        const usage = response.data.detail?.usage
         updateChat(
           +uuid,
           dataSources.value.length - 1,
           {
             dateTime: new Date().toLocaleString(),
-            text: response.choices[0].message.content,  // 假设 response.text 包含完整回答
+            text: response.data.choices[0].message.content,  // 假设 response.data.choices[0].message.content 包含完整回答
             inversion: false,
             error: false,
             loading: false,
-            conversationOptions: { conversationId: response.conversationId, parentMessageId: response.id },
+            conversationOptions: { conversationId: response.data.conversationId, parentMessageId: response.data.id },
             requestOptions: { prompt: message, options: { ...options } },
             usage,
           },
@@ -320,7 +325,7 @@ async function onRegenerate(index: number) {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      if (!isO1Model.value) {  // 修改：仅在非 o1 模型下使用流式处理
+      if (!isO1Model.value) {  // 仅在非 o1 模型下使用流式处理
         await fetchChatAPIProcess<Chat.ConversationResponse>({
           roomId: +uuid,
           uuid: chatUuid || Date.now(),
@@ -337,15 +342,15 @@ async function onRegenerate(index: number) {
             if (lastIndex !== -1)
               chunk = responseText.substring(lastIndex)
             try {
-              const data = JSON.parse(chunk)
+              const data = JSON.parse(chunk) as Chat.ConversationResponse
               lastChatInfo = data
               const usage = (data.detail && data.detail.usage)
                 ? {
-                    completion_tokens: data.detail.usage.completion_tokens || null,
-                    prompt_tokens: data.detail.usage.prompt_tokens || null,
-                    total_tokens: data.detail.usage.total_tokens || null,
-                    estimated: data.detail.usage.estimated || null,
-                  }
+                  completion_tokens: data.detail.usage.completion_tokens || null,
+                  prompt_tokens: data.detail.usage.prompt_tokens || null,
+                  total_tokens: data.detail.usage.total_tokens || null,
+                  estimated: data.detail.usage.estimated || null,
+                }
                 : undefined
               updateChat(
                 +uuid,
@@ -385,22 +390,22 @@ async function onRegenerate(index: number) {
           options,
           signal: controller.signal,
           // 不传递 onDownloadProgress，因为是完整响应
-        })
+        }) as FetchChatAPIResponse  // 确保类型正确
 
         // 直接处理完整响应
-        lastChatInfo = response
-        const usage = response.detail?.usage
+        lastChatInfo = response.data
+        const usage = response.data.detail?.usage
         updateChat(
           +uuid,
           index,
           {
             dateTime: new Date().toLocaleString(),
-            text: response.choices[0].message.content,  // 假设 response.text 包含完整回答
+            text: response.data.choices[0].message.content,  // 假设 response.data.choices[0].message.content 包含完整回答
             inversion: false,
             responseCount,
             error: false,
             loading: false,
-            conversationOptions: { conversationId: response.conversationId, parentMessageId: response.id },
+            conversationOptions: { conversationId: response.data.conversationId, parentMessageId: response.data.id },
             requestOptions: { prompt: message, options: { ...options } },
             usage,
           },
