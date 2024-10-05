@@ -76,23 +76,21 @@ export async function initApi(key: KeyConfig, {
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     top_p,
-    stream: true,
-    stream_options: {
-      include_usage: true,
-    },
     messages,
   }
 
   if (!model.includes('o1')) {
     options.temperature = temperature
+    options.stream = true
+    options.stream_options = {
+      include_usage: true,
+    }
   }
 
   return openai.chat.completions.create(options, {
     signal: abortSignal,
   })
 }
-
-const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const model = options.room.chatModel
@@ -140,6 +138,38 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     })
     processThreads.push({ userId, abort, messageId })
 
+    if (model.includes('o1')) {
+      // 非流式处理 o1 模型
+      const response = await api
+      const text = response.choices[0]?.message.content || ''
+      return sendResponse({
+        type: 'Success',
+        data: {
+          object: 'chat.completion',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: text,
+            },
+            finish_reason: 'stop',
+            index: 0,
+            logprobs: null,
+          }],
+          created: Date.now(),
+          conversationId: lastContext.conversationId,
+          model: response.model,
+          text,
+          id: response.id,
+          detail: {
+            usage: response.usage && {
+              ...response.usage,
+              estimated: false,
+            },
+          },
+        },
+      })
+    } else {
+      // 流式处理其他模型
     let text = ''
     let chatIdRes = null
     let modelRes = ''
