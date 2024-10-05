@@ -22,7 +22,7 @@ import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
 
-// 定义 `Usage` 接口
+// 定义 `ChatUsage` 接口
 interface ChatUsage {
   completion_tokens: number
   prompt_tokens: number
@@ -30,25 +30,20 @@ interface ChatUsage {
   estimated: boolean
 }
 
-// 定义 `ConversationResponse` 接口
+// 定义 `ChatConversationResponse` 接口
 interface ChatConversationResponse {
   text?: string
   conversationId?: string
   id?: string
   detail?: {
-    usage?: {
-      completion_tokens: number
-      prompt_tokens: number
-      total_tokens: number
-      estimated?: boolean
-    }
+    usage?: Partial<ChatUsage>
     choices?: Array<{
       finish_reason?: string
     }>
   }
 }
 
-// 定义 `ConversationRequest` 接口
+// 定义 `ChatConversationRequest` 接口
 interface ChatConversationRequest {
   roomId: number
   uuid: number
@@ -59,13 +54,21 @@ interface ChatConversationRequest {
     conversationId?: string
     parentMessageId?: string
   }
-  signal?: GenericAbortSignal
+  signal?: AbortSignal // 使用标准的 AbortSignal
 }
 
-// 定义 `History` 接口（根据需要补充其他属性）
-interface ChatHistory {
-  uuid: number
+// 定义 `History` 接口（根据实际情况补充其他属性）
+interface History {
+  title: string
+  isEdit: boolean
+  usingContext: boolean
   // 其他属性...
+}
+
+// 定义 `ChatHistory` 接口，确保与 `History` 兼容
+interface ChatHistory extends History {
+  uuid: number
+  // 其他必要属性
 }
 
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
@@ -204,7 +207,8 @@ async function onConversation() {
             try {
               const data = JSON.parse(line) as ChatConversationResponse
               lastChatInfo = data
-              const usageData = data.detail?.usage || {}
+
+              const usageData: Partial<ChatUsage> = data.detail?.usage ?? {}
               const usage: ChatUsage = {
                 completion_tokens: usageData.completion_tokens ?? 0,
                 prompt_tokens: usageData.prompt_tokens ?? 0,
@@ -232,7 +236,7 @@ async function onConversation() {
               scrollToBottomIfAtBottom()
             }
             catch (error) {
-              // 解析单个行错误，继续处理下一个
+              // 解析错误，继续处理
               console.error('解析数据块时出错:', error)
             }
           }
@@ -347,7 +351,8 @@ async function onRegenerate(index: number) {
             try {
               const data = JSON.parse(line) as ChatConversationResponse
               lastChatInfo = data
-              const usageData = data.detail?.usage || {}
+
+              const usageData: Partial<ChatUsage> = data.detail?.usage ?? {}
               const usage: ChatUsage = {
                 completion_tokens: usageData.completion_tokens ?? 0,
                 prompt_tokens: usageData.prompt_tokens ?? 0,
@@ -376,7 +381,7 @@ async function onRegenerate(index: number) {
               scrollToBottomIfAtBottom()
             }
             catch (error) {
-              // 解析单个行错误，继续处理下一个
+              // 解析错误，继续处理
               console.error('解析数据块时出错:', error)
             }
           }
@@ -423,6 +428,14 @@ async function onRegenerate(index: number) {
 
 async function onResponseHistory(index: number, historyIndex: number) {
   const chat = (await fetchChatResponseoHistory(+uuid, dataSources.value[index].uuid || Date.now(), historyIndex)).data
+  const usageData: Partial<ChatUsage> = chat.usage ?? {}
+  const usage: ChatUsage = {
+    completion_tokens: usageData.completion_tokens ?? 0,
+    prompt_tokens: usageData.prompt_tokens ?? 0,
+    total_tokens: usageData.total_tokens ?? 0,
+    estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false,
+  }
+
   updateChat(
     +uuid,
     index,
@@ -435,12 +448,7 @@ async function onResponseHistory(index: number, historyIndex: number) {
       loading: false,
       conversationOptions: chat.conversationOptions,
       requestOptions: { prompt: chat.requestOptions.prompt, options: { ...chat.requestOptions.options } },
-      usage: {
-        completion_tokens: chat.usage.completion_tokens ?? 0,
-        prompt_tokens: chat.usage.prompt_tokens ?? 0,
-        total_tokens: chat.usage.total_tokens ?? 0,
-        estimated: typeof chat.usage.estimated === 'boolean' ? chat.usage.estimated : false,
-      } as ChatUsage, // 强制转换为 ChatUsage 类型
+      usage,
     },
   )
 }
@@ -557,36 +565,39 @@ async function loadMoreMessage(event: any) {
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
 
   const lastId = chatStore.chat[chatIndex].data[0].uuid
-  await chatStore.syncChat({ uuid: +uuid } as ChatHistory, lastId, () => {
+  await chatStore.syncChat({ 
+    uuid: +uuid, 
+    title: '历史标题',          // 根据实际情况填写
+    isEdit: false,              // 根据实际情况设置
+    usingContext: true          // 根据实际情况设置
+  } as ChatHistory, lastId, () => {
     loadingms && loadingms.destroy()
     nextTick(() => scrollTo(event.target.scrollHeight - scrollPosition))
   }, () => {
-    loadingms = ms.loading(
-      '加载中...', {
-        duration: 0,
-      },
-    )
+    loadingms = ms.loading('加载中...', { duration: 0 })
   }, () => {
     allmsg && allmsg.destroy()
-    allmsg = ms.warning('没有更多了', {
-      duration: 1000,
-    })
+    allmsg = ms.warning('没有更多了', { duration: 1000 })
   })
 }
 
 const handleLoadMoreMessage = debounce(loadMoreMessage, 300)
-const handleSyncChat
-  = debounce(() => {
-    // 直接刷 极小概率不请求
-    chatStore.syncChat({ uuid: Number(uuid) } as ChatHistory, undefined, () => {
-      firstLoading.value = false
-      const scrollRef = document.querySelector('#scrollRef')
-      if (scrollRef)
-        nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
-      if (inputRef.value && !isMobile.value)
-        inputRef.value?.focus()
-    })
-  }, 200)
+const handleSyncChat = debounce(() => {
+  // 直接刷 极小概率不请求
+  chatStore.syncChat({ 
+    uuid: Number(uuid),
+    title: '当前聊天标题',        // 根据实际情况填写
+    isEdit: false,                // 根据实际情况设置
+    usingContext: true            // 根据实际情况设置
+  } as ChatHistory, undefined, () => {
+    firstLoading.value = false
+    const scrollRef = document.querySelector('#scrollRef')
+    if (scrollRef)
+      nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
+    if (inputRef.value && !isMobile.value)
+      inputRef.value?.focus()
+  })
+}, 200)
 
 async function handleScroll(event: any) {
   const scrollTop = event.target.scrollTop
