@@ -62,7 +62,7 @@ export async function initApi(key: KeyConfig, {
     })
     lastMessageId = message.parentMessageId
   }
-  if (systemMessage) {
+  if (systemMessage && !model.includes('o1')) {
     messages.push({
       role: 'system',
       content: systemMessage,
@@ -75,7 +75,6 @@ export async function initApi(key: KeyConfig, {
   })
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
-    temperature,
     top_p,
     stream: true,
     stream_options: {
@@ -83,6 +82,11 @@ export async function initApi(key: KeyConfig, {
     },
     messages,
   }
+
+  if (!model.includes('o1')) {
+    options.temperature = temperature
+  }
+
   return openai.chat.completions.create(options, {
     signal: abortSignal,
   })
