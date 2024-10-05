@@ -140,95 +140,61 @@ async function onConversation() {
 
   // 修改后的 fetchChatAPIOnce 函数在这里使用
   const fetchChatAPIOnce = async () => {
-    const isO1Model = currentChatModel.value && currentChatModel.value.includes('o1')
-
-    if (isO1Model) {
-      // 处理非流式传输的情况
-      const response = await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: +uuid,
-        uuid: chatUuid,
-        prompt: message,
-        uploadFileKeys,
-        options,
-        signal: controller.signal,
-      })
-
-      if (response && response.detail && response.detail.choices) {
-        const data = response.detail.choices[0]
-        // 处理完整的响应数据
-        updateChat(
-          +uuid,
-          dataSources.value.length - 1,
-          {
-            dateTime: new Date().toLocaleString(),
-            text: data.text || '',
-            inversion: false,
-            error: false,
-            loading: false,
-            conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-            requestOptions: { prompt: message, options: { ...options } },
-            usage: response.detail.usage,
-          },
-        )
-      }
-    } else {
-      // 处理流式传输的情况
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: +uuid,
-        uuid: chatUuid,
-        prompt: message,
-        uploadFileKeys,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target
-          const { responseText } = xhr
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1) {
-            chunk = responseText.substring(lastIndex)
+    await fetchChatAPIProcess<Chat.ConversationResponse>({
+      roomId: +uuid,
+      uuid: chatUuid,
+      prompt: message,
+      uploadFileKeys,
+      options,
+      signal: controller.signal,
+      onDownloadProgress: ({ event }) => {
+        const xhr = event.target
+        const { responseText } = xhr
+        // Always process the final line
+        const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
+        let chunk = responseText
+        if (lastIndex !== -1)
+          chunk = responseText.substring(lastIndex)
+        try {
+          const data = JSON.parse(chunk)
+          lastChatInfo = data
+          const usage = (data.detail && data.detail.usage)
+            ? {
+                completion_tokens: data.detail.usage.completion_tokens || null,
+                prompt_tokens: data.detail.usage.prompt_tokens || null,
+                total_tokens: data.detail.usage.total_tokens || null,
+                estimated: data.detail.usage.estimated || null,
+              }
+            : undefined
+          updateChat(
+            +uuid,
+            dataSources.value.length - 1,
+            {
+              dateTime: new Date().toLocaleString(),
+              text: lastText + (data.text ?? ''),
+              inversion: false,
+              error: false,
+              loading: true,
+              conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+              requestOptions: { prompt: message, options: { ...options } },
+              usage,
+            },
+          )
+  
+          if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+            options.parentMessageId = data.id
+            lastText = data.text
+            message = ''
+            return fetchChatAPIOnce()
           }
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              dataSources.value.length - 1,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
-
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
-            }
-
-            scrollToBottomIfAtBottom()
-          }
-          catch (error) {
-            console.error('Error parsing chunk:', error)
-          }
-        },
-      })
-    }
+  
+          scrollToBottomIfAtBottom()
+        }
+        catch (error) {
+          //
+        }
+      },
+    })
     updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
   }
 
@@ -314,65 +280,148 @@ async function onRegenerate(index: number) {
 
   try {
     let lastText = ''
+  
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: +uuid,
-        uuid: chatUuid || Date.now(),
-        regenerate: true,
-        prompt: message,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target
-          const { responseText } = xhr
-          // Always process the final line
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              index,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                responseCount,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
-
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
+      try {
+        // 发送请求并监听下载进度
+        await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid || Date.now(),
+          regenerate: true,
+          prompt: message,
+          options,
+          signal: controller.signal,
+          // 处理流式传输的响应
+          onDownloadProgress: ({ event }) => {
+            const xhr = event.target;
+            const { responseText } = xhr;
+  
+            // Always process the final line
+            const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2);
+            let chunk = responseText;
+  
+            if (lastIndex !== -1) {
+              chunk = responseText.substring(lastIndex);
             }
-          }
-          catch (error) {
-            //
-          }
-        },
-      })
-      updateChatSome(+uuid, index, { loading: false })
+  
+            try {
+              // 尝试解析分段的 JSON 数据
+              const data = JSON.parse(chunk);
+              lastChatInfo = data;
+  
+              const usage = (data.detail && data.detail.usage)
+                ? {
+                    completion_tokens: data.detail.usage.completion_tokens || null,
+                    prompt_tokens: data.detail.usage.prompt_tokens || null,
+                    total_tokens: data.detail.usage.total_tokens || null,
+                    estimated: data.detail.usage.estimated || null,
+                  }
+                : undefined;
+  
+              // 更新聊天记录
+              updateChat(
+                +uuid,
+                index,
+                {
+                  dateTime: new Date().toLocaleString(),
+                  text: lastText + (data.text ?? ''),
+                  inversion: false,
+                  responseCount,
+                  error: false,
+                  loading: true,
+                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                  requestOptions: { prompt: message, options: { ...options } },
+                  usage,
+                },
+              );
+  
+              // 如果是长消息，递归请求下一部分
+              if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+                options.parentMessageId = data.id;
+                lastText = data.text;
+                message = '';
+                return fetchChatAPIOnce();
+              }
+            } catch (error) {
+              console.error('流式响应解析错误:', error);
+            }
+          },
+        });
+  
+        // 请求完成后，更新聊天状态
+        updateChatSome(+uuid, index, { loading: false });
+      } catch (error) {
+        console.error('请求或解析响应时发生错误:', error);
+        updateChatSome(+uuid, index, { error: true, loading: false });
+      }
+    };
+  
+    const fetchCompleteResponse = async () => {
+      try {
+        // 发送请求并等待完整的响应
+        const response = await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid || Date.now(),
+          regenerate: true,
+          prompt: message,
+          options,
+          signal: controller.signal,
+        });
+  
+        // 这里处理完整的非流式响应
+        lastChatInfo = response;  // 假定响应是 JSON 格式
+  
+        const usage = (response.detail && response.detail.usage)
+          ? {
+              completion_tokens: response.detail.usage.completion_tokens || null,
+              prompt_tokens: response.detail.usage.prompt_tokens || null,
+              total_tokens: response.detail.usage.total_tokens || null,
+              estimated: response.detail.usage.estimated || null,
+            }
+          : undefined;
+  
+        // 更新聊天记录
+        updateChat(
+          +uuid,
+          index,
+          {
+            dateTime: new Date().toLocaleString(),
+            text: lastText + (response.text ?? ''),
+            inversion: false,
+            responseCount,
+            error: false,
+            loading: false,  // 完整响应直接标记不再加载
+            conversationOptions: { conversationId: response.conversationId, parentMessageId: response.id },
+            requestOptions: { prompt: message, options: { ...options } },
+            usage,
+          },
+        );
+  
+        // 处理长消息的情况
+        if (openLongReply && response.detail && response.detail.choices.length > 0 && response.detail.choices[0].finish_reason === 'length') {
+          options.parentMessageId = response.id;
+          lastText = response.text;
+          message = '';
+          return fetchChatAPIOnce();  // 递归获取剩余部分
+        }
+  
+      } catch (error) {
+        console.error('请求或解析完整响应时发生错误:', error);
+        updateChatSome(+uuid, index, { error: true, loading: false });
+      }
+    };
+  
+    // 判断是否支持流式传输，通常可以通过 options 或响应头来判断
+    const isStreamingSupported = options.streaming || false;
+  
+    if (isStreamingSupported) {
+      // 支持流式传输，使用流式处理
+      await fetchChatAPIOnce();
+    } else {
+      // 不支持流式传输，直接处理完整响应
+      await fetchCompleteResponse();
     }
-    await fetchChatAPIOnce()
-  }
+  } 
   catch (error: any) {
     if (error.message === 'canceled') {
       updateChatSome(
