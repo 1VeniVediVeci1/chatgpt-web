@@ -22,12 +22,59 @@ import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
 
+// 定义 `Usage` 接口
+interface ChatUsage {
+  completion_tokens: number
+  prompt_tokens: number
+  total_tokens: number
+  estimated: boolean
+}
+
+// 定义 `ConversationResponse` 接口
+interface ChatConversationResponse {
+  text?: string
+  conversationId?: string
+  id?: string
+  detail?: {
+    usage?: {
+      completion_tokens: number
+      prompt_tokens: number
+      total_tokens: number
+      estimated?: boolean
+    }
+    choices?: Array<{
+      finish_reason?: string
+    }>
+  }
+}
+
+// 定义 `ConversationRequest` 接口
+interface ChatConversationRequest {
+  roomId: number
+  uuid: number
+  regenerate?: boolean
+  prompt: string
+  uploadFileKeys?: string[]
+  options?: {
+    conversationId?: string
+    parentMessageId?: string
+  }
+  signal?: GenericAbortSignal
+}
+
+// 定义 `History` 接口（根据需要补充其他属性）
+interface ChatHistory {
+  uuid: number
+  // 其他属性...
+}
+
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
 let controller = new AbortController()
 let lastChatInfo: any = {}
 
-const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
+// 移除此变量以消除未使用错误
+// const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
 
 const route = useRoute()
 const dialog = useDialog()
@@ -57,7 +104,7 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 
 const currentNavIndexRef = ref<number>(-1)
 
-const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value?.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value?.includes('gpt-4o')))
+const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value.includes('gpt-4o')))
 
 let loadingms: MessageReactive
 let allmsg: MessageReactive
@@ -117,7 +164,7 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
-  let options: Chat.ConversationRequest = {}
+  let options: ChatConversationRequest['options'] = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
 
   if (lastContext && usingContext.value)
@@ -141,7 +188,7 @@ async function onConversation() {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
+      await fetchChatAPIProcess<ChatConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid,
         prompt: message,
@@ -149,53 +196,49 @@ async function onConversation() {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target
+          const xhr = event.target as XMLHttpRequest
           const { responseText } = xhr
-          // Always process the final line
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              dataSources.value.length - 1,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
+          // 处理每个数据块
+          const lines = responseText.split('\n').filter(line => line.trim() !== '')
+          for (const line of lines) {
+            try {
+              const data = JSON.parse(line) as ChatConversationResponse
+              lastChatInfo = data
+              const usageData = data.detail?.usage || {}
+              const usage: ChatUsage = {
+                completion_tokens: usageData.completion_tokens ?? 0,
+                prompt_tokens: usageData.prompt_tokens ?? 0,
+                total_tokens: usageData.total_tokens ?? 0,
+                estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false, // 确保是 boolean
+              }
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
+              updateChat(
+                +uuid,
+                dataSources.value.length - 1,
+                {
+                  dateTime: new Date().toLocaleString(),
+                  text: lastText + (data.text ?? ''),
+                  inversion: false,
+                  error: false,
+                  loading: true,
+                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                  requestOptions: { prompt: message, options: { ...options } },
+                  usage,
+                },
+              )
+
+              lastText += data.text ?? ''
+
+              scrollToBottomIfAtBottom()
             }
-
-            scrollToBottomIfAtBottom()
-          }
-          catch (error) {
-            //
+            catch (error) {
+              // 解析单个行错误，继续处理下一个
+              console.error('解析数据块时出错:', error)
+            }
           }
         },
       })
+      // 请求完成，更新 loading 状态
       updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
     }
 
@@ -263,7 +306,7 @@ async function onRegenerate(index: number) {
 
   let message = requestOptions?.prompt ?? ''
 
-  let options: Chat.ConversationRequest = {}
+  let options: ChatConversationRequest['options'] = {}
 
   if (requestOptions.options)
     options = { ...requestOptions.options }
@@ -288,7 +331,7 @@ async function onRegenerate(index: number) {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
+      await fetchChatAPIProcess<ChatConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid || Date.now(),
         regenerate: true,
@@ -296,52 +339,50 @@ async function onRegenerate(index: number) {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target
+          const xhr = event.target as XMLHttpRequest
           const { responseText } = xhr
-          // Always process the final line
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              index,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                responseCount,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
+          // 处理每个数据块
+          const lines = responseText.split('\n').filter(line => line.trim() !== '')
+          for (const line of lines) {
+            try {
+              const data = JSON.parse(line) as ChatConversationResponse
+              lastChatInfo = data
+              const usageData = data.detail?.usage || {}
+              const usage: ChatUsage = {
+                completion_tokens: usageData.completion_tokens ?? 0,
+                prompt_tokens: usageData.prompt_tokens ?? 0,
+                total_tokens: usageData.total_tokens ?? 0,
+                estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false, // 确保是 boolean
+              }
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
+              updateChat(
+                +uuid,
+                index,
+                {
+                  dateTime: new Date().toLocaleString(),
+                  text: lastText + (data.text ?? ''),
+                  inversion: false,
+                  responseCount,
+                  error: false,
+                  loading: true,
+                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                  requestOptions: { prompt: message, options: { ...options } },
+                  usage,
+                },
+              )
+
+              lastText += data.text ?? ''
+
+              scrollToBottomIfAtBottom()
             }
-          }
-          catch (error) {
-            //
+            catch (error) {
+              // 解析单个行错误，继续处理下一个
+              console.error('解析数据块时出错:', error)
+            }
           }
         },
       })
+      // 请求完成，更新 loading 状态
       updateChatSome(+uuid, index, { loading: false })
     }
     await fetchChatAPIOnce()
@@ -394,7 +435,12 @@ async function onResponseHistory(index: number, historyIndex: number) {
       loading: false,
       conversationOptions: chat.conversationOptions,
       requestOptions: { prompt: chat.requestOptions.prompt, options: { ...chat.requestOptions.options } },
-      usage: chat.usage,
+      usage: {
+        completion_tokens: chat.usage.completion_tokens ?? 0,
+        prompt_tokens: chat.usage.prompt_tokens ?? 0,
+        total_tokens: chat.usage.total_tokens ?? 0,
+        estimated: typeof chat.usage.estimated === 'boolean' ? chat.usage.estimated : false,
+      } as ChatUsage, // 强制转换为 ChatUsage 类型
     },
   )
 }
@@ -511,7 +557,7 @@ async function loadMoreMessage(event: any) {
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
 
   const lastId = chatStore.chat[chatIndex].data[0].uuid
-  await chatStore.syncChat({ uuid: +uuid } as Chat.History, lastId, () => {
+  await chatStore.syncChat({ uuid: +uuid } as ChatHistory, lastId, () => {
     loadingms && loadingms.destroy()
     nextTick(() => scrollTo(event.target.scrollHeight - scrollPosition))
   }, () => {
@@ -532,7 +578,7 @@ const handleLoadMoreMessage = debounce(loadMoreMessage, 300)
 const handleSyncChat
   = debounce(() => {
     // 直接刷 极小概率不请求
-    chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
+    chatStore.syncChat({ uuid: Number(uuid) } as ChatHistory, undefined, () => {
       firstLoading.value = false
       const scrollRef = document.querySelector('#scrollRef')
       if (scrollRef)
@@ -688,7 +734,7 @@ onUnmounted(() => {
                   :images="item.images"
                   :inversion="item.inversion"
                   :response-count="item.responseCount"
-                  :usage="item && item.usage || undefined"
+                  :usage="item.usage || undefined"
                   :error="item.error"
                   :loading="item.loading"
                   @regenerate="onRegenerate(index)"
@@ -769,7 +815,7 @@ onUnmounted(() => {
               :value="currentChatModel"
               :options="authStore.session?.chatModels"
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
-              @update-value="(val) => handleSyncChatModel(val)"
+              @update:value="(val) => handleSyncChatModel(val)"
             />
             <NSlider v-model:value="userStore.userInfo.advanced.maxContextCount" :max="100" :min="0" :step="1" style="width: 88px" :format-tooltip="formatTooltip" @update:value="() => { userStore.updateSetting(false) }" />
           </div>
