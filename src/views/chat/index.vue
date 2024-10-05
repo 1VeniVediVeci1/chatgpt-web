@@ -22,62 +22,12 @@ import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
 
-// 定义 `ChatUsage` 接口
-interface ChatUsage {
-  completion_tokens: number
-  prompt_tokens: number
-  total_tokens: number
-  estimated: boolean
-}
-
-// 定义 `ChatConversationResponse` 接口
-interface ChatConversationResponse {
-  text?: string
-  conversationId?: string
-  id?: string
-  detail?: {
-    usage?: Partial<ChatUsage>
-    choices?: Array<{
-      finish_reason?: string
-    }>
-  }
-}
-
-// 定义 `ChatConversationRequest` 接口
-interface ChatConversationRequest {
-  roomId: number
-  uuid: number
-  regenerate?: boolean
-  prompt: string
-  uploadFileKeys?: string[]
-  options?: {
-    conversationId?: string
-    parentMessageId?: string
-  }
-  signal?: AbortSignal // 使用标准的 AbortSignal
-}
-
-// 定义 `History` 接口（根据实际情况补充其他属性）
-interface History {
-  title: string
-  isEdit: boolean
-  usingContext: boolean
-  // 其他属性...
-}
-
-// 定义 `ChatHistory` 接口，确保与 `History` 兼容
-interface ChatHistory extends History {
-  uuid: number
-  // 其他必要属性
-}
-
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
 let controller = new AbortController()
 let lastChatInfo: any = {}
 
-// 移除此变量以消除未使用错误
-// const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
+const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
 
 const route = useRoute()
 const dialog = useDialog()
@@ -107,7 +57,7 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 
 const currentNavIndexRef = ref<number>(-1)
 
-const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value.includes('gpt-4o')))
+const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value?.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value?.includes('gpt-4o')))
 
 let loadingms: MessageReactive
 let allmsg: MessageReactive
@@ -167,7 +117,7 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
-  let options: ChatConversationRequest['options'] = {}
+  let options: Chat.ConversationRequest = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
 
   if (lastContext && usingContext.value)
@@ -191,7 +141,7 @@ async function onConversation() {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<ChatConversationResponse>({
+      await fetchChatAPIProcess<Chat.ConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid,
         prompt: message,
@@ -199,50 +149,53 @@ async function onConversation() {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target as XMLHttpRequest
+          const xhr = event.target
           const { responseText } = xhr
-          // 处理每个数据块
-          const lines = responseText.split('\n').filter(line => line.trim() !== '')
-          for (const line of lines) {
-            try {
-              const data = JSON.parse(line) as ChatConversationResponse
-              lastChatInfo = data
+          // Always process the final line
+          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
+          let chunk = responseText
+          if (lastIndex !== -1)
+            chunk = responseText.substring(lastIndex)
+          try {
+            const data = JSON.parse(chunk)
+            lastChatInfo = data
+            const usage = (data.detail && data.detail.usage)
+              ? {
+                  completion_tokens: data.detail.usage.completion_tokens || null,
+                  prompt_tokens: data.detail.usage.prompt_tokens || null,
+                  total_tokens: data.detail.usage.total_tokens || null,
+                  estimated: data.detail.usage.estimated || null,
+                }
+              : undefined
+            updateChat(
+              +uuid,
+              dataSources.value.length - 1,
+              {
+                dateTime: new Date().toLocaleString(),
+                text: lastText + (data.text ?? ''),
+                inversion: false,
+                error: false,
+                loading: true,
+                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                requestOptions: { prompt: message, options: { ...options } },
+                usage,
+              },
+            )
 
-              const usageData: Partial<ChatUsage> = data.detail?.usage ?? {}
-              const usage: ChatUsage = {
-                completion_tokens: usageData.completion_tokens ?? 0,
-                prompt_tokens: usageData.prompt_tokens ?? 0,
-                total_tokens: usageData.total_tokens ?? 0,
-                estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false, // 确保是 boolean
-              }
-
-              updateChat(
-                +uuid,
-                dataSources.value.length - 1,
-                {
-                  dateTime: new Date().toLocaleString(),
-                  text: lastText + (data.text ?? ''),
-                  inversion: false,
-                  error: false,
-                  loading: true,
-                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                  requestOptions: { prompt: message, options: { ...options } },
-                  usage,
-                },
-              )
-
-              lastText += data.text ?? ''
-
-              scrollToBottomIfAtBottom()
+            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+              options.parentMessageId = data.id
+              lastText = data.text
+              message = ''
+              return fetchChatAPIOnce()
             }
-            catch (error) {
-              // 解析错误，继续处理
-              console.error('解析数据块时出错:', error)
-            }
+
+            scrollToBottomIfAtBottom()
+          }
+          catch (error) {
+            //
           }
         },
       })
-      // 请求完成，更新 loading 状态
       updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
     }
 
@@ -310,7 +263,7 @@ async function onRegenerate(index: number) {
 
   let message = requestOptions?.prompt ?? ''
 
-  let options: ChatConversationRequest['options'] = {}
+  let options: Chat.ConversationRequest = {}
 
   if (requestOptions.options)
     options = { ...requestOptions.options }
@@ -335,7 +288,7 @@ async function onRegenerate(index: number) {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<ChatConversationResponse>({
+      await fetchChatAPIProcess<Chat.ConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid || Date.now(),
         regenerate: true,
@@ -343,51 +296,52 @@ async function onRegenerate(index: number) {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target as XMLHttpRequest
+          const xhr = event.target
           const { responseText } = xhr
-          // 处理每个数据块
-          const lines = responseText.split('\n').filter(line => line.trim() !== '')
-          for (const line of lines) {
-            try {
-              const data = JSON.parse(line) as ChatConversationResponse
-              lastChatInfo = data
+          // Always process the final line
+          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
+          let chunk = responseText
+          if (lastIndex !== -1)
+            chunk = responseText.substring(lastIndex)
+          try {
+            const data = JSON.parse(chunk)
+            lastChatInfo = data
+            const usage = (data.detail && data.detail.usage)
+              ? {
+                  completion_tokens: data.detail.usage.completion_tokens || null,
+                  prompt_tokens: data.detail.usage.prompt_tokens || null,
+                  total_tokens: data.detail.usage.total_tokens || null,
+                  estimated: data.detail.usage.estimated || null,
+                }
+              : undefined
+            updateChat(
+              +uuid,
+              index,
+              {
+                dateTime: new Date().toLocaleString(),
+                text: lastText + (data.text ?? ''),
+                inversion: false,
+                responseCount,
+                error: false,
+                loading: true,
+                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                requestOptions: { prompt: message, options: { ...options } },
+                usage,
+              },
+            )
 
-              const usageData: Partial<ChatUsage> = data.detail?.usage ?? {}
-              const usage: ChatUsage = {
-                completion_tokens: usageData.completion_tokens ?? 0,
-                prompt_tokens: usageData.prompt_tokens ?? 0,
-                total_tokens: usageData.total_tokens ?? 0,
-                estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false, // 确保是 boolean
-              }
-
-              updateChat(
-                +uuid,
-                index,
-                {
-                  dateTime: new Date().toLocaleString(),
-                  text: lastText + (data.text ?? ''),
-                  inversion: false,
-                  responseCount,
-                  error: false,
-                  loading: true,
-                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                  requestOptions: { prompt: message, options: { ...options } },
-                  usage,
-                },
-              )
-
-              lastText += data.text ?? ''
-
-              scrollToBottomIfAtBottom()
+            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+              options.parentMessageId = data.id
+              lastText = data.text
+              message = ''
+              return fetchChatAPIOnce()
             }
-            catch (error) {
-              // 解析错误，继续处理
-              console.error('解析数据块时出错:', error)
-            }
+          }
+          catch (error) {
+            //
           }
         },
       })
-      // 请求完成，更新 loading 状态
       updateChatSome(+uuid, index, { loading: false })
     }
     await fetchChatAPIOnce()
@@ -428,14 +382,6 @@ async function onRegenerate(index: number) {
 
 async function onResponseHistory(index: number, historyIndex: number) {
   const chat = (await fetchChatResponseoHistory(+uuid, dataSources.value[index].uuid || Date.now(), historyIndex)).data
-  const usageData: Partial<ChatUsage> = chat.usage ?? {}
-  const usage: ChatUsage = {
-    completion_tokens: usageData.completion_tokens ?? 0,
-    prompt_tokens: usageData.prompt_tokens ?? 0,
-    total_tokens: usageData.total_tokens ?? 0,
-    estimated: typeof usageData.estimated === 'boolean' ? usageData.estimated : false,
-  }
-
   updateChat(
     +uuid,
     index,
@@ -448,7 +394,7 @@ async function onResponseHistory(index: number, historyIndex: number) {
       loading: false,
       conversationOptions: chat.conversationOptions,
       requestOptions: { prompt: chat.requestOptions.prompt, options: { ...chat.requestOptions.options } },
-      usage,
+      usage: chat.usage,
     },
   )
 }
@@ -565,39 +511,36 @@ async function loadMoreMessage(event: any) {
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
 
   const lastId = chatStore.chat[chatIndex].data[0].uuid
-  await chatStore.syncChat({ 
-    uuid: +uuid, 
-    title: '历史标题',          // 根据实际情况填写
-    isEdit: false,              // 根据实际情况设置
-    usingContext: true          // 根据实际情况设置
-  } as ChatHistory, lastId, () => {
+  await chatStore.syncChat({ uuid: +uuid } as Chat.History, lastId, () => {
     loadingms && loadingms.destroy()
     nextTick(() => scrollTo(event.target.scrollHeight - scrollPosition))
   }, () => {
-    loadingms = ms.loading('加载中...', { duration: 0 })
+    loadingms = ms.loading(
+      '加载中...', {
+        duration: 0,
+      },
+    )
   }, () => {
     allmsg && allmsg.destroy()
-    allmsg = ms.warning('没有更多了', { duration: 1000 })
+    allmsg = ms.warning('没有更多了', {
+      duration: 1000,
+    })
   })
 }
 
 const handleLoadMoreMessage = debounce(loadMoreMessage, 300)
-const handleSyncChat = debounce(() => {
-  // 直接刷 极小概率不请求
-  chatStore.syncChat({ 
-    uuid: Number(uuid),
-    title: '当前聊天标题',        // 根据实际情况填写
-    isEdit: false,                // 根据实际情况设置
-    usingContext: true            // 根据实际情况设置
-  } as ChatHistory, undefined, () => {
-    firstLoading.value = false
-    const scrollRef = document.querySelector('#scrollRef')
-    if (scrollRef)
-      nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
-    if (inputRef.value && !isMobile.value)
-      inputRef.value?.focus()
-  })
-}, 200)
+const handleSyncChat
+  = debounce(() => {
+    // 直接刷 极小概率不请求
+    chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
+      firstLoading.value = false
+      const scrollRef = document.querySelector('#scrollRef')
+      if (scrollRef)
+        nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
+      if (inputRef.value && !isMobile.value)
+        inputRef.value?.focus()
+    })
+  }, 200)
 
 async function handleScroll(event: any) {
   const scrollTop = event.target.scrollTop
@@ -745,7 +688,7 @@ onUnmounted(() => {
                   :images="item.images"
                   :inversion="item.inversion"
                   :response-count="item.responseCount"
-                  :usage="item.usage || undefined"
+                  :usage="item && item.usage || undefined"
                   :error="item.error"
                   :loading="item.loading"
                   @regenerate="onRegenerate(index)"
@@ -826,7 +769,7 @@ onUnmounted(() => {
               :value="currentChatModel"
               :options="authStore.session?.chatModels"
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
-              @update:value="(val) => handleSyncChatModel(val)"
+              @update-value="(val) => handleSyncChatModel(val)"
             />
             <NSlider v-model:value="userStore.userInfo.advanced.maxContextCount" :max="100" :min="0" :step="1" style="width: 88px" :format-tooltip="formatTooltip" @update:value="() => { userStore.updateSetting(false) }" />
           </div>
