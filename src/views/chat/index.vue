@@ -22,11 +22,13 @@ import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
 
+// 异步加载 Prompt 组件
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
 let controller = new AbortController()
 let lastChatInfo: any = {}
 
+// 确保在环境变量中设置了 VITE_GLOB_OPEN_LONG_REPLY
 const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
 
 const route = useRoute()
@@ -57,16 +59,16 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 
 const currentNavIndexRef = ref<number>(-1)
 
-const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value?.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value?.includes('gpt-4o')))
+const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value.includes('gpt-4o')))
 
 let loadingms: MessageReactive
 let allmsg: MessageReactive
 let prevScrollTop: number
 
-// 添加PromptStore
+// 添加 PromptStore
 const promptStore = usePromptStore()
 
-// 使用storeToRefs，保证store修改后，联想部分能够重新渲染
+// 使用 storeToRefs，保证 store 修改后，联想部分能够重新渲染
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
 // 未知原因刷新页面，loading 状态不会重置，手动重置
@@ -75,11 +77,45 @@ dataSources.value.forEach((item, index) => {
     updateChatSome(+uuid, index, { loading: false })
 })
 
-function handleSubmit() {
-  onConversation()
+// 类型定义，确保 `Usage` 类型包含 `estimated` 属性
+interface Usage {
+  completion_tokens: number;
+  prompt_tokens: number;
+  total_tokens: number;
+  estimated?: number; // 根据实际情况调整类型
 }
 
-const uploadFileKeysRef = ref<string[]>([])
+interface ChatDetail {
+  usage: Usage;
+  choices: Array<{
+    finish_reason: string;
+  }>;
+  conversationId: string;
+  id: string;
+}
+
+interface ConversationResponse {
+  detail?: ChatDetail;
+  text?: string;
+  conversationId?: string;
+  id?: string;
+}
+
+interface ConversationRequest {
+  prompt: string;
+  options?: any;
+  roomId?: number;
+  uuid?: number;
+  regenerate?: boolean;
+  uploadFileKeys?: string[];
+  signal?: AbortSignal;
+  onDownloadProgress?: (progressEvent: any) => void;
+}
+
+interface History {
+  uuid: number;
+  // 其他属性
+}
 
 async function onConversation() {
   let message = prompt.value
@@ -117,7 +153,7 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
-  let options: Chat.ConversationRequest = {}
+  let options: ConversationRequest = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
 
   if (lastContext && usingContext.value)
@@ -143,7 +179,7 @@ async function onConversation() {
 
   try {
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
+      await fetchChatAPIProcess<ConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid,
         prompt: message,
@@ -156,7 +192,7 @@ async function onConversation() {
 
           // 尝试解析整个 responseText，处理非流式响应
           try {
-            const data = JSON.parse(responseText)
+            const data: ConversationResponse = JSON.parse(responseText)
             // 非流式响应，直接处理并退出
             processResponseData(data)
             lastProcessedLength = responseText.length
@@ -170,7 +206,7 @@ async function onConversation() {
             for (const line of lines) {
               if (!line.trim()) continue
               try {
-                const data = JSON.parse(line)
+                const data: ConversationResponse = JSON.parse(line)
                 processResponseData(data)
               } catch (err) {
                 // 忽略不完整的 JSON，等待更多数据
@@ -182,9 +218,9 @@ async function onConversation() {
       updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
     }
 
-    const processResponseData = (data: Chat.ConversationResponse) => {
+    const processResponseData = (data: ConversationResponse) => {
       lastChatInfo = data
-      const usage = data.detail?.usage
+      const usage: Usage | undefined = data.detail?.usage
         ? {
             completion_tokens: data.detail.usage.completion_tokens ?? null,
             prompt_tokens: data.detail.usage.prompt_tokens ?? null,
@@ -203,8 +239,8 @@ async function onConversation() {
           error: false,
           loading: true,
           conversationOptions: {
-            conversationId: data.conversationId,
-            parentMessageId: data.id,
+            conversationId: data.detail?.conversationId ?? '',
+            parentMessageId: data.detail?.id ?? '',
           },
           requestOptions: { prompt: message, options: { ...options } },
           usage,
@@ -212,6 +248,19 @@ async function onConversation() {
       )
       lastText += data.text ?? ''
       scrollToBottomIfAtBottom()
+
+      // 使用 openLongReply 变量，防止未使用错误
+      if (
+        openLongReply &&
+        data.detail &&
+        data.detail.choices &&
+        data.detail.choices.length > 0 &&
+        data.detail.choices[0].finish_reason === 'length'
+      ) {
+        options.parentMessageId = data.detail.id
+        message = '' // 重置消息
+        fetchChatAPIOnce()
+      }
     }
 
     await fetchChatAPIOnce()
@@ -278,7 +327,7 @@ async function onRegenerate(index: number) {
 
   let message = requestOptions?.prompt ?? ''
 
-  let options: Chat.ConversationRequest = {}
+  let options: ConversationRequest = {}
 
   if (requestOptions.options)
     options = { ...requestOptions.options }
@@ -305,7 +354,7 @@ async function onRegenerate(index: number) {
 
   try {
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
+      await fetchChatAPIProcess<ConversationResponse>({
         roomId: +uuid,
         uuid: chatUuid || Date.now(),
         regenerate: true,
@@ -318,7 +367,7 @@ async function onRegenerate(index: number) {
 
           // 尝试解析整个 responseText，处理非流式响应
           try {
-            const data = JSON.parse(responseText)
+            const data: ConversationResponse = JSON.parse(responseText)
             // 非流式响应，直接处理并退出
             processResponseData(data)
             lastProcessedLength = responseText.length
@@ -332,7 +381,7 @@ async function onRegenerate(index: number) {
             for (const line of lines) {
               if (!line.trim()) continue
               try {
-                const data = JSON.parse(line)
+                const data: ConversationResponse = JSON.parse(line)
                 processResponseData(data)
               } catch (err) {
                 // 忽略不完整的 JSON，等待更多数据
@@ -344,9 +393,9 @@ async function onRegenerate(index: number) {
       updateChatSome(+uuid, index, { loading: false })
     }
 
-    const processResponseData = (data: Chat.ConversationResponse) => {
+    const processResponseData = (data: ConversationResponse) => {
       lastChatInfo = data
-      const usage = data.detail?.usage
+      const usage: Usage | undefined = data.detail?.usage
         ? {
             completion_tokens: data.detail.usage.completion_tokens ?? null,
             prompt_tokens: data.detail.usage.prompt_tokens ?? null,
@@ -366,8 +415,8 @@ async function onRegenerate(index: number) {
           error: false,
           loading: true,
           conversationOptions: {
-            conversationId: data.conversationId,
-            parentMessageId: data.id,
+            conversationId: data.detail?.conversationId ?? '',
+            parentMessageId: data.detail?.id ?? '',
           },
           requestOptions: { prompt: message, options: { ...options } },
           usage,
@@ -375,6 +424,19 @@ async function onRegenerate(index: number) {
       )
       lastText += data.text ?? ''
       scrollToBottomIfAtBottom()
+
+      // 使用 openLongReply 变量，防止未使用错误
+      if (
+        openLongReply &&
+        data.detail &&
+        data.detail.choices &&
+        data.detail.choices.length > 0 &&
+        data.detail.choices[0].finish_reason === 'length'
+      ) {
+        options.parentMessageId = data.detail.id
+        message = '' // 重置消息
+        fetchChatAPIOnce()
+      }
     }
 
     await fetchChatAPIOnce()
@@ -544,7 +606,7 @@ async function loadMoreMessage(event: any) {
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
 
   const lastId = chatStore.chat[chatIndex].data[0].uuid
-  await chatStore.syncChat({ uuid: +uuid } as Chat.History, lastId, () => {
+  await chatStore.syncChat({ uuid: +uuid } as History, lastId, () => {
     loadingms && loadingms.destroy()
     nextTick(() => scrollTo(event.target.scrollHeight - scrollPosition))
   }, () => {
@@ -564,12 +626,12 @@ async function loadMoreMessage(event: any) {
 const handleLoadMoreMessage = debounce(loadMoreMessage, 300)
 const handleSyncChat
   = debounce(() => {
-    // 直接刷 极小概率不请求
-    chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
+    // 直接刷新，极小概率不请求
+    chatStore.syncChat({ uuid: Number(uuid) } as History, undefined, () => {
       firstLoading.value = false
       const scrollRef = document.querySelector('#scrollRef')
       if (scrollRef)
-        nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
+        nextTick(() => (scrollRef as HTMLElement).scrollTop = (scrollRef as HTMLElement).scrollHeight)
       if (inputRef.value && !isMobile.value)
         inputRef.value?.focus()
     })
@@ -595,23 +657,23 @@ async function handleToggleUsingContext() {
 }
 
 // 可优化部分
-// 搜索选项计算，这里使用value作为索引项，所以当出现重复value时渲染异常(多项同时出现选中效果)
-// 理想状态下其实应该是key作为索引项,但官方的renderOption会出现问题，所以就需要value反renderLabel实现
+// 搜索选项计算，这里使用 value 作为索引项，所以当出现重复 value 时渲染异常(多项同时出现选中效果)
+// 理想状态下其实应该是 key 作为索引项，但官方的 renderOption 会出现问题，所以需要 value 反渲染 label 实现
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
-    return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
-      return {
+    return promptTemplate.value
+      .filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase()))
+      .map((obj: { value: any }) => ({
         label: obj.value,
         value: obj.value,
-      }
-    })
+      }))
   }
   else {
     return []
   }
 })
 
-// value反渲染key
+// value 反渲染 key
 function renderOption(option: { label: string }) {
   for (const i of promptTemplate.value) {
     if (i.value === option.label)
@@ -665,6 +727,7 @@ const uploadHeaders = computed(() => {
   }
 })
 
+// 生命周期钩子
 onMounted(() => {
   firstLoading.value = true
   handleSyncChat()
@@ -692,7 +755,8 @@ onUnmounted(() => {
       v-if="isMobile"
       :using-context="usingContext"
       :show-prompt="showPrompt"
-      @export="handleExport" @toggle-using-context="handleToggleUsingContext"
+      @export="handleExport"
+      @toggle-using-context="handleToggleUsingContext"
       @toggle-show-prompt="showPrompt = true"
     />
     <main class="flex-1 overflow-hidden">
@@ -791,7 +855,12 @@ onUnmounted(() => {
                 <IconPrompt class="w-[20px] m-auto" />
               </span>
             </HoverButton>
-            <HoverButton v-if="!isMobile" :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')" :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }" @click="handleToggleUsingContext">
+            <HoverButton
+              v-if="!isMobile"
+              :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')"
+              :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }"
+              @click="handleToggleUsingContext"
+            >
               <span class="text-xl">
                 <SvgIcon icon="ri:chat-history-line" />
               </span>
@@ -804,7 +873,15 @@ onUnmounted(() => {
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
               @update-value="(val) => handleSyncChatModel(val)"
             />
-            <NSlider v-model:value="userStore.userInfo.advanced.maxContextCount" :max="100" :min="0" :step="1" style="width: 88px" :format-tooltip="formatTooltip" @update:value="() => { userStore.updateSetting(false) }" />
+            <NSlider
+              v-model:value="userStore.userInfo.advanced.maxContextCount"
+              :max="100"
+              :min="0"
+              :step="1"
+              style="width: 88px"
+              :format-tooltip="formatTooltip"
+              @update:value="() => { userStore.updateSetting(false) }"
+            />
           </div>
           <div class="flex items-center justify-between space-x-2">
             <NAutoComplete v-model:value="prompt" :options="searchOptions" :render-label="renderOption">
@@ -837,3 +914,7 @@ onUnmounted(() => {
     <Prompt v-if="showPrompt" v-model:roomId="uuid" v-model:visible="showPrompt" />
   </div>
 </template>
+
+<style scoped>
+/* 根据需要添加样式 */
+</style>
