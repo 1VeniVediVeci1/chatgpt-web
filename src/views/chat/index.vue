@@ -58,6 +58,7 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 const currentNavIndexRef = ref<number>(-1)
 
 const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value?.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value?.includes('gpt-4o')))
+const isO1Model = computed(() => currentChatModel.value?.includes('o1'))  // 新增：判断是否为 o1 模型
 
 let loadingms: MessageReactive
 let allmsg: MessageReactive
@@ -141,62 +142,93 @@ async function onConversation() {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: +uuid,
-        uuid: chatUuid,
-        prompt: message,
-        uploadFileKeys,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target
-          const { responseText } = xhr
-          // Always process the final line
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              dataSources.value.length - 1,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
+      if (!isO1Model.value) {  // 修改：仅在非 o1 模型下使用流式处理
+        await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid,
+          prompt: message,
+          uploadFileKeys,
+          options,
+          signal: controller.signal,
+          onDownloadProgress: ({ event }) => {
+            const xhr = event.target
+            const { responseText } = xhr
+            // Always process the final line
+            const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
+            let chunk = responseText
+            if (lastIndex !== -1)
+              chunk = responseText.substring(lastIndex)
+            try {
+              const data = JSON.parse(chunk)
+              lastChatInfo = data
+              const usage = (data.detail && data.detail.usage)
+                ? {
+                    completion_tokens: data.detail.usage.completion_tokens || null,
+                    prompt_tokens: data.detail.usage.prompt_tokens || null,
+                    total_tokens: data.detail.usage.total_tokens || null,
+                    estimated: data.detail.usage.estimated || null,
+                  }
+                : undefined
+              updateChat(
+                +uuid,
+                dataSources.value.length - 1,
+                {
+                  dateTime: new Date().toLocaleString(),
+                  text: lastText + (data.text ?? ''),
+                  inversion: false,
+                  error: false,
+                  loading: true,
+                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                  requestOptions: { prompt: message, options: { ...options } },
+                  usage,
+                },
+              )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
+              if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+                options.parentMessageId = data.id
+                lastText = data.text
+                message = ''
+                return fetchChatAPIOnce()
+              }
+
+              scrollToBottomIfAtBottom()
             }
+            catch (error) {
+              //
+            }
+          },
+        })
+        updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
+      } else {  // 新增：处理 o1 模型的完整响应
+        const response = await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid,
+          prompt: message,
+          uploadFileKeys,
+          options,
+          signal: controller.signal,
+          // 不传递 onDownloadProgress，因为是完整响应
+        })
 
-            scrollToBottomIfAtBottom()
-          }
-          catch (error) {
-            //
-          }
-        },
-      })
-      updateChatSome(+uuid, dataSources.value.length - 1, { loading: false })
+        // 直接处理完整响应
+        lastChatInfo = response
+        const usage = response.detail?.usage
+        updateChat(
+          +uuid,
+          dataSources.value.length - 1,
+          {
+            dateTime: new Date().toLocaleString(),
+            text: response.choices[0].message.content,  // 假设 response.text 包含完整回答
+            inversion: false,
+            error: false,
+            loading: false,
+            conversationOptions: { conversationId: response.conversationId, parentMessageId: response.id },
+            requestOptions: { prompt: message, options: { ...options } },
+            usage,
+          },
+        )
+        scrollToBottomIfAtBottom()
+      }
     }
 
     await fetchChatAPIOnce()
@@ -288,61 +320,92 @@ async function onRegenerate(index: number) {
   try {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: +uuid,
-        uuid: chatUuid || Date.now(),
-        regenerate: true,
-        prompt: message,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target
-          const { responseText } = xhr
-          // Always process the final line
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
-            updateChat(
-              +uuid,
-              index,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                responseCount,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
+      if (!isO1Model.value) {  // 修改：仅在非 o1 模型下使用流式处理
+        await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid || Date.now(),
+          regenerate: true,
+          prompt: message,
+          options,
+          signal: controller.signal,
+          onDownloadProgress: ({ event }) => {
+            const xhr = event.target
+            const { responseText } = xhr
+            // Always process the final line
+            const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
+            let chunk = responseText
+            if (lastIndex !== -1)
+              chunk = responseText.substring(lastIndex)
+            try {
+              const data = JSON.parse(chunk)
+              lastChatInfo = data
+              const usage = (data.detail && data.detail.usage)
+                ? {
+                    completion_tokens: data.detail.usage.completion_tokens || null,
+                    prompt_tokens: data.detail.usage.prompt_tokens || null,
+                    total_tokens: data.detail.usage.total_tokens || null,
+                    estimated: data.detail.usage.estimated || null,
+                  }
+                : undefined
+              updateChat(
+                +uuid,
+                index,
+                {
+                  dateTime: new Date().toLocaleString(),
+                  text: lastText + (data.text ?? ''),
+                  inversion: false,
+                  responseCount,
+                  error: false,
+                  loading: true,
+                  conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
+                  requestOptions: { prompt: message, options: { ...options } },
+                  usage,
+                },
+              )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
+              if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+                options.parentMessageId = data.id
+                lastText = data.text
+                message = ''
+                return fetchChatAPIOnce()
+              }
             }
-          }
-          catch (error) {
-            //
-          }
-        },
-      })
-      updateChatSome(+uuid, index, { loading: false })
+            catch (error) {
+              //
+            }
+          },
+        })
+        updateChatSome(+uuid, index, { loading: false })
+      } else {  // 新增：处理 o1 模型的完整响应
+        const response = await fetchChatAPIProcess<Chat.ConversationResponse>({
+          roomId: +uuid,
+          uuid: chatUuid || Date.now(),
+          regenerate: true,
+          prompt: message,
+          options,
+          signal: controller.signal,
+          // 不传递 onDownloadProgress，因为是完整响应
+        })
+
+        // 直接处理完整响应
+        lastChatInfo = response
+        const usage = response.detail?.usage
+        updateChat(
+          +uuid,
+          index,
+          {
+            dateTime: new Date().toLocaleString(),
+            text: response.choices[0].message.content,  // 假设 response.text 包含完整回答
+            inversion: false,
+            responseCount,
+            error: false,
+            loading: false,
+            conversationOptions: { conversationId: response.conversationId, parentMessageId: response.id },
+            requestOptions: { prompt: message, options: { ...options } },
+            usage,
+          },
+        )
+      }
     }
     await fetchChatAPIOnce()
   }
