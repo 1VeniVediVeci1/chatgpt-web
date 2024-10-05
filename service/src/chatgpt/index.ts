@@ -170,58 +170,59 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     } else {
       // 流式处理其他模型
-    let text = ''
-    let chatIdRes = null
-    let modelRes = ''
-    let usageRes: OpenAI.Completions.CompletionUsage
+      let text = ''
+      let chatIdRes = null
+      let modelRes = ''
+      let usageRes: OpenAI.Completions.CompletionUsage
 
-    for await (const chunk of api) {
-      // Fix many model responses, do not include `finish_reason: 'stop'`
-      if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
-        console.error('[chunk] unknown chunk', chunk)
-        return
+      for await (const chunk of api) {
+        // Fix many model responses, do not include `finish_reason: 'stop'`
+        if (chunk.id.replace(/^chatcmpl-/g, '') === '') {
+          console.error('[chunk] unknown chunk', chunk)
+          return
+        }
+
+        text += chunk.choices[0]?.delta.content ?? ''
+        chatIdRes = chunk.id
+        modelRes = chunk.model
+        usageRes = usageRes || chunk.usage
+
+        console.warn('[chunk]', chunk)
+        process?.({
+          ...chunk,
+          text,
+          role: chunk.choices[0]?.delta.role || 'assistant',
+          conversationId: lastContext.conversationId,
+          parentMessageId: lastContext.parentMessageId,
+        })
       }
-
-      text += chunk.choices[0]?.delta.content ?? ''
-      chatIdRes = chunk.id
-      modelRes = chunk.model
-      usageRes = usageRes || chunk.usage
-
-      console.warn('[chunk]', chunk)
-      process?.({
-        ...chunk,
-        text,
-        role: chunk.choices[0]?.delta.role || 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
-      })
-    }
-    return sendResponse({
-      type: 'Success',
-      data: {
-        object: 'chat.completion',
-        choices: [{
-          message: {
-            role: 'assistant',
-            content: text,
-          },
-          finish_reason: 'stop',
-          index: 0,
-          logprobs: null,
-        }],
-        created: Date.now(),
-        conversationId: lastContext.conversationId,
-        model: modelRes,
-        text,
-        id: chatIdRes,
-        detail: {
-          usage: usageRes && {
-            ...usageRes,
-            estimated: false,
+      return sendResponse({
+        type: 'Success',
+        data: {
+          object: 'chat.completion',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: text,
+            },
+            finish_reason: 'stop',
+            index: 0,
+            logprobs: null,
+          }],
+          created: Date.now(),
+          conversationId: lastContext.conversationId,
+          model: modelRes,
+          text,
+          id: chatIdRes,
+          detail: {
+            usage: usageRes && {
+              ...usageRes,
+              estimated: false,
+            },
           },
         },
-      },
-    })
+      })
+    }
   }
   catch (error: any) {
     const code = error.statusCode
