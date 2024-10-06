@@ -35,7 +35,7 @@ const mdi = new MarkdownIt({
     return highlightBlock(hljs.highlightAuto(code).value, '')
   },
 })
-const markdownItKatex = require('markdown-it-katex');
+
 mdi.use(mila, { attrs: { target: '_blank', rel: 'noopener' } })
 mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
   
