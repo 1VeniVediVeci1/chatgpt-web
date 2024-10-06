@@ -56,8 +56,8 @@ const text = computed(() => {
   let value = props.text ?? '';  // 使用 let 而不是 const
   if (!props.asRawText) {
     // 替换自定义分隔符
-    value = value.replace(/\/\(/g, '$').replace(/\/\)/g, '$');
-    value = value.replace(/\/\[/g, '$$').replace(/\/\]/g, '$$');
+    value = value.replace(/\/\((.*?)\/\)/g, '$$1$');
+    value = value.replace(/\/\[(.*?)\/\]/g, '$$$1$$');
     return mdi.render(value);
   }
   return value;
