@@ -37,17 +37,7 @@ const mdi = new MarkdownIt({
 })
 
 mdi.use(mila, { attrs: { target: '_blank', rel: 'noopener' } })
-//mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
-mdi.use(mdKatex, {
-  delimiters: [
-    {left: '$$', right: '$$', display: true},  // 块级公式
-    {left: '$', right: '$', display: false},   // 行内公式
-    {left: '/[', right: '/]', display: true},  // 自定义块级公式
-    {left: '/(', right: '/)', display: false}  // 自定义行内公式
-  ],
-  blockClass: 'katexmath-block rounded-md p-[10px]', // 自定义样式
-  errorColor: ' #cc0000'  // 错误提示颜色
-})
+mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
 
 const wrapClass = computed(() => {
   return [
@@ -63,11 +53,15 @@ const wrapClass = computed(() => {
 })
 
 const text = computed(() => {
-  const value = props.text ?? ''
-  if (!props.asRawText)
-    return mdi.render(value)
-  return value
-})
+  let value = props.text ?? '';  // 使用 let 而不是 const
+  if (!props.asRawText) {
+    // 替换自定义分隔符
+    value = value.replace(/\/\(/g, '$').replace(/\/\)/g, '$');
+    value = value.replace(/\/\[/g, '$$').replace(/\/\]/g, '$$');
+    return mdi.render(value);
+  }
+  return value;
+});
 
 function highlightBlock(str: string, lang?: string) {
   return `<pre class="code-block-wrapper"><div class="code-block-header"><span class="code-block-header__lang">${lang}</span><span class="code-block-header__copy">${t('chat.copyCode')}</span></div><code class="hljs code-block-body ${lang}">${str}</code></pre>`
