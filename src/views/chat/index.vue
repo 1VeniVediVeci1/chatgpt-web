@@ -183,7 +183,7 @@ async function onConversation() {
               },
             )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length' && !currentChatModel.value?.includes('o1')) {
+            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
               options.parentMessageId = data.id
               lastText = data.text
               message = ''
@@ -224,9 +224,16 @@ async function onConversation() {
         +uuid,
         dataSources.value.length - 1,
         {
-          text: `${currentChat.text}\n[${errorMessage}]`,
-          error: false,
-          loading: false,
+          if (!currentChatModel.value?.includes('o1')) {
+            text: `${currentChat.text}\n[${errorMessage}]`,
+            error: false,
+            loading: false,
+              }
+          else {
+            text: `${currentChat.text}`,
+            error: false,
+            loading: false,
+              }
         },
       )
       return
@@ -331,7 +338,7 @@ async function onRegenerate(index: number) {
               },
             )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length' && !currentChatModel.value?.includes('o1')) {
+            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
               options.parentMessageId = data.id
               lastText = data.text
               message = ''
