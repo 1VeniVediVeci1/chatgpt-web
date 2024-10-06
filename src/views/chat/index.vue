@@ -219,21 +219,26 @@ async function onConversation() {
 
     const currentChat = getChatByUuidAndIndex(+uuid, dataSources.value.length - 1)
 
-    if (currentChat?.text && currentChat.text !== '') {
+    if (currentChat?.text && currentChat.text !== '' && !currentChatModel.value?.includes('o1')) {
       updateChatSome(
         +uuid,
         dataSources.value.length - 1,
         {
-          if (!currentChatModel.value?.includes('o1')) {
             text: `${currentChat.text}\n[${errorMessage}]`,
             error: false,
             loading: false,
-              }
-          else {
+        },
+      )
+      return
+    }
+    if (currentChat?.text && currentChat.text !== '' && currentChatModel.value?.includes('o1')) {
+      updateChatSome(
+        +uuid,
+        dataSources.value.length - 1,
+        {
             text: `${currentChat.text}`,
             error: false,
             loading: false,
-              }
         },
       )
       return
