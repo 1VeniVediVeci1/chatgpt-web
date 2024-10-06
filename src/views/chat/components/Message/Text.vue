@@ -37,7 +37,17 @@ const mdi = new MarkdownIt({
 })
 
 mdi.use(mila, { attrs: { target: '_blank', rel: 'noopener' } })
-mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
+//mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
+mdi.use(mdKatex, {
+  delimiters: [
+    {left: '$$', right: '$$', display: true},  // 块级公式
+    {left: '$', right: '$', display: false},   // 行内公式
+    {left: '/[', right: '/]', display: true},  // 自定义块级公式
+    {left: '/(', right: '/)', display: false}  // 自定义行内公式
+  ],
+  blockClass: 'katexmath-block rounded-md p-[10px]', // 自定义样式
+  errorColor: ' #cc0000'  // 错误提示颜色
+})
 
 const wrapClass = computed(() => {
   return [
