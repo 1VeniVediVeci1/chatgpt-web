@@ -75,7 +75,7 @@ const wrapClass = computed(() => {
 })
 
 const text = computed(() => {
-  const value = props.text ?? '';
+  let value = props.text ?? '';
   if (!props.asRawText) {
     value = replaceBracketsWithDollar(value);
     value = replaceBracketsWithDollar2(value);
