@@ -58,7 +58,7 @@ function replaceBracketsWithDollar2(input: string): string {
     const regex = /\\\((.*?)\\\)/g;
 
     // 使用 replace 方法进行替换
-    return input.replace(regex, (_, content) => `$$${content}$$`);
+    return input.replace(regex, (_, content) => `$${content}$`);
 }
 
 const wrapClass = computed(() => {
