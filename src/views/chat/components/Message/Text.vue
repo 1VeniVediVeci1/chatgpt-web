@@ -55,7 +55,7 @@ function replaceBracketsWithDollar2(input: string): string {
     // \\(     匹配字符 '\('
     // (.*?)   非贪婪匹配任意字符，并捕获为分组 1
     // \\)     匹配字符 '\)'
-    const regex = /\\\((.*?)\\\)/g;
+    const regex = /\\\( (.*?) \\\)/g;
 
     // 使用 replace 方法进行替换
     return input.replace(regex, (_, content) => `$${content}$`);
