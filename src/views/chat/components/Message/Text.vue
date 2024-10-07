@@ -38,7 +38,29 @@ const mdi = new MarkdownIt({
 
 mdi.use(mila, { attrs: { target: '_blank', rel: 'noopener' } })
 mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
-  
+
+function replaceBracketsWithDollar(input: string): string {
+    // 正则表达式解释：
+    // \\[     匹配字符 '\['
+    // (.*?)   非贪婪匹配任意字符，并捕获为分组 1
+    // \\]     匹配字符 '\]'
+    const regex = /\\\[(.*?)\\\]/gs;
+
+    // 使用 replace 方法进行替换
+    return input.replace(regex, (_, content) => `$$${content}$$`);
+}
+
+function replaceBracketsWithDollar2(input: string): string {
+    // 正则表达式解释：
+    // \\(     匹配字符 '\('
+    // (.*?)   非贪婪匹配任意字符，并捕获为分组 1
+    // \\)     匹配字符 '\)'
+    const regex = /\\\((.*?)\\\)/g;
+
+    // 使用 replace 方法进行替换
+    return input.replace(regex, (_, content) => `$$${content}$$`);
+}
+
 const wrapClass = computed(() => {
   return [
     'text-wrap',
@@ -55,6 +77,8 @@ const wrapClass = computed(() => {
 const text = computed(() => {
   const value = props.text ?? '';
   if (!props.asRawText) {
+    value = replaceBracketsWithDollar(value);
+    value = replaceBracketsWithDollar2(value);
     return mdi.render(value);
   }
   return value;
