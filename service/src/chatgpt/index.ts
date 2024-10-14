@@ -64,7 +64,8 @@ export async function initApi(key: KeyConfig, {
     lastMessageId = message.parentMessageId
   }
   // 判断模型是否为 o1
-  const isO1Model = model.includes('o1')
+  //const isO1Model = model.includes('o1')
+  const isO1Model = false;
   if (systemMessage && !isO1Model) {
     messages.push({
       role: 'system',
@@ -158,7 +159,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
     // 判断模型是否为 o1
-    const isO1Model = model.includes('o1')
+    //const isO1Model = model.includes('o1')
+    const isO1Model = false;
     // 如果是流式传输，使用 for await 迭代 response
     if (isO1Model) {
       // 非流式传输，直接处理一次性响应
