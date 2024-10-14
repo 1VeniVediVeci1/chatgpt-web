@@ -63,7 +63,10 @@ export async function initApi(key: KeyConfig, {
     })
     lastMessageId = message.parentMessageId
   }
-  if (systemMessage && !model.includes('o1')) {
+  // 判断模型是否为 o1
+  //const isO1Model = model.includes('o1')
+  const isO1Model = false;
+  if (systemMessage && !isO1Model) {
     messages.push({
       role: 'system',
       content: systemMessage,
@@ -74,10 +77,7 @@ export async function initApi(key: KeyConfig, {
     role: 'user',
     content,
   })
-
-  // 判断模型是否为 o1，如果是，则禁用 stream 选项
-  const isO1Model = model.includes('o1')
-
+  
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     top_p,
@@ -86,7 +86,7 @@ export async function initApi(key: KeyConfig, {
     messages,
   }
 
-  if (!model.includes('o1')) {
+  if (!isO1Model) {
     options.temperature = temperature
   }
 
@@ -156,9 +156,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let chatIdRes = null
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
-
+    //const isO1Model = model.includes('o1')
+    const isO1Model = false;
     // 如果是流式传输，使用 for await 迭代 response
-    if (model.includes('o1')) {
+    if (isO1Model) {
       // 非流式传输，直接处理一次性响应
       const completion = api as OpenAI.ChatCompletion
       text = completion.choices[0].message.content
