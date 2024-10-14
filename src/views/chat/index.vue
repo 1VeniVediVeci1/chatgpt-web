@@ -218,8 +218,9 @@ async function onConversation() {
     }
 
     const currentChat = getChatByUuidAndIndex(+uuid, dataSources.value.length - 1)
-
-    if (currentChat?.text && currentChat.text !== '' && !currentChatModel.value?.includes('o1')) {
+    //const iso1model = currentChatModel.value?.includes('o1')
+    const iso1model = false
+    if (currentChat?.text && currentChat.text !== '' && !iso1model) {
       updateChatSome(
         +uuid,
         dataSources.value.length - 1,
@@ -231,7 +232,7 @@ async function onConversation() {
       )
       return
     }
-    if (currentChat?.text && currentChat.text !== '' && currentChatModel.value?.includes('o1')) {
+    if (currentChat?.text && currentChat.text !== '' && iso1model) {
       updateChatSome(
         +uuid,
         dataSources.value.length - 1,
