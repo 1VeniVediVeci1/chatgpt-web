@@ -59,7 +59,8 @@ const app = express()
 const router = express.Router()
 
 app.use(express.static('public'))
-app.use(express.json())
+app.use(express.json({ limit: '100mb' }))  // 增加limit参数
+app.use(express.urlencoded({ limit: '100mb', extended: true }))  // 同时处理form数据
 
 app.use('/uploads', express.static('uploads'))
 
