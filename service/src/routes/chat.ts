@@ -326,17 +326,13 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       // eslint-disable-next-line no-unsafe-finally
         return
 
-      // 确保保存时 ID 都存在
-      const finalMessageId = result.data.id || `msg-${Date.now()}`
-      const finalConversationId = result.data.conversationId || options.conversationId || `conv-${Date.now()}`
-      
       if (regenerate && message.options.messageId) {
         const previousResponse = message.previousResponse || []
         previousResponse.push({ response: message.response, options: message.options })
         await updateChat(message._id as unknown as string,
           result.data.text,
-          finalMessageId, // 使用确保存在的值
-          finalConversationId, // 使用确保存在的值
+          result.data.id,
+          result.data.conversationId,
           model,
           result.data.detail?.usage as UsageResponse,
           previousResponse as [])
@@ -344,8 +340,8 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       else {
         await updateChat(message._id as unknown as string,
           result.data.text,
-          finalMessageId, // 使用确保存在的值
-          finalConversationId, // 使用确保存在的值
+          result.data.id,
+          result.data.conversationId,
           model,
           result.data.detail?.usage as UsageResponse)
       }
@@ -354,7 +350,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
         await insertChatUsage(ObjectId.createFromHexString(req.headers.userId),
           roomId,
           message._id,
-          finalMessageId, // 使用确保存在的值
+          result.data.id,
           model,
           result.data.detail?.usage as UsageResponse)
       }
