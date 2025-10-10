@@ -157,34 +157,33 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let chatIdRes = null
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
-    // 判断模型是否为 o1
-    const isO1Model = model.includes('o1')
+    // 🔥 确保 conversationId 始终存在
+    const conversationId = lastContext.conversationId || `conv-${Date.now()}`
     // 如果是流式传输，使用 for await 迭代 response
-    if (isO1Model) {
-      // 非流式传输，直接处理一次性响应
-      const completion = api as OpenAI.ChatCompletion
-      text = completion.choices[0].message.content
-      chatIdRes = completion.id
-      modelRes = completion.model
-    } else {
-      // 流式传输，逐块处理
-      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
-        text += chunk.choices[0]?.delta.content ?? ''
+    // 流式传输，逐块处理
+    for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
+      text += chunk.choices[0]?.delta.content ?? ''
+      // 只在第一次或 API 返回时赋值
+      if (!chatIdRes && chunk.id) {
         chatIdRes = chunk.id
-        modelRes = chunk.model
-        usageRes = usageRes || chunk.usage
-
-        console.warn('[chunk]', chunk)
-        process?.({
-          ...chunk,
-          text,
-          role: chunk.choices[0]?.delta.role || 'assistant',
-          conversationId: lastContext.conversationId,
-          parentMessageId: lastContext.parentMessageId,
-        })
       }
+      modelRes = chunk.model
+      usageRes = usageRes || chunk.usage
+
+      console.warn('[chunk]', chunk)
+      process?.({
+        ...chunk,
+        text,
+        role: chunk.choices[0]?.delta.role || 'assistant',
+        conversationId, // 使用确保存在的 conversationId
+        parentMessageId: lastContext.parentMessageId,
+      })
     }
 
+    // 如果流式传输后仍无 id，生成一个
+    if (!chatIdRes) {
+      chatIdRes = `msg-${Date.now()}`
+    }
     return sendResponse({
       type: 'Success',
       data: {
@@ -199,7 +198,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           logprobs: null,
         }],
         created: Date.now(),
-        conversationId: lastContext.conversationId,
+        conversationId, // 使用确保存在的值
         model: modelRes,
         text,
         id: chatIdRes,
