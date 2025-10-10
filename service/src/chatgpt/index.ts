@@ -157,33 +157,34 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let chatIdRes = null
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
-    // 🔥 确保 conversationId 始终存在
-    const conversationId = lastContext.conversationId || `conv-${Date.now()}`
+    // 判断模型是否为 o1
+    const isO1Model = model.includes('o1')
     // 如果是流式传输，使用 for await 迭代 response
-    // 流式传输，逐块处理
-    for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
-      text += chunk.choices[0]?.delta.content ?? ''
-      // 只在第一次或 API 返回时赋值
-      if (!chatIdRes && chunk.id) {
+    if (isO1Model) {
+      // 非流式传输，直接处理一次性响应
+      const completion = api as OpenAI.ChatCompletion
+      text = completion.choices[0].message.content
+      chatIdRes = completion.id
+      modelRes = completion.model
+    } else {
+      // 流式传输，逐块处理
+      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
+        text += chunk.choices[0]?.delta.content ?? ''
         chatIdRes = chunk.id
+        modelRes = chunk.model
+        usageRes = usageRes || chunk.usage
+
+        console.warn('[chunk]', chunk)
+        process?.({
+          ...chunk,
+          text,
+          role: chunk.choices[0]?.delta.role || 'assistant',
+          conversationId: lastContext.conversationId,
+          parentMessageId: lastContext.parentMessageId,
+        })
       }
-      modelRes = chunk.model
-      usageRes = usageRes || chunk.usage
-
-      console.warn('[chunk]', chunk)
-      process?.({
-        ...chunk,
-        text,
-        role: chunk.choices[0]?.delta.role || 'assistant',
-        conversationId, // 使用确保存在的 conversationId
-        parentMessageId: lastContext.parentMessageId,
-      })
     }
 
-    // 如果流式传输后仍无 id，生成一个
-    if (!chatIdRes) {
-      chatIdRes = `msg-${Date.now()}`
-    }
     return sendResponse({
       type: 'Success',
       data: {
@@ -198,7 +199,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           logprobs: null,
         }],
         created: Date.now(),
-        conversationId, // 使用确保存在的值
+        conversationId: lastContext.conversationId,
         model: modelRes,
         text,
         id: chatIdRes,
@@ -277,9 +278,8 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
   if (chatInfo) {
-    const parentMessageId = isPrompt
-      ? chatInfo.options.parentMessageId
-      : `prompt_${id}` // parent message is the prompt
+    // FIX: Always use the parentMessageId from the database record.
+    const parentMessageId = chatInfo.options.parentMessageId
 
     if (chatInfo.status !== Status.Normal) { // jumps over deleted messages
       return parentMessageId
@@ -308,7 +308,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         return {
           id,
           conversationId: chatInfo.options.conversationId,
-          parentMessageId,
+          parentMessageId, // Corrected to use the variable from above
           role: 'user',
           text: content,
         }
@@ -317,7 +317,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         return { // completion
           id,
           conversationId: chatInfo.options.conversationId,
-          parentMessageId,
+          parentMessageId, // Corrected to use the variable from above
           role: 'assistant',
           text: chatInfo.response,
         }
