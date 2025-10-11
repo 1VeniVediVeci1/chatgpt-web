@@ -12,6 +12,8 @@ import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { JWT, ModelConfig } from '../types'
 import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
 import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
+// [ADDED] 导入自定义 ID 生成器
+import { generateMessageId } from '../utils/id-generator'
 
 dotenv.config()
 
@@ -63,9 +65,7 @@ export async function initApi(key: KeyConfig, {
     })
     lastMessageId = message.parentMessageId
   }
-  // 判断模型是否为 o1
-  const isO1Model = model.includes('o1')
-  if (systemMessage && !isO1Model) {
+  if (systemMessage) {
     messages.push({
       role: 'system',
       content: systemMessage,
@@ -77,32 +77,20 @@ export async function initApi(key: KeyConfig, {
     content,
   })
 
-
-
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     top_p,
-    stream: !isO1Model,  // 如果是 o1 模型，则禁用流式传输
-    stream_options: isO1Model ? undefined : { include_usage: true },  // 只有在使用流式传输时才包含 stream_options
+    stream: 1,
+    stream_options: { include_usage: true },
     messages,
   }
+  options.temperature = temperature
 
-  if (!isO1Model) {
-    options.temperature = temperature
-  }
-
-  // 根据是否使用流式传输返回不同的结果
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
   })
 
-  // 如果不使用流式传输，直接返回响应
-  if (isO1Model) {
-    return apiResponse as OpenAI.ChatCompletion // 如果不是流式传输，直接返回完整响应
-  }
-
-  // 否则，返回异步可迭代的流
-  return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk> // 使用 AsyncIterable 代替 Stream
+  return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
@@ -116,7 +104,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   if (key == null || key === undefined)
     throw new Error('没有对应的 apikeys 配置，请再试一次。')
 
-  // Add Chat Record
   updateRoomChatModel(userId, options.room.roomId, model)
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
@@ -140,6 +127,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   const abort = new AbortController()
 
+  // [ADDED] 关键改动：在API调用前，提前生成一个唯一的、自定义的消息 ID
+  const customMessageId = generateMessageId()
+
   try {
     const api = await initApi(key, {
       model,
@@ -154,35 +144,27 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     processThreads.push({ userId, abort, messageId })
 
     let text = ''
-    let chatIdRes = null
+    // [MODIFIED] 初始化 chatIdRes 为自定义 ID，以防某些情况下未被赋值
+    let chatIdRes = customMessageId
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
-    // 判断模型是否为 o1
-    const isO1Model = model.includes('o1')
-    // 如果是流式传输，使用 for await 迭代 response
-    if (isO1Model) {
-      // 非流式传输，直接处理一次性响应
-      const completion = api as OpenAI.ChatCompletion
-      text = completion.choices[0].message.content
-      chatIdRes = completion.id
-      modelRes = completion.model
-    } else {
-      // 流式传输，逐块处理
-      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { // 使用 AsyncIterable
-        text += chunk.choices[0]?.delta.content ?? ''
-        chatIdRes = chunk.id
-        modelRes = chunk.model
-        usageRes = usageRes || chunk.usage
+    for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
+      text += chunk.choices[0]?.delta.content ?? ''
+      // [MODIFIED] 在整个流式传输过程中，始终使用同一个自定义 ID
+      chatIdRes = customMessageId
+      modelRes = chunk.model
+      usageRes = usageRes || chunk.usage
 
-        console.warn('[chunk]', chunk)
-        process?.({
-          ...chunk,
-          text,
-          role: chunk.choices[0]?.delta.role || 'assistant',
-          conversationId: lastContext.conversationId,
-          parentMessageId: lastContext.parentMessageId,
-        })
-      }
+      console.warn('[chunk]', chunk)
+      process?.({
+        ...chunk,
+        // [MODIFIED] 在流式数据中也返回自定义 ID，确保前端接收到的 ID 从始至终保持一致
+        id: customMessageId,
+        text,
+        role: chunk.choices[0]?.delta.role || 'assistant',
+        conversationId: lastContext.conversationId,
+        parentMessageId: lastContext.parentMessageId,
+      })
     }
 
     return sendResponse({
@@ -202,6 +184,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         conversationId: lastContext.conversationId,
         model: modelRes,
         text,
+        // [MODIFIED] 最终返回的数据中包含自定义 ID
         id: chatIdRes,
         detail: {
           usage: usageRes && {
@@ -213,6 +196,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     })
   }
   catch (error: any) {
+    // 保留了原有的复杂错误处理和重试机制
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
       if (options.tryCount++ < 3) {
@@ -227,11 +211,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
+    // 保留了原有的 Abort 清理逻辑
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1)
       processThreads.splice(index, 1)
   }
 }
+
+// --- 以下所有辅助函数均保持不变，因为它们与ID生成无关 ---
 
 export function abortChatProcess(userId: string) {
   const index = processThreads.findIndex(d => d.userId === userId)
@@ -278,16 +265,15 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
   if (chatInfo) {
-    // FIX: Always use the parentMessageId from the database record.
     const parentMessageId = chatInfo.options.parentMessageId
 
-    if (chatInfo.status !== Status.Normal) { // jumps over deleted messages
+    if (chatInfo.status !== Status.Normal) {
       return parentMessageId
         ? getMessageById(parentMessageId)
         : undefined
     }
     else {
-      if (isPrompt) { // prompt
+      if (isPrompt) {
         let content: MessageContent = chatInfo.prompt
         if (chatInfo.images && chatInfo.images.length > 0) {
           content = [
@@ -308,16 +294,16 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         return {
           id,
           conversationId: chatInfo.options.conversationId,
-          parentMessageId, // Corrected to use the variable from above
+          parentMessageId,
           role: 'user',
           text: content,
         }
       }
       else {
-        return { // completion
+        return {
           id,
           conversationId: chatInfo.options.conversationId,
-          parentMessageId, // Corrected to use the variable from above
+          parentMessageId,
           role: 'assistant',
           text: chatInfo.response,
         }
@@ -330,7 +316,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
 async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
   if (keys.length <= 0)
     return null
-  // cleanup old locked keys
   _lockedKeys.filter(d => d.lockedTime <= Date.now() - 1000 * 20).forEach(d => _lockedKeys.splice(_lockedKeys.indexOf(d), 1))
 
   let unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
