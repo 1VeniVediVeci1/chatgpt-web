@@ -151,7 +151,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       content,
       abortSignal: abort.signal,
       systemMessage,
-      lastMessageId: lastContext.id,
+      lastMessageId: lastContext.parentMessageId,
     })
     processThreads.push({ userId, abort, messageId })
 
@@ -277,7 +277,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
   if (chatInfo) {
-    const parentMessageId = chatInfo.options.parentMessageId
+    const parentMessageId = isPrompt
+      ? chatInfo.options.parentMessageId
+      : `prompt_${id}` // parent message is the prompt
 
     if (chatInfo.status !== Status.Normal) {
       return parentMessageId
