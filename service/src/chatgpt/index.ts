@@ -86,6 +86,18 @@ export async function initApi(key: KeyConfig, {
   }
   options.temperature = temperature
 
+  // [调试模式] - 开始 - 新增的调试代码块
+  console.log('\n/==================== OpenAI API 请求体 (调试模式) ====================/')
+  console.log(`[调试] 请求时间: ${new Date().toISOString()}`)
+  console.log(`[调试] 目标 URL: ${OPENAI_API_BASE_URL}`)
+  // 为安全起见，只打印 API Key 的前5位和后4位
+  console.log(`[调试] 使用 API Key: ${key.key.substring(0, 5)}...${key.key.slice(-4)}`)
+  console.log('[调试] 完整请求负载 (Payload):')
+  // 使用 console.dir 可以更好地格式化对象，并完整打印嵌套内容
+  console.dir(options, { depth: null, colors: true })
+  console.log('/=======================================================================/\n')
+  // [调试模式] - 结束
+  
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
   })
