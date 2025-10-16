@@ -46,7 +46,8 @@
     "request-ip": "^3.3.0",
     "socks-proxy-agent": "^7.0.0",
     "speakeasy": "^2.0.0",
-    "tsx": "^4.7.0"
+    "tsx": "^4.7.0",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^0.43.1",
@@ -60,6 +61,7 @@
     "copyfiles": "^2.4.1",
     "eslint": "^8.56.0",
     "rimraf": "^5.0.5",
-    "typescript": "~5.3.3"
+    "typescript": "~5.3.3",
+    "@types/uuid": "^9.0.0"
   }
 }
