@@ -151,7 +151,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       content,
       abortSignal: abort.signal,
       systemMessage,
-      lastMessageId: lastContext.Id,
+      lastMessageId: lastContext.id,
     })
     processThreads.push({ userId, abort, messageId })
 
