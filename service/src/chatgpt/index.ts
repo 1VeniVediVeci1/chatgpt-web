@@ -80,7 +80,7 @@ export async function initApi(key: KeyConfig, {
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     top_p,
-    stream: 1,
+    stream: true,
     stream_options: { include_usage: true },
     messages,
   }
