@@ -12,8 +12,14 @@ import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { JWT, ModelConfig } from '../types'
 import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
 import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
-// [ADDED] 导入自定义 ID 生成器
+// 导入自定义 ID 生成器
 import { generateMessageId } from '../utils/id-generator'
+
+// 在文件开头添加模型配置
+const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
+  'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
+  // 其他特殊模型可以在这里添加
+}
 
 dotenv.config()
 
@@ -52,6 +58,11 @@ export async function initApi(key: KeyConfig, {
     apiKey: key.key,
     maxRetries: 0,
   })
+  // 根据模型类型调整参数
+  const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
+  const finalTemperature = modelConfig.defaultTemperature ?? temperature
+  const shouldUseTopP = modelConfig.supportTopP
+  
   const messages: OpenAI.ChatCompletionMessageParam[] = []
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId)
@@ -79,12 +90,15 @@ export async function initApi(key: KeyConfig, {
 
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
-    top_p,
     stream: true,
     stream_options: { include_usage: true },
     messages,
   }
-  options.temperature = temperature
+  options.temperature = finalTemperature
+  // 只有支持 top_p 的模型才添加该参数
+  if (shouldUseTopP) {
+    options.top_p = top_p
+  }
 
   // [调试模式] - 开始 - 新增的调试代码块
   console.log('\n/==================== OpenAI API 请求体 (调试模式) ====================/')
