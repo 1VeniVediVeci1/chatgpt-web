@@ -128,6 +128,18 @@ onMounted(() => {
             />
           </div>
         </div>
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">图片/非流式模型</span>
+          <div class="flex-1">
+            <NInput
+              :value="config && config.imageModels"
+              placeholder="在此列表中的模型将关闭流式输出并自动包装图片链接。英文逗号分割，如：gemini-3-pro-image, dall-e-3"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              @input="(val) => { if (config) config.imageModels = val }"
+            />
+          </div>
+        </div>
         <!-- 增加新注册用户的全局数量设置 -->
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.globalAmount') }}</span>
