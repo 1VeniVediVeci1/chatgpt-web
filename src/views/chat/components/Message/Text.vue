@@ -25,21 +25,32 @@ const { isMobile } = useBasicLayout()
 
 const textRef = ref<HTMLElement | null>(null)
 
-// ---------- Markdown 图片用的隐藏 NImage 预览 ----------
+/**
+ * -------- Markdown 图片的预览逻辑 ----------
+ * 使用一个“看不见的 NImage”，点击 Markdown <img> 时：
+ * 1. 把 src 赋给这个 NImage；
+ * 2. nextTick 后调用它的预览方法（不同版本可能是 showPreview / preview / open）
+ */
 const markdownPreviewUrl = ref<string>('')
-// 不强求具体类型，用 any 即可，避免 TS 报错
 const markdownPreviewRef = ref<any>(null)
+
+function triggerNaiveImagePreview() {
+  const inst = markdownPreviewRef.value
+  if (!inst) return
+
+  // 尝试多种可能的实例方法名，以兼容不同版本的 Naive UI
+  inst.showPreview?.()
+  inst.preview?.()
+  inst.open?.()
+}
 
 function handleImageClickFromMarkdown(src: string) {
   markdownPreviewUrl.value = src
   nextTick(() => {
-    // 不同 Naive 版本方法名可能略有不同，如 preview / showPreview
-    markdownPreviewRef.value?.showPreview?.()
-    // 如果你用的 Naive 版本是 preview()：
-    // markdownPreviewRef.value?.preview?.()
+    triggerNaiveImagePreview()
   })
 }
-// ------------------------------------------------------
+// --------------------------------------------
 
 // markdown 容器点击：只处理 <img>
 function handleMarkdownClick(e: MouseEvent) {
@@ -226,12 +237,13 @@ onUnmounted(() => {
       </div>
 
       <!-- 隐藏的 NImage：专门给 Markdown 中的 <img> 用来触发 Naive 预览器 -->
-      <NImage
-        v-if="markdownPreviewUrl"
-        ref="markdownPreviewRef"
-        :src="markdownPreviewUrl"
-        class="hidden"
-      />
+      <div style="display: none">
+        <NImage
+          v-if="markdownPreviewUrl"
+          ref="markdownPreviewRef"
+          :src="markdownPreviewUrl"
+        />
+      </div>
     </div>
   </div>
 </template>
