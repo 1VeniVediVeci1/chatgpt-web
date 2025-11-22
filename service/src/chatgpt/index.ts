@@ -16,6 +16,7 @@ import * as fs from 'node:fs/promises' // 引入 fs
 import * as path from 'node:path'      // 引入 path
 // 导入自定义 ID 生成器
 import { generateMessageId } from '../utils/id-generator'
+import { getCacheConfig } from '../storage/config'
 
 // 在文件开头添加模型配置
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
@@ -53,12 +54,15 @@ export async function initApi(key: KeyConfig, {
   content,
   systemMessage,
   lastMessageId,
+  //传入是否为图片模型的标记
+  isImageModel, 
 }: Pick<OpenAI.ChatCompletionCreateParams, 'temperature' | 'model' | 'top_p'> & {
   maxContextCount: number
   content: MessageContent
   abortSignal?: AbortSignal
   systemMessage?: string
   lastMessageId?: string
+  isImageModel?: boolean
 }) {
   const config = await getCacheConfig()
   const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
@@ -97,10 +101,12 @@ export async function initApi(key: KeyConfig, {
     content,
   })
 
+  const enableStream = !isImageModel
+
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
-    stream: true,
-    stream_options: { include_usage: true },
+    stream: enableStream,
+    stream_options: enableStream ? { include_usage: true } : undefined,
     messages,
   }
   options.temperature = finalTemperature
@@ -144,7 +150,15 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
   let content: MessageContent = message
   let fileContext = ''
-
+  //获取全局配置，判断当前模型是否在图片模型列表中
+  const globalConfig = await getCacheConfig()
+  const imageModelsStr = globalConfig.siteConfig.imageModels || ''
+  //将配置字符串按逗号分割，去除空格，生成数组
+  const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+  //判断当前模型是否包含在配置列表中 (支持模糊匹配，比如配置 gemini-3-pro 会匹配 gemini-3-pro-image)
+  //或者精确匹配： const isImage = imageModelList.includes(model)
+  const isImage = imageModelList.some(m => model.includes(m))
+  
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     // 1. 先处理文本文件，读取内容拼接到 Prompt 中
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
@@ -201,6 +215,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       abortSignal: abort.signal,
       systemMessage,
       lastMessageId: lastContext.parentMessageId,
+      isImageModel: isImage,
     })
     processThreads.push({ userId, abort, messageId })
 
@@ -208,21 +223,60 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let chatIdRes = customMessageId
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
-    for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
-      text += chunk.choices[0]?.delta.content ?? ''
-      chatIdRes = customMessageId
-      modelRes = chunk.model
-      usageRes = usageRes || chunk.usage
 
-      console.warn('[chunk]', chunk)
+    //分支处理
+    if (isImage) {
+      // --- 图片模型 (非流式处理) ---
+      // 注意：这里 api 的类型不仅是 ChatCompletionChunk，也可能是 ChatCompletion
+      const response = api as any // 简单处理类型推断问题
+      const choice = response.choices[0]
+      let rawContent = choice.message?.content || ''
+      
+      modelRes = response.model
+      usageRes = response.usage
+
+      // 自动包装 Markdown 图片语法
+      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) {
+         text = `![Generated Image](${rawContent})`
+      } else {
+         text = rawContent
+      }
+
       process?.({
-        ...chunk,
         id: customMessageId,
         text,
-        role: chunk.choices[0]?.delta.role || 'assistant',
+        role: choice.message.role || 'assistant',
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
+        // 伪造一个 detail 对象给前端
+        detail: {
+            choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
+            created: response.created,
+            id: response.id,
+            model: response.model,
+            object: 'chat.completion',
+            usage: response.usage
+        } as any 
       })
+
+    } else {
+      // --- 文本模型 (流式处理) ---
+      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
+         // ... (原有的流式处理逻辑保持不变) ...
+         text += chunk.choices[0]?.delta.content ?? ''
+         chatIdRes = customMessageId
+         modelRes = chunk.model
+         usageRes = usageRes || chunk.usage
+ 
+         process?.({
+           ...chunk,
+           id: customMessageId,
+           text,
+           role: chunk.choices[0]?.delta.role || 'assistant',
+           conversationId: lastContext.conversationId,
+           parentMessageId: lastContext.parentMessageId,
+         })
+      }
     }
 
     return sendResponse({
@@ -242,7 +296,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         conversationId: lastContext.conversationId,
         model: modelRes,
         text,
-        // [MODIFIED] 最终返回的数据中包含自定义 ID
+        //最终返回的数据中包含自定义 ID
         id: chatIdRes,
         detail: {
           usage: usageRes && {
