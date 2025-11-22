@@ -168,7 +168,7 @@ onUnmounted(() => {
           alt="image" 
           object-fit="contain"
           class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
-          img-props="{ style: { maxWidth: '100%', width: '300px' } }"
+          :img-props="{ style: { maxWidth: '100%', width: '300px' }, alt: 'image' }"
         />
         <!-- NImage 自带点击全屏预览功能 -->
       </div>
