@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { computed, onMounted, onUnmounted, onUpdated, ref } from 'vue'
-import { NImage, NModal } from 'naive-ui'
+import { NImage, NImageGroup, NModal } from 'naive-ui'
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
 import mila from 'markdown-it-link-attributes'
@@ -23,29 +23,28 @@ const props = defineProps<Props>()
 
 const { isMobile } = useBasicLayout()
 
-const textRef = ref<HTMLElement>()
+const textRef = ref<HTMLElement | null>(null)
 
-// --- 图片预览逻辑（统一使用自定义 NModal） ---
+// --- 图片预览逻辑 ---
 const previewSrc = ref<string>('')
 const showPreview = ref(false)
 
-function handleImageClick(src: string) {
+function handleImageClickFromMarkdown(src: string) {
   previewSrc.value = src
   showPreview.value = true
 }
-// ------------------------------------------
+// ----------------------
 
-// Markdown 内联图片点击代理
 function handleMarkdownClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
   if (!target)
     return
 
   if (target.tagName.toLowerCase() === 'img') {
-    e.stopPropagation() // 避免触发外层快速删除
+    e.stopPropagation()
     const src = (target as HTMLImageElement).src
     if (src)
-      handleImageClick(src)
+      handleImageClickFromMarkdown(src)
   }
 }
 
@@ -117,8 +116,8 @@ function highlightBlock(str: string, lang?: string) {
 
 function addCopyEvents() {
   if (textRef.value) {
-    const copyBtn = textRef.value.querySelectorAll('.code-block-header__copy')
-    copyBtn.forEach((btn) => {
+    const copyBtnList = textRef.value.querySelectorAll('.code-block-header__copy')
+    copyBtnList.forEach((btn) => {
       const handler = async () => {
         const code = btn.parentElement?.nextElementSibling?.textContent
         if (code) {
@@ -139,9 +138,8 @@ function addCopyEvents() {
 
 function removeCopyEvents() {
   if (textRef.value) {
-    const copyBtn = textRef.value.querySelectorAll('.code-block-header__copy')
-    copyBtn.forEach((btn) => {
-      // 无法精确移除匿名函数，这里主要在组件卸载时清理引用即可
+    const copyBtnList = textRef.value.querySelectorAll('.code-block-header__copy')
+    copyBtnList.forEach((btn) => {
       btn.replaceWith(btn.cloneNode(true))
     })
   }
@@ -167,6 +165,7 @@ onUnmounted(() => {
       class="leading-relaxed break-words"
       @click="handleMarkdownClick"
     >
+      <!-- 文本 / Markdown -->
       <div v-if="!inversion" class="flex items-end">
         <div
           v-if="!asRawText"
@@ -178,26 +177,25 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 渲染图片附件 -->
+      <!-- 附件图片：使用 NImageGroup + NImage，直接使用 Naive UI 预览/缩放 -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
-        <div
-          v-for="(v, i) of imageList"
-          :key="`img-${i}`"
-          class="excludeFastDel"
-          @click.stop="handleImageClick(`/uploads/${v}`)"
-        >
+        <NImageGroup>
           <NImage
+            v-for="(v, i) of imageList"
+            :key="`img-${i}`"
             :src="`/uploads/${v}`"
             alt="image"
             object-fit="contain"
-            preview-disabled
-            class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
-            :img-props="{ style: { maxWidth: '100%', maxHeight: '300px' }, alt: 'image' }"
+            class="rounded-md shadow-sm cursor-pointer hover:opacity-90 excludeFastDel"
+            :img-props="{
+              style: { maxWidth: '100%', maxHeight: '300px', objectFit: 'contain' },
+              alt: 'image',
+            }"
           />
-        </div>
+        </NImageGroup>
       </div>
 
-      <!-- 渲染非图片附件 -->
+      <!-- 非图片附件：文件下载 -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a
           v-for="(v, i) of fileList"
@@ -219,7 +217,7 @@ onUnmounted(() => {
         </a>
       </div>
 
-      <!-- 统一图片预览弹窗 -->
+      <!-- Markdown 内 img 的预览：点击 Markdown 里的 <img>，弹出 Modal，里面用 NImageGroup + NImage -->
       <NModal
         v-model:show="showPreview"
         preset="card"
@@ -228,12 +226,16 @@ onUnmounted(() => {
         :content-style="{ padding: 0, display: 'flex', justifyContent: 'center', alignItems: 'center' }"
       >
         <div class="relative w-full flex justify-center items-center cursor-zoom-out" @click="showPreview = false">
-          <img
-            v-if="previewSrc"
-            :src="previewSrc"
-            class="max-w-[95vw] max-h-[90vh] object-contain rounded-md shadow-2xl bg-black/50 backdrop-blur-sm"
-            @click.stop
-          >
+          <NImageGroup>
+            <NImage
+              v-if="previewSrc"
+              :src="previewSrc"
+              object-fit="contain"
+              class="max-w-[95vw] max-h-[90vh] rounded-md shadow-2xl bg-black/50 backdrop-blur-sm cursor-zoom-in"
+              :img-props="{ style: { maxWidth: '95vw', maxHeight: '90vh', objectFit: 'contain' } }"
+              @click.stop
+            />
+          </NImageGroup>
         </div>
       </NModal>
     </div>
