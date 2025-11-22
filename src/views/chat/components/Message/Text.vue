@@ -29,25 +29,17 @@ const textRef = ref<HTMLElement | null>(null)
  * -------- Markdown 图片的预览逻辑 ----------
  * 使用一个“看不见的 NImage”，点击 Markdown <img> 时：
  * 1. 把 src 赋给这个 NImage；
- * 2. nextTick 后调用它的预览方法（不同版本可能是 showPreview / preview / open）
+ * 2. nextTick 后模拟点击它的 DOM 节点，触发 Naive 自带的预览器。
  */
 const markdownPreviewUrl = ref<string>('')
 const markdownPreviewRef = ref<any>(null)
 
-function triggerNaiveImagePreview() {
-  const inst = markdownPreviewRef.value
-  if (!inst) return
-
-  // 尝试多种可能的实例方法名，以兼容不同版本的 Naive UI
-  inst.showPreview?.()
-  inst.preview?.()
-  inst.open?.()
-}
-
 function handleImageClickFromMarkdown(src: string) {
   markdownPreviewUrl.value = src
   nextTick(() => {
-    triggerNaiveImagePreview()
+    const inst = markdownPreviewRef.value
+    const el = inst?.$el as HTMLElement | undefined
+    el?.click?.()   // 等价于用户点了一下 NImage，直接打开预览层
   })
 }
 // --------------------------------------------
@@ -237,7 +229,7 @@ onUnmounted(() => {
       </div>
 
       <!-- 隐藏的 NImage：专门给 Markdown 中的 <img> 用来触发 Naive 预览器 -->
-      <div style="display: none">
+      <div style="position: fixed; top: -9999px; left: -9999px; width: 0; height: 0; overflow: hidden;">
         <NImage
           v-if="markdownPreviewUrl"
           ref="markdownPreviewRef"
