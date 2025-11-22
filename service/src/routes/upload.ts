@@ -10,7 +10,10 @@ const storage = multer.diskStorage({
     cb(null, 'uploads/') // 确保这个文件夹存在
   },
   filename(req, file, cb) {
-    cb(null, `${file.fieldname}-${Date.now()}`)
+    // 获取文件扩展名
+    const ext = path.extname(file.originalname)
+    // 生成文件名，保留扩展名
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1E9)}${ext}`)
   },
 })
 
