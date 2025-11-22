@@ -33,6 +33,7 @@ export class SiteConfig {
   globalAmount?: number
   usageCountLimit?: boolean
   showWatermark?: boolean
+  imageModels?: string
 }
 
 export class MailConfig {
