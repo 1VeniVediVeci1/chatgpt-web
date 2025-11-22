@@ -164,14 +164,12 @@ onUnmounted(() => {
           @click.stop="handleImageClick(`/uploads/${v}`)"
         >
           <!-- 
-            preview-disabled: 彻底禁用 NImage 自带预览，防止与外层点击事件冲突。
             class: cursor-pointer 提示用户可点击。
           -->
           <NImage
             :src="`/uploads/${v}`"
             alt="image"
             object-fit="contain"
-            preview-disabled
             class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
             :img-props="{ style: { maxWidth: '100%', maxHeight: '300px' }, alt: 'image' }"
           />
