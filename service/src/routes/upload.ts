@@ -1,6 +1,7 @@
 import Router from 'express'
 import multer from 'multer'
 import { auth } from '../middleware/auth'
+import path from 'path'
 
 export const router = Router()
 
