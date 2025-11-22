@@ -12,6 +12,8 @@ import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { JWT, ModelConfig } from '../types'
 import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
 import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
+import * as fs from 'node:fs/promises' // 引入 fs
+import * as path from 'node:path'      // 引入 path
 // 导入自定义 ID 生成器
 import { generateMessageId } from '../utils/id-generator'
 
@@ -19,6 +21,13 @@ import { generateMessageId } from '../utils/id-generator'
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
   // 其他特殊模型可以在这里添加
+}
+
+// 添加一个辅助函数来判断是否为文本文件
+function isTextFile(filename: string): boolean {
+  const ext = path.extname(filename).toLowerCase()
+  const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log']
+  return textExtensions.includes(ext)
 }
 
 dotenv.config()
@@ -134,26 +143,52 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
   let content: MessageContent = message
+  let fileContext = ''
+
   if (uploadFileKeys && uploadFileKeys.length > 0) {
-    content = [
-      {
-        type: 'text',
-        text: message,
-      },
-    ]
-    for (const uploadFileKey of uploadFileKeys) {
-      content.push({
-        type: 'image_url',
-        image_url: {
-          url: await convertImageUrl(uploadFileKey),
+    // 1. 先处理文本文件，读取内容拼接到 Prompt 中
+    const textFiles = uploadFileKeys.filter(key => isTextFile(key))
+    const imageFiles = uploadFileKeys.filter(key => !isTextFile(key)) // 假设非文本即图片，或者你可以加更严格的校验
+
+    if (textFiles.length > 0) {
+      for (const fileKey of textFiles) {
+        try {
+          const filePath = path.join('uploads', fileKey)
+          const fileContent = await fs.readFile(filePath, 'utf-8')
+          fileContext += `\n\n--- File Start: ${fileKey} ---\n${fileContent}\n--- File End ---\n`
+        } catch (e) {
+          console.error(`Error reading file ${fileKey}`, e)
+        }
+      }
+    }
+
+    // 组合新的 Prompt
+    const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
+
+    // 2. 如果有图片，使用多模态格式
+    if (imageFiles.length > 0) {
+      content = [
+        {
+          type: 'text',
+          text: finalMessage, // 使用包含文件内容的文本
         },
-      })
+      ]
+      for (const uploadFileKey of imageFiles) {
+        content.push({
+          type: 'image_url',
+          image_url: {
+            url: await convertImageUrl(uploadFileKey),
+          },
+        })
+      }
+    } else {
+      // 3. 如果没有图片，只有文本文件，直接作为字符串发送
+      content = finalMessage
     }
   }
 
   const abort = new AbortController()
 
-  // [ADDED] 关键改动：在API调用前，提前生成一个唯一的、自定义的消息 ID
   const customMessageId = generateMessageId()
 
   try {
@@ -170,13 +205,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     processThreads.push({ userId, abort, messageId })
 
     let text = ''
-    // [MODIFIED] 初始化 chatIdRes 为自定义 ID，以防某些情况下未被赋值
     let chatIdRes = customMessageId
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
     for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
       text += chunk.choices[0]?.delta.content ?? ''
-      // [MODIFIED] 在整个流式传输过程中，始终使用同一个自定义 ID
       chatIdRes = customMessageId
       modelRes = chunk.model
       usageRes = usageRes || chunk.usage
@@ -184,7 +217,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       console.warn('[chunk]', chunk)
       process?.({
         ...chunk,
-        // [MODIFIED] 在流式数据中也返回自定义 ID，确保前端接收到的 ID 从始至终保持一致
         id: customMessageId,
         text,
         role: chunk.choices[0]?.delta.role || 'assistant',
