@@ -334,15 +334,39 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
     }
     else {
       if (isPrompt) {
-        let content: MessageContent = chatInfo.prompt
-        if (chatInfo.images && chatInfo.images.length > 0) {
+        let promptText = chatInfo.prompt
+        const allFileKeys = chatInfo.images || [] // 数据库中我们将所有文件key都存在了 images 字段里
+        
+        const textFiles = allFileKeys.filter(k => isTextFile(k))
+        const imageFiles = allFileKeys.filter(k => !isTextFile(k))
+
+        // 1. 如果历史记录里有文本文件，重新读取内容并拼接到 Prompt 中
+        if (textFiles.length > 0) {
+          let fileContext = ''
+          for (const fileKey of textFiles) {
+            try {
+              const filePath = path.join('uploads', fileKey)
+              const fileContent = await fs.readFile(filePath, 'utf-8')
+              fileContext += `\n\n--- Context File: ${fileKey} ---\n${fileContent}\n--- End File ---\n`
+            } catch (e) {
+              console.error(`Error reading history file ${fileKey}`, e)
+            }
+          }
+          promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
+        }
+
+        // 2. 构建返回给 OpenAI 的 content
+        let content: MessageContent = promptText
+
+        // 如果还有图片文件，则转为多模态数组格式
+        if (imageFiles.length > 0) {
           content = [
             {
               type: 'text',
-              text: chatInfo.prompt,
+              text: promptText,
             },
           ]
-          for (const image of chatInfo.images) {
+          for (const image of imageFiles) {
             content.push({
               type: 'image_url',
               image_url: {
