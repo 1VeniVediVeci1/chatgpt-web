@@ -7,6 +7,7 @@ import hljs from 'highlight.js'
 import { useBasicLayout } from '@/hooks/useBasicLayout'
 import { t } from '@/locales'
 import { copyToClip } from '@/utils/copy'
+import { SvgIcon } from '@/components/common'
 
 interface Props {
   inversion?: boolean
@@ -16,7 +17,23 @@ interface Props {
   loading?: boolean
   asRawText?: boolean
 }
+  
+function isImage(filename: string | undefined): boolean {
+  if (!filename) return false
+  // 简单的后缀判断，可根据需要补充
+  return /\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(filename)
+}
 
+// 计算属性：过滤出图片
+const imageList = computed(() => {
+  return (props.images || []).filter(file => isImage(file))
+})
+
+// 计算属性：过滤出非图片（文档等）
+const fileList = computed(() => {
+  return (props.images || []).filter(file => !isImage(file))
+})
+  
 const props = defineProps<Props>()
 
 const { isMobile } = useBasicLayout()
@@ -140,7 +157,40 @@ onUnmounted(() => {
         <div v-else class="w-full whitespace-pre-wrap" v-text="text" />
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
-      <img v-for="(v, i) of images" :key="i" :src="`/uploads/${v}`" alt="" width="160px">
+      
+      <!-- 渲染图片 -->
+      <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
+        <img 
+          v-for="(v, i) of imageList" 
+          :key="`img-${i}`" 
+          :src="`/uploads/${v}`" 
+          alt="image" 
+          class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
+          style="max-width: 100%; width: 300px;"
+        >
+      </div>
+
+      <!-- 渲染非图片文件 (如文本文件) -->
+      <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
+        <a 
+          v-for="(v, i) of fileList" 
+          :key="`file-${i}`" 
+          :href="`/uploads/${v}`" 
+          target="_blank"
+          class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group"
+          style="text-decoration: none; color: inherit;"
+        >
+          <div class="flex items-center justify-center w-8 h-8 mr-2 bg-gray-100 rounded-full dark:bg-gray-700 text-gray-500 dark:text-gray-300">
+            <!-- 使用通用文件图标 -->
+            <SvgIcon icon="ri:file-text-line" class="text-lg" />
+          </div>
+          <div class="flex flex-col overflow-hidden">
+            <span class="text-sm font-medium truncate w-48">{{ v }}</span>
+            <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载/预览</span>
+          </div>
+        </a>
+      </div>
+
     </div>
   </div>
 </template>
