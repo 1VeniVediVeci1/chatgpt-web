@@ -208,6 +208,7 @@ export class SiteConfig {
     public globalAmount?: number,
     public usageCountLimit?: boolean,
     public showWatermark?: boolean,
+    public imageModels?: string, 
   ) { }
 }
 
