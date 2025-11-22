@@ -16,7 +16,6 @@ import * as fs from 'node:fs/promises' // 引入 fs
 import * as path from 'node:path'      // 引入 path
 // 导入自定义 ID 生成器
 import { generateMessageId } from '../utils/id-generator'
-import { getCacheConfig } from '../storage/config'
 
 // 在文件开头添加模型配置
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
