@@ -25,48 +25,40 @@ const { isMobile } = useBasicLayout()
 
 const textRef = ref<HTMLElement | null>(null)
 
-// -------- Markdown 图片预览核心逻辑 --------
-// 初始化给一个空字符串，不要让它为 null
+// ---------- Markdown 图片预览逻辑 ----------
 const markdownPreviewUrl = ref<string>('')
-const markdownPreviewRef = ref<any>(null)
+const markdownPreviewRef = ref<any>(null) // 使用 any 避免 TS 类型检查问题
 
 function handleImageClickFromMarkdown(src: string) {
-  // 1. 设置 URL
   markdownPreviewUrl.value = src
-  
-  // 2. 等待 DOM 更新 src
   nextTick(() => {
-    const inst = markdownPreviewRef.value
-    if (inst && inst.$el) {
-      // 核心修复：直接模拟点击 DOM 节点
-      // Naive UI 的 NImage 监听的是 onClick，所以直接触发 click() 即可
-      inst.$el.click()
-      
-      // 双重保险：如果根节点点击无效，尝试点击内部的 img 元素
-      const innerImg = inst.$el.querySelector('img')
-      if (innerImg) {
-        innerImg.click()
-      }
+    // 核心修改：
+    // 1. 获取 NImage 组件的根 DOM 元素
+    const nImageEl = markdownPreviewRef.value?.$el
+    // 2. 找到里面的 img 标签并模拟点击
+    //    (Naive UI 的 NImage 内部包含一个 img，点击它就会触发预览)
+    if (nImageEl) {
+      // 尝试找内部 img 点击，如果找不到直接点容器
+      const imgTag = nImageEl.querySelector('img')
+      if (imgTag)
+        imgTag.click()
+      else
+        nImageEl.click()
     }
   })
 }
-// -----------------------------------------
+// ----------------------------------------
 
-// 捕获 Markdown 内容点击事件
 function handleMarkdownClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
-  if (!target) return
+  if (!target)
+    return
 
-  // 只有点到 img 标签才处理
   if (target.tagName.toLowerCase() === 'img') {
-    // 阻止默认行为（防止浏览器打开新标签页等）
-    e.preventDefault()
-    e.stopPropagation()
-    
+    e.stopPropagation() // 阻止冒泡，防止触发其他点击事件
     const src = (target as HTMLImageElement).src
-    if (src) {
+    if (src)
       handleImageClickFromMarkdown(src)
-    }
   }
 }
 
@@ -186,7 +178,7 @@ onUnmounted(() => {
       class="leading-relaxed break-words"
       @click="handleMarkdownClick"
     >
-      <!-- 文本 / Markdown 渲染区域 -->
+      <!-- 文本 / Markdown -->
       <div v-if="!inversion" class="flex items-end">
         <div
           v-if="!asRawText"
@@ -198,7 +190,7 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 附件图片区域 -->
+      <!-- 附件图片 -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
         <NImageGroup>
           <NImage
@@ -216,7 +208,7 @@ onUnmounted(() => {
         </NImageGroup>
       </div>
 
-      <!-- 非图片附件区域 -->
+      <!-- 附件文件 -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a
           v-for="(v, i) of fileList"
@@ -239,17 +231,16 @@ onUnmounted(() => {
       </div>
 
       <!-- 
-        隐藏的 NImage 代理 
-        1. 去掉了 v-if，保证组件一直存在，避免挂载延迟。
-        2. 使用 fixed + 极大负值隐藏，确保不影响布局但可被 JS 触发。
+        隐藏的 NImage：
+        1. 宽高为 0，overflow hidden，绝对定位 -> 保证页面上看不见任何“多余图片”
+        2. 逻辑上存在 -> 可以被 JS 选中并触发 .click()
       -->
-      <div style="position: fixed; left: -99999px; top: -99999px; opacity: 0; pointer-events: none;">
-        <NImage
-          ref="markdownPreviewRef"
-          :src="markdownPreviewUrl"
-          :preview-disabled="false"
-        />
-      </div>
+      <NImage
+        ref="markdownPreviewRef"
+        :src="markdownPreviewUrl"
+        :preview-disabled="false"
+        style="width: 0; height: 0; overflow: hidden; position: absolute; visibility: hidden;"
+      />
     </div>
   </div>
 </template>
