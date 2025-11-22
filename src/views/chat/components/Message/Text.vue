@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import { computed, onMounted, onUnmounted, onUpdated, ref } from 'vue'
+import { NImage } from 'naive-ui' 
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
 import mila from 'markdown-it-link-attributes'
@@ -158,35 +159,38 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
       
-      <!-- 渲染图片 -->
+      <!-- 渲染图片：使用 NImage 替换 img -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
-        <img 
+        <NImage
           v-for="(v, i) of imageList" 
           :key="`img-${i}`" 
           :src="`/uploads/${v}`" 
           alt="image" 
+          object-fit="contain"
           class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
-          style="max-width: 100%; width: 300px;"
-        >
+          img-props="{ style: { maxWidth: '100%', width: '300px' } }"
+        />
+        <!-- NImage 自带点击全屏预览功能 -->
       </div>
 
-      <!-- 渲染非图片文件 (如文本文件) -->
+      <!-- 渲染非图片文件：添加 download 属性 -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a 
           v-for="(v, i) of fileList" 
           :key="`file-${i}`" 
           :href="`/uploads/${v}`" 
           target="_blank"
+          download 
           class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group"
           style="text-decoration: none; color: inherit;"
         >
           <div class="flex items-center justify-center w-8 h-8 mr-2 bg-gray-100 rounded-full dark:bg-gray-700 text-gray-500 dark:text-gray-300">
-            <!-- 使用通用文件图标 -->
             <SvgIcon icon="ri:file-text-line" class="text-lg" />
           </div>
           <div class="flex flex-col overflow-hidden">
             <span class="text-sm font-medium truncate w-48">{{ v }}</span>
-            <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载/预览</span>
+            <!-- 修改提示文字 -->
+            <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载</span>
           </div>
         </a>
       </div>
