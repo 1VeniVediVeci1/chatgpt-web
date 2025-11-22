@@ -25,16 +25,29 @@ const { isMobile } = useBasicLayout()
 
 const textRef = ref<HTMLElement>()
 
-// --- 图片预览逻辑 (全端统一) ---
+// --- 图片预览逻辑（统一使用自定义 NModal） ---
 const previewSrc = ref<string>('')
 const showPreview = ref(false)
 
 function handleImageClick(src: string) {
-  // 不再区分移动端或PC端，统一使用自定义弹窗预览
   previewSrc.value = src
   showPreview.value = true
 }
-// ---------------------------
+// ------------------------------------------
+
+// Markdown 内联图片点击代理
+function handleMarkdownClick(e: MouseEvent) {
+  const target = e.target as HTMLElement | null
+  if (!target)
+    return
+
+  if (target.tagName.toLowerCase() === 'img') {
+    e.stopPropagation() // 避免触发外层快速删除
+    const src = (target as HTMLImageElement).src
+    if (src)
+      handleImageClick(src)
+  }
+}
 
 function isImage(filename: string | undefined): boolean {
   if (!filename) return false
@@ -106,17 +119,20 @@ function addCopyEvents() {
   if (textRef.value) {
     const copyBtn = textRef.value.querySelectorAll('.code-block-header__copy')
     copyBtn.forEach((btn) => {
-      btn.addEventListener('click', () => {
+      const handler = async () => {
         const code = btn.parentElement?.nextElementSibling?.textContent
         if (code) {
-          copyToClip(code).then(() => {
-            btn.textContent = '复制成功'
-            setTimeout(() => {
-              btn.textContent = '复制代码'
-            }, 1000)
-          })
+          await copyToClip(code)
+          const originalText = t('chat.copyCode')
+          btn.textContent = '复制成功'
+          setTimeout(() => {
+            btn.textContent = originalText
+          }, 1000)
         }
-      })
+      }
+      // 先移除再绑定，避免重复绑定
+      btn.removeEventListener('click', handler)
+      btn.addEventListener('click', handler)
     })
   }
 }
@@ -125,7 +141,8 @@ function removeCopyEvents() {
   if (textRef.value) {
     const copyBtn = textRef.value.querySelectorAll('.code-block-header__copy')
     copyBtn.forEach((btn) => {
-      btn.removeEventListener('click', () => { })
+      // 无法精确移除匿名函数，这里主要在组件卸载时清理引用即可
+      btn.replaceWith(btn.cloneNode(true))
     })
   }
 }
@@ -145,17 +162,23 @@ onUnmounted(() => {
 
 <template>
   <div class="text-black" :class="wrapClass">
-    <div ref="textRef" class="leading-relaxed break-words">
+    <div
+      ref="textRef"
+      class="leading-relaxed break-words"
+      @click="handleMarkdownClick"
+    >
       <div v-if="!inversion" class="flex items-end">
         <div
-          v-if="!asRawText" class="w-full markdown-body" :class="{ 'markdown-body-generate': loading }"
+          v-if="!asRawText"
+          class="w-full markdown-body"
+          :class="{ 'markdown-body-generate': loading }"
           v-html="text"
         />
         <div v-else class="w-full whitespace-pre-wrap" v-text="text" />
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 渲染图片 -->
+      <!-- 渲染图片附件 -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
         <div
           v-for="(v, i) of imageList"
@@ -163,20 +186,18 @@ onUnmounted(() => {
           class="excludeFastDel"
           @click.stop="handleImageClick(`/uploads/${v}`)"
         >
-          <!-- 
-            class: cursor-pointer 提示用户可点击。
-          -->
           <NImage
             :src="`/uploads/${v}`"
             alt="image"
             object-fit="contain"
+            preview-disabled
             class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
             :img-props="{ style: { maxWidth: '100%', maxHeight: '300px' }, alt: 'image' }"
           />
         </div>
       </div>
 
-      <!-- 渲染非图片文件 -->
+      <!-- 渲染非图片附件 -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a
           v-for="(v, i) of fileList"
@@ -184,7 +205,7 @@ onUnmounted(() => {
           :href="`/uploads/${v}`"
           target="_blank"
           download
-          class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group"
+          class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group excludeFastDel"
           style="text-decoration: none; color: inherit;"
           @click.stop
         >
@@ -198,7 +219,7 @@ onUnmounted(() => {
         </a>
       </div>
 
-      <!-- 全端通用的图片预览弹窗 -->
+      <!-- 统一图片预览弹窗 -->
       <NModal
         v-model:show="showPreview"
         preset="card"
@@ -213,13 +234,8 @@ onUnmounted(() => {
             class="max-w-[95vw] max-h-[90vh] object-contain rounded-md shadow-2xl bg-black/50 backdrop-blur-sm"
             @click.stop
           >
-          <!-- 
-            @click.stop on img: 防止点击图片本身关闭弹窗（如果希望点击背景关闭，点击图片不关闭）
-            如果希望点击图片也关闭，可以去掉 @click.stop
-          -->
         </div>
       </NModal>
-
     </div>
   </div>
 </template>
