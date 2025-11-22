@@ -626,6 +626,15 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
+function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
+  // 限制文件大小，例如 10MB
+  if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
+    ms.error('文件大小不能超过 100MB')
+    return false
+  }
+  return true
+}
+  
 // https://github.com/tusen-ai/naive-ui/issues/4887
 function handleFinish(options: { file: UploadFileInfo; event?: ProgressEvent }) {
   if (options.file.status === 'finished') {
