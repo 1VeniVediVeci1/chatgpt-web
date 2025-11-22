@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { computed, onMounted, onUnmounted, onUpdated, ref, nextTick } from 'vue'
 import { NImage, NImageGroup } from 'naive-ui'
-import type { ImageInst } from 'naive-ui'
+import ImageInst from "naive-ui"
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
 import mila from 'markdown-it-link-attributes'
