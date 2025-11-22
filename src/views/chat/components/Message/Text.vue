@@ -164,7 +164,7 @@ onUnmounted(() => {
         <div 
           v-for="(v, i) of imageList" 
           :key="`img-${i}`" 
-          @click.stop
+          class="excludeFastDel"
         >
           <NImage
             :src="`/uploads/${v}`" 
