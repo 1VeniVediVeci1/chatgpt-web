@@ -160,7 +160,7 @@ onUnmounted(() => {
       <div v-else class="whitespace-pre-wrap" v-text="text" />
       
       <!-- 渲染图片：使用 NImage 替换 img -->
-      <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
+      <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2 excludeFastDel">
         <NImage
           v-for="(v, i) of imageList" 
           :key="`img-${i}`" 
@@ -170,7 +170,6 @@ onUnmounted(() => {
           class="rounded-md shadow-sm cursor-pointer hover:opacity-90"
           :img-props="{ style: { maxWidth: '100%', width: '300px' }, alt: 'image' }"
         />
-        <!-- NImage 自带点击全屏预览功能 -->
       </div>
 
       <!-- 渲染非图片文件：添加 download 属性 -->
