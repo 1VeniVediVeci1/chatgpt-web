@@ -1,6 +1,7 @@
 <script lang="ts" setup>
-import { computed, onMounted, onUnmounted, onUpdated, ref } from 'vue'
-import { NImage, NImageGroup, NModal } from 'naive-ui'
+import { computed, onMounted, onUnmounted, onUpdated, ref, nextTick } from 'vue'
+import { NImage, NImageGroup } from 'naive-ui'
+import type { ImageInst } from 'naive-ui'
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
 import mila from 'markdown-it-link-attributes'
@@ -25,16 +26,22 @@ const { isMobile } = useBasicLayout()
 
 const textRef = ref<HTMLElement | null>(null)
 
-// --- 图片预览逻辑 ---
-const previewSrc = ref<string>('')
-const showPreview = ref(false)
+// ---------- Markdown 图片用的隐藏 NImage 预览 ----------
+const markdownPreviewUrl = ref<string>('')
+const markdownPreviewRef = ref<ImageInst | null>(null)
 
 function handleImageClickFromMarkdown(src: string) {
-  previewSrc.value = src
-  showPreview.value = true
+  markdownPreviewUrl.value = src
+  nextTick(() => {
+    // 不同 Naive 版本方法名可能略有不同，如 preview / showPreview
+    markdownPreviewRef.value?.showPreview?.()
+    // 如果你用的版本是 preview()，则改为：
+    // markdownPreviewRef.value?.preview?.()
+  })
 }
-// ----------------------
+// ------------------------------------------------------
 
+// markdown 容器点击：只处理 <img>
 function handleMarkdownClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
   if (!target)
@@ -114,6 +121,7 @@ function highlightBlock(str: string, lang?: string) {
   return `<pre class="code-block-wrapper"><div class="code-block-header"><span class="code-block-header__lang">${lang}</span><span class="code-block-header__copy">${t('chat.copyCode')}</span></div><code class="hljs code-block-body ${lang}">${str}</code></pre>`
 }
 
+// 为代码块绑定“复制”事件
 function addCopyEvents() {
   if (textRef.value) {
     const copyBtnList = textRef.value.querySelectorAll('.code-block-header__copy')
@@ -129,7 +137,7 @@ function addCopyEvents() {
           }, 1000)
         }
       }
-      // 先移除再绑定，避免重复绑定
+      // 避免重复绑定
       btn.removeEventListener('click', handler)
       btn.addEventListener('click', handler)
     })
@@ -177,7 +185,7 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 附件图片：使用 NImageGroup + NImage，直接使用 Naive UI 预览/缩放 -->
+      <!-- 附件图片：使用 NImageGroup + NImage，点击直接进入 Naive 预览/缩放 -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
         <NImageGroup>
           <NImage
@@ -217,27 +225,13 @@ onUnmounted(() => {
         </a>
       </div>
 
-      <!-- Markdown 内 img 的预览：点击 Markdown 里的 <img>，弹出 Modal，里面用 NImageGroup + NImage -->
-      <NModal
-        v-model:show="showPreview"
-        preset="card"
-        style="width: auto; max-width: 95vw; background-color: transparent; box-shadow: none; border: none;"
-        :header-style="{ display: 'none' }"
-        :content-style="{ padding: 0, display: 'flex', justifyContent: 'center', alignItems: 'center' }"
-      >
-        <div class="relative w-full flex justify-center items-center cursor-zoom-out" @click="showPreview = false">
-          <NImageGroup>
-            <NImage
-              v-if="previewSrc"
-              :src="previewSrc"
-              object-fit="contain"
-              class="max-w-[95vw] max-h-[90vh] rounded-md shadow-2xl bg-black/50 backdrop-blur-sm cursor-zoom-in"
-              :img-props="{ style: { maxWidth: '95vw', maxHeight: '90vh', objectFit: 'contain' } }"
-              @click.stop
-            />
-          </NImageGroup>
-        </div>
-      </NModal>
+      <!-- 隐藏的 NImage：专门给 Markdown 中的 <img> 用来触发 Naive 预览器 -->
+      <NImage
+        v-if="markdownPreviewUrl"
+        ref="markdownPreviewRef"
+        :src="markdownPreviewUrl"
+        class="hidden"
+      />
     </div>
   </div>
 </template>
