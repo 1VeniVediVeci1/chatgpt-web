@@ -631,11 +631,12 @@ function handleFinish(options: { file: UploadFileInfo; event?: ProgressEvent }) 
   if (options.file.status === 'finished') {
     const response = (options.event?.target as XMLHttpRequest).response
     uploadFileKeysRef.value.push(`${response.data.fileKey}`)
+    ms.success('上传成功')
   }
 }
 
-function handleDeleteUploadFile() {
-  uploadFileKeysRef.value.pop()
+function handleDeleteUploadFile(index: number) {
+  uploadFileKeysRef.value.splice(index, 1)
 }
 
 const uploadHeaders = computed(() => {
@@ -726,34 +727,40 @@ onUnmounted(() => {
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          <div v-if="isVisionModel && uploadFileKeysRef.length > 0" class="flex items-center space-x-2 h-10">
-            <NSpace>
-              <img v-for="(v, i) of uploadFileKeysRef" :key="i" :src="`/uploads/${v}`" class="max-h-10">
-              <HoverButton @click="handleDeleteUploadFile">
-                <span class="text-xl text-[#4f555e] dark:text-white">
-                  <SvgIcon icon="ri:delete-back-2-fill" />
-                </span>
-              </HoverButton>
-            </NSpace>
+          <!-- 1. 显示已上传的文件列表 (新增) -->
+          <div v-if="uploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
+            <div 
+              v-for="(key, index) in uploadFileKeysRef" 
+              :key="index"
+              class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
+            >
+              <span class="truncate max-w-[150px]">{{ key }}</span>
+              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteUploadFile(index)">
+                <SvgIcon icon="ri:close-line" />
+              </button>
+            </div>
           </div>
-
+    
           <div class="flex items-center space-x-2">
+            <!-- 2. 修改或新增上传按钮 -->
             <div>
+              <!-- 这里的 accept 增加了常用的文本格式 -->
+              <!-- action 指向现有的上传接口，它使用 multer，通常能处理所有文件 -->
               <NUpload
-                :disabled="!isVisionModel"
-                action="/api/upload-image"
-                list-type="image"
-                class="flex items-center justify-center h-10 transition hover:bg-neutral-100 dark:hover:bg-[#414755]"
-                style="flex-flow:row nowrap;min-width:2.5em;padding:.5em;border-radius:.5em;"
+                action="/api/upload-image" 
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
-                accept="image/png, image/jpeg, image/webp, image/gif"
+                accept="image/*,.txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log"
                 @finish="handleFinish"
+                @before-upload="handleBeforeUpload"
               >
-                <span class="text-xl text-[#4f555e] dark:text-white">
-                  <SvgIcon icon="ri:image-edit-line" />
-                </span>
+                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
+                   <span class="text-xl text-[#4f555e] dark:text-white">
+                      <!-- 换一个图标表示附件 -->
+                      <SvgIcon icon="ri:attachment-2" />
+                   </span>
+                </div>
               </NUpload>
             </div>
             <HoverButton @click="handleClear">
