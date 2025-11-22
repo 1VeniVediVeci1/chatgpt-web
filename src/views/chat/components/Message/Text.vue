@@ -25,36 +25,48 @@ const { isMobile } = useBasicLayout()
 
 const textRef = ref<HTMLElement | null>(null)
 
-/**
- * -------- Markdown 图片的预览逻辑 ----------
- * 使用一个“看不见的 NImage”，点击 Markdown <img> 时：
- * 1. 把 src 赋给这个 NImage；
- * 2. nextTick 后模拟点击它的 DOM 节点，触发 Naive 自带的预览器。
- */
+// -------- Markdown 图片预览核心逻辑 --------
+// 初始化给一个空字符串，不要让它为 null
 const markdownPreviewUrl = ref<string>('')
 const markdownPreviewRef = ref<any>(null)
 
 function handleImageClickFromMarkdown(src: string) {
+  // 1. 设置 URL
   markdownPreviewUrl.value = src
+  
+  // 2. 等待 DOM 更新 src
   nextTick(() => {
     const inst = markdownPreviewRef.value
-    const el = inst?.$el as HTMLElement | undefined
-    el?.click?.()   // 等价于用户点了一下 NImage，直接打开预览层
+    if (inst && inst.$el) {
+      // 核心修复：直接模拟点击 DOM 节点
+      // Naive UI 的 NImage 监听的是 onClick，所以直接触发 click() 即可
+      inst.$el.click()
+      
+      // 双重保险：如果根节点点击无效，尝试点击内部的 img 元素
+      const innerImg = inst.$el.querySelector('img')
+      if (innerImg) {
+        innerImg.click()
+      }
+    }
   })
 }
-// --------------------------------------------
+// -----------------------------------------
 
-// markdown 容器点击：只处理 <img>
+// 捕获 Markdown 内容点击事件
 function handleMarkdownClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
-  if (!target)
-    return
+  if (!target) return
 
+  // 只有点到 img 标签才处理
   if (target.tagName.toLowerCase() === 'img') {
+    // 阻止默认行为（防止浏览器打开新标签页等）
+    e.preventDefault()
     e.stopPropagation()
+    
     const src = (target as HTMLImageElement).src
-    if (src)
+    if (src) {
       handleImageClickFromMarkdown(src)
+    }
   }
 }
 
@@ -124,7 +136,6 @@ function highlightBlock(str: string, lang?: string) {
   return `<pre class="code-block-wrapper"><div class="code-block-header"><span class="code-block-header__lang">${lang}</span><span class="code-block-header__copy">${t('chat.copyCode')}</span></div><code class="hljs code-block-body ${lang}">${str}</code></pre>`
 }
 
-// 为代码块绑定“复制”事件
 function addCopyEvents() {
   if (textRef.value) {
     const copyBtnList = textRef.value.querySelectorAll('.code-block-header__copy')
@@ -140,7 +151,6 @@ function addCopyEvents() {
           }, 1000)
         }
       }
-      // 避免重复绑定
       btn.removeEventListener('click', handler)
       btn.addEventListener('click', handler)
     })
@@ -176,7 +186,7 @@ onUnmounted(() => {
       class="leading-relaxed break-words"
       @click="handleMarkdownClick"
     >
-      <!-- 文本 / Markdown -->
+      <!-- 文本 / Markdown 渲染区域 -->
       <div v-if="!inversion" class="flex items-end">
         <div
           v-if="!asRawText"
@@ -188,7 +198,7 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 附件图片：使用 NImageGroup + NImage，点击直接进入 Naive 预览/缩放 -->
+      <!-- 附件图片区域 -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
         <NImageGroup>
           <NImage
@@ -206,7 +216,7 @@ onUnmounted(() => {
         </NImageGroup>
       </div>
 
-      <!-- 非图片附件：文件下载 -->
+      <!-- 非图片附件区域 -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a
           v-for="(v, i) of fileList"
@@ -228,12 +238,16 @@ onUnmounted(() => {
         </a>
       </div>
 
-      <!-- 隐藏的 NImage：专门给 Markdown 中的 <img> 用来触发 Naive 预览器 -->
-      <div style="position: fixed; top: -9999px; left: -9999px; width: 0; height: 0; overflow: hidden;">
+      <!-- 
+        隐藏的 NImage 代理 
+        1. 去掉了 v-if，保证组件一直存在，避免挂载延迟。
+        2. 使用 fixed + 极大负值隐藏，确保不影响布局但可被 JS 触发。
+      -->
+      <div style="position: fixed; left: -99999px; top: -99999px; opacity: 0; pointer-events: none;">
         <NImage
-          v-if="markdownPreviewUrl"
           ref="markdownPreviewRef"
           :src="markdownPreviewUrl"
+          :preview-disabled="false"
         />
       </div>
     </div>
