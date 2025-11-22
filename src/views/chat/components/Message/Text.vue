@@ -27,23 +27,23 @@ const textRef = ref<HTMLElement | null>(null)
 
 // ---------- Markdown 图片预览逻辑 ----------
 const markdownPreviewUrl = ref<string>('')
-const markdownPreviewRef = ref<any>(null) // 使用 any 避免 TS 类型检查问题
+const markdownPreviewRef = ref<any>(null)
 
 function handleImageClickFromMarkdown(src: string) {
+  // 1. 设置预览图地址
   markdownPreviewUrl.value = src
+  
   nextTick(() => {
-    // 核心修改：
-    // 1. 获取 NImage 组件的根 DOM 元素
+    // 2. 模拟点击隐藏的 NImage
     const nImageEl = markdownPreviewRef.value?.$el
-    // 2. 找到里面的 img 标签并模拟点击
-    //    (Naive UI 的 NImage 内部包含一个 img，点击它就会触发预览)
     if (nImageEl) {
-      // 尝试找内部 img 点击，如果找不到直接点容器
       const imgTag = nImageEl.querySelector('img')
-      if (imgTag)
+      // 必须阻止这次模拟点击的冒泡，虽然移出了容器，但为了保险加上 stop
+      if (imgTag) {
         imgTag.click()
-      else
+      } else {
         nImageEl.click()
+      }
     }
   })
 }
@@ -54,9 +54,20 @@ function handleMarkdownClick(e: MouseEvent) {
   if (!target)
     return
 
+  // 只有点击的是 img 标签才处理
   if (target.tagName.toLowerCase() === 'img') {
-    e.stopPropagation() // 阻止冒泡，防止触发其他点击事件
+    // 获取 src
     const src = (target as HTMLImageElement).src
+    
+    // 如果点击的是我们要预览的那张隐藏图本身，直接返回，防止死循环（双重保险）
+    // 检查 class 或者父级是否是隐藏容器
+    if (target.closest('.hidden-preview-image')) {
+        return
+    }
+
+    e.stopPropagation()
+    e.preventDefault() // 阻止默认行为
+    
     if (src)
       handleImageClickFromMarkdown(src)
   }
@@ -173,6 +184,10 @@ onUnmounted(() => {
 
 <template>
   <div class="text-black" :class="wrapClass">
+    <!-- 
+      注意：这个 div 绑定了 click 事件，
+      所以 NImage 必须放在这个 div 外面，否则模拟点击会冒泡回来导致死循环 
+    -->
     <div
       ref="textRef"
       class="leading-relaxed break-words"
@@ -229,19 +244,20 @@ onUnmounted(() => {
           </div>
         </a>
       </div>
-
-      <!-- 
-        隐藏的 NImage：
-        1. 宽高为 0，overflow hidden，绝对定位 -> 保证页面上看不见任何“多余图片”
-        2. 逻辑上存在 -> 可以被 JS 选中并触发 .click()
-      -->
-      <NImage
-        ref="markdownPreviewRef"
-        :src="markdownPreviewUrl"
-        :preview-disabled="false"
-        style="width: 0; height: 0; overflow: hidden; position: absolute; visibility: hidden;"
-      />
     </div>
+
+    <!-- 
+      【重要修改】
+      隐藏的 NImage 移到了 @click="handleMarkdownClick" 的容器外面
+      这样模拟点击它时，不会再次触发上面的 click 事件，避免死循环。
+    -->
+    <NImage
+      ref="markdownPreviewRef"
+      :src="markdownPreviewUrl"
+      :preview-disabled="false"
+      class="hidden-preview-image"
+      style="width: 0; height: 0; overflow: hidden; position: absolute; visibility: hidden;"
+    />
   </div>
 </template>
 
