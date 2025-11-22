@@ -1,7 +1,6 @@
 <script lang="ts" setup>
 import { computed, onMounted, onUnmounted, onUpdated, ref, nextTick } from 'vue'
 import { NImage, NImageGroup } from 'naive-ui'
-import ImageInst from "naive-ui"
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
 import mila from 'markdown-it-link-attributes'
@@ -28,14 +27,15 @@ const textRef = ref<HTMLElement | null>(null)
 
 // ---------- Markdown 图片用的隐藏 NImage 预览 ----------
 const markdownPreviewUrl = ref<string>('')
-const markdownPreviewRef = ref<ImageInst | null>(null)
+// 不强求具体类型，用 any 即可，避免 TS 报错
+const markdownPreviewRef = ref<any>(null)
 
 function handleImageClickFromMarkdown(src: string) {
   markdownPreviewUrl.value = src
   nextTick(() => {
     // 不同 Naive 版本方法名可能略有不同，如 preview / showPreview
     markdownPreviewRef.value?.showPreview?.()
-    // 如果你用的版本是 preview()，则改为：
+    // 如果你用的 Naive 版本是 preview()：
     // markdownPreviewRef.value?.preview?.()
   })
 }
