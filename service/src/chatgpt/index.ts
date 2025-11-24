@@ -148,7 +148,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   
   const isImage = imageModelList.some(m => model.includes(m))
-  const isGeminiImageModel = isImage && model === 'gemini-3-pro-image-pro'
+  // 只要是图片模型且名字包含 gemini 即可
+  const isGeminiImageModel = isImage && model.includes('gemini')
+
 
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
