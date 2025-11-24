@@ -2,7 +2,7 @@ import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
 import fetch, { Request } from 'node-fetch'
-import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai' // [新增] 引入 SDK
+import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -17,15 +17,56 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
+import * as fsData from 'fs' // 用于流式写入
 
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
 }
 
+// 定义上传文件目录，建议使用绝对路径防止路径错乱
+const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads')
+
+// [新增] 确保上传目录存在
+async function ensureUploadDir() {
+  try {
+    await fs.access(UPLOAD_DIR)
+  } catch {
+    await fs.mkdir(UPLOAD_DIR, { recursive: true })
+  }
+}
+
+// 判断是否为文本文件
 function isTextFile(filename: string): boolean {
   const ext = path.extname(filename).toLowerCase()
-  const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log']
+  const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log', '.ini', '.config']
   return textExtensions.includes(ext)
+}
+
+// [新增] 显式判断是否为图片文件（避免把 PDF 当图片传给 AI）
+function isImageFile(filename: string): boolean {
+  const ext = path.extname(filename).toLowerCase()
+  const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.bmp']
+  return imageExtensions.includes(ext)
+}
+
+// [新增] 从本地文件读取并转为 Base64
+async function getFileBase64(filename: string): Promise<{ mime: string; data: string } | null> {
+  try {
+    const filePath = path.join(UPLOAD_DIR, filename)
+    await fs.access(filePath) // 检查是否存在
+    const buffer = await fs.readFile(filePath)
+    const ext = path.extname(filename).toLowerCase().replace('.', '')
+    let mime = 'image/png'
+    if (ext === 'jpg' || ext === 'jpeg') mime = 'image/jpeg'
+    else if (ext === 'webp') mime = 'image/webp'
+    else if (ext === 'gif') mime = 'image/gif'
+    else if (ext === 'heic') mime = 'image/heic'
+    
+    return { mime, data: buffer.toString('base64') }
+  } catch (e) {
+    console.error(`[File Read Error] ${filename}:`, e)
+    return null
+  }
 }
 
 dotenv.config()
@@ -42,8 +83,7 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// [新增] Gemini 会话内存缓存：Key = userId:roomId:model
-// 用于在多轮对话中保持 SDK 的 ChatSession 实例，从而自动携带 thought_signature
+// Gemini 会话内存缓存
 const geminiChats = new Map<string, ChatSession>()
 
 export async function initApi(key: KeyConfig, {
@@ -84,10 +124,8 @@ export async function initApi(key: KeyConfig, {
     if (!message)
       break
     
-    // 即使是 OpenAI 调用，也确保 content 里没有超长 base64
     let safeContent = message.text
     if (typeof safeContent === 'string') {
-       // 二次清洗，防止 getMessageById 漏网（虽然那里已经处理了）
        safeContent = safeContent.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
     }
 
@@ -122,7 +160,6 @@ export async function initApi(key: KeyConfig, {
     options.top_p = top_p
   }
 
-  // [调试日志]
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
   const apiResponse = await openai.chat.completions.create(options, {
@@ -134,21 +171,17 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
-// [新增] 辅助函数：为了让 SDK 支持自定义 baseUrl (反代)，我们需要劫持 fetch
 function createCustomFetch(baseUrl: string) {
   return async (url: string | Request | URL, init?: any) => {
     let fetchUrl = url.toString()
-    // SDK 默认请求 https://generativelanguage.googleapis.com/...
-    // 我们将其替换为用户配置的 baseUrl
     if (baseUrl && fetchUrl.includes('generativelanguage.googleapis.com')) {
       fetchUrl = fetchUrl.replace('https://generativelanguage.googleapis.com', baseUrl.replace(/\/+$/, ''))
     }
     console.log(`[Gemini SDK] Fetching: ${fetchUrl}`)
-    return fetch(fetchUrl, init) // 使用 node-fetch
+    return fetch(fetchUrl, init)
   }
 }
 
-// [新增] 获取或创建 Gemini ChatSession
 function getGeminiChatSession(
   apiKey: string,
   modelName: string,
@@ -156,16 +189,12 @@ function getGeminiChatSession(
   sessionKey: string,
   systemInstruction?: string
 ): ChatSession {
-  // 注意：如果不希望重启服务后丢失 history，需要做持久化加载
-  // 现阶段为了解决 400 thought_signature 问题，我们优先使用内存中的会话
   let chatSession = geminiChats.get(sessionKey)
 
   if (!chatSession) {
     console.log(`[Gemini SDK] Creating new session for ${sessionKey}`)
     const genAI = new GoogleGenerativeAI(apiKey)
     
-    // 如果有 baseUrl，通过自定义 requestOptions 传入 fetch
-    // 注意：Google SDK 的 requestOptions 在 getGenerativeModel 中设置
     const requestOptions: any = {}
     if (baseUrl) {
       requestOptions.customFetch = createCustomFetch(baseUrl)
@@ -177,7 +206,7 @@ function getGeminiChatSession(
     }, requestOptions)
 
     chatSession = model.startChat({
-      history: [], // 初始为空，后续 SDK 会自动维护
+      history: [], 
     })
     geminiChats.set(sessionKey, chatSession)
   }
@@ -186,46 +215,49 @@ function getGeminiChatSession(
 }
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
+  // 1. 初始化
+  await ensureUploadDir() // 确保 Docker 内目录存在
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const userId = options.user._id.toString()
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
   const messageId = options.messageId
+  
   if (key == null || key === undefined)
     throw new Error('没有对应的 apikeys 配置，请再试一次。')
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
+  
+  // 2. 文件分类与文本注入逻辑 [核心修改]
   let content: MessageContent = message
   let fileContext = ''
-  const globalConfig = await getCacheConfig()
-  const imageModelsStr = globalConfig.siteConfig.imageModels || ''
-  const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   
-  const isImage = imageModelList.some(m => model.includes(m))
-  // 只要是图片模型且名字包含 gemini 即可
-  const isGeminiImageModel = isImage && model.includes('gemini')
-
-
+  // 仅识别文本文件和图片文件
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
-    const imageFiles = uploadFileKeys.filter(key => !isTextFile(key))
+    const imageFiles = uploadFileKeys.filter(key => isImageFile(key)) // 修复：仅处理已知的图片格式
 
+    // 处理文本文件：读出内容拼接到 prompt
     if (textFiles.length > 0) {
       for (const fileKey of textFiles) {
         try {
-          const filePath = path.join('uploads', fileKey)
+          const filePath = path.join(UPLOAD_DIR, fileKey)
+          // 检查文件是否存在
+          await fs.access(filePath)
           const fileContent = await fs.readFile(filePath, 'utf-8')
           fileContext += `\n\n--- File Start: ${fileKey} ---\n${fileContent}\n--- File End ---\n`
         } catch (e) {
-          console.error(`Error reading file ${fileKey}`, e)
+          console.error(`Error reading text file ${fileKey}`, e)
+          fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n`
         }
       }
     }
 
     const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
 
+    // 处理图片文件：构造 OpenAI 格式的 MessageContent
     if (imageFiles.length > 0) {
       content = [
         {
@@ -237,29 +269,33 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         content.push({
           type: 'image_url',
           image_url: {
-            url: await convertImageUrl(uploadFileKey),
+            url: await convertImageUrl(uploadFileKey), // 这里返回的是 /uploads/xxx 或 base64
           },
         })
       }
     } else {
+      // 只有文本
       content = finalMessage
     }
   }
+
+  const globalConfig = await getCacheConfig()
+  const imageModelsStr = globalConfig.siteConfig.imageModels || ''
+  const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+  const isImage = imageModelList.some(m => model.includes(m))
+  const isGeminiImageModel = isImage && model.includes('gemini')
 
   const abort = new AbortController()
   const customMessageId = generateMessageId()
 
   try {
-    // ====== ① Gemini 图片模型（SDK 托管会话） [修改] ======
+    // ====== ① Gemini 图片模型（SDK 托管会话） ======
     if (isGeminiImageModel) {
-      // 1. 构造 Session Key (相同房间复用同一个 SDK session)
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
-      const sessionKey = `${userId}:${options.room.roomId}:${model}` // 用户:房间:模型
+      const sessionKey = `${userId}:${options.room.roomId}:${model}`
       
-      // 2. 初始化或获取 Session
       const chatSession = getGeminiChatSession(key.key, model, baseUrl, sessionKey, systemMessage)
 
-      // 3. 构造本轮输入 (Parts)
       const inputParts: Part[] = []
       
       // 3.1 提取文本
@@ -275,23 +311,30 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       if (promptText) inputParts.push({ text: promptText })
 
-      // 3.2 提取图片 (OpenAI 格式转 Gemini InlineData)
+      // 3.2 提取图片并转为 Gemini SDK 需要的 InlineData
       if (Array.isArray(content)) {
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
-            // part.image_url.url 格式如: data:image/png;base64,xxxxx
-            const dataUrl = (part as any).image_url.url as string
-            const [header, base64Data] = dataUrl.split(',')
-            if (header && base64Data) {
-              const mimeMatch = header.match(/:(.*?);/)
-              const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
-              
-              inputParts.push({
-                inlineData: {
-                  mimeType,
-                  data: base64Data
+            const urlStr = (part as any).image_url.url as string
+            
+            // 情况A: Data URL (Base64)
+            if (urlStr.startsWith('data:')) {
+                const [header, base64Data] = urlStr.split(',')
+                if (header && base64Data) {
+                  const mimeMatch = header.match(/:(.*?);/)
+                  const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
+                  inputParts.push({ inlineData: { mimeType, data: base64Data } })
                 }
-              })
+            } 
+            // 情况B: 本地路径 /uploads/xxx.png [这是修复文件上传的关键]
+            else if (urlStr.includes('/uploads/')) {
+                const filename = path.basename(urlStr)
+                const fileData = await getFileBase64(filename)
+                if (fileData) {
+                    inputParts.push({ 
+                        inlineData: { mimeType: fileData.mime, data: fileData.data } 
+                    })
+                }
             }
           }
         }
@@ -299,11 +342,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       processThreads.push({ userId, abort, messageId })
 
-      // 4. 发送消息
-      const result = await chatSession.sendMessage(inputParts) // SDK 自动处理 history 和 signature
+      const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
       
-      // 5. 解析结果并保存生成的图片
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
@@ -316,7 +357,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
-          const filePath = path.join('uploads', filename)
+          const filePath = path.join(UPLOAD_DIR, filename) // 使用统一的 UPLOAD_DIR
           await fs.writeFile(filePath, buffer)
           
           const prefix = text ? '\n\n' : ''
@@ -324,7 +365,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      if (!text) text = JSON.stringify(response) // Fallback
+      if (!text) text = JSON.stringify(response)
 
       const usageRes: any = response.usageMetadata
         ? {
@@ -335,7 +376,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           }
         : undefined
 
-      // 6. 推送前端更新
       process?.({
         id: customMessageId,
         text,
@@ -462,7 +502,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     globalThis.console.error(error)
     
-    // 尝试清除 Session 缓存，以防 Session 出错影响后续（例如 Key 变了）
     if (isGeminiImageModel) {
         const sessionKey = `${userId}:${options.room.roomId}:${model}`
         geminiChats.delete(sessionKey)
@@ -512,7 +551,6 @@ async function chatConfig() {
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
 
-// [重要修改] 在获取历史消息时，清洗掉可能存在的旧 Base64 数据
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -529,24 +567,24 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       if (isPrompt) {
         let promptText = chatInfo.prompt
         const allFileKeys = chatInfo.images || []
+        // 使用新的判断函数
         const textFiles = allFileKeys.filter(k => isTextFile(k))
-        const imageFiles = allFileKeys.filter(k => !isTextFile(k))
+        const imageFiles = allFileKeys.filter(k => isImageFile(k)) 
 
         if (textFiles.length > 0) {
           let fileContext = ''
           for (const fileKey of textFiles) {
             try {
-              const filePath = path.join('uploads', fileKey)
+              const filePath = path.join(UPLOAD_DIR, fileKey) // 使用 UPLOAD_DIR
               const fileContent = await fs.readFile(filePath, 'utf-8')
               fileContext += `\n\n--- Context File: ${fileKey} ---\n${fileContent}\n--- End File ---\n`
             } catch (e) {
-              console.error(`Error reading history file ${fileKey}`, e)
+               // 忽略丢失的历史文件
             }
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
         
-        // 强制清理 Prompt 中的 Base64 脏数据
         if (promptText && typeof promptText === 'string') {
            promptText = promptText.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
         }
@@ -571,11 +609,8 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         }
       }
       else {
-        // [Fix] 清洗 Assistant 回复中的 Base64 图片
-        // 如果历史记录里有旧的 base64 图片，这里会把它变成简短文字，从而避免后续请求 Token 爆炸
         let responseText = chatInfo.response || ''
         if (responseText.includes('data:image') && responseText.includes('base64')) {
-            // 正则替换 Markdown 图片语法中包含 data:image 的部分
             responseText = responseText.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image History]')
         }
         
