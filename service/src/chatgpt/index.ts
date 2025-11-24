@@ -1,6 +1,7 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
+import fetch from 'node-fetch' // 新增 fetch 依赖
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -54,7 +55,7 @@ export async function initApi(key: KeyConfig, {
   systemMessage,
   lastMessageId,
   //传入是否为图片模型的标记
-  isImageModel, 
+  isImageModel,
 }: Pick<OpenAI.ChatCompletionCreateParams, 'temperature' | 'model' | 'top_p'> & {
   maxContextCount: number
   content: MessageContent
@@ -74,7 +75,7 @@ export async function initApi(key: KeyConfig, {
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
   const finalTemperature = modelConfig.defaultTemperature ?? temperature
   const shouldUseTopP = modelConfig.supportTopP
-  
+
   const messages: OpenAI.ChatCompletionMessageParam[] = []
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId)
@@ -125,7 +126,7 @@ export async function initApi(key: KeyConfig, {
   console.dir(options, { depth: null, colors: true })
   console.log('/=======================================================================/\n')
   // [调试模式] - 结束
-  
+
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
   })
@@ -155,9 +156,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   //将配置字符串按逗号分割，去除空格，生成数组
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   //判断当前模型是否包含在配置列表中 (支持模糊匹配，比如配置 gemini-3-pro 会匹配 gemini-3-pro-image)
-  //或者精确匹配： const isImage = imageModelList.includes(model)
-  const isImage = imageModelList.some(m => model.includes(m))
   
+  const isImage = imageModelList.some(m => model.includes(m))
+  // 特殊判断是否为 gemini-3-pro-image-pro 模型
+  const isGeminiImageModel = isImage && model === 'gemini-3-pro-image-pro'
+
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     // 1. 先处理文本文件，读取内容拼接到 Prompt 中
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
@@ -205,6 +208,141 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const customMessageId = generateMessageId()
 
   try {
+    // ====== ① Gemini 图片模型，单独走 Google 接口 ======
+    if (isGeminiImageModel) {
+      // 优先使用 Key 的 baseUrl，如果没有配置，则使用默认的 Google 官方地址
+      // 这样你可以通过配置 Key 的 baseUrl 实现自定义反代
+      const GEMINI_BASE_URL = isNotEmptyString(key.baseUrl)
+        ? key.baseUrl
+        : 'https://generativelanguage.googleapis.com'
+
+      const endpoint = `${GEMINI_BASE_URL.replace(/\/+$/, '')}/v1beta/models/gemini-3-pro-image:generateContent?key=${encodeURIComponent(key.key)}`
+
+      // 从 content 中提取纯文本 prompt（只用文本，不用图片，避免再次塞 base64）
+      let promptText = ''
+      if (typeof content === 'string') {
+        promptText = content
+      }
+      else if (Array.isArray(content)) {
+        for (const part of content) {
+          if ((part as any).type === 'text' && (part as any).text)
+            promptText += `${(part as any).text}\n`
+        }
+      }
+
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: promptText },
+            ],
+          },
+        ],
+      }
+
+      processThreads.push({ userId, abort, messageId })
+
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        // node-fetch 支持 AbortController.signal
+        // @ts-expect-error
+        signal: abort.signal,
+        body: JSON.stringify(body),
+      })
+
+      if (!resp.ok) {
+        const errText = await resp.text()
+        throw new Error(`Gemini API error: ${resp.status} ${errText}`)
+      }
+
+      const data: any = await resp.json()
+
+      let text = ''
+      
+      const candidate = data.candidates?.[0]
+      const parts = candidate?.content?.parts ?? []
+
+      for (const part of parts) {
+        // 普通文本
+        if (part.text)
+          text += part.text
+
+        // 图片结果：inlineData.base64 -> 写入 uploads/ 下的文件，再用 /uploads/xxx.png 引用
+        // 这样避免将超长 base64 放入 text 导致 token 溢出
+        if (part.inlineData?.data) {
+          const mime = part.inlineData.mimeType || 'image/png'
+          const base64 = part.inlineData.data as string
+
+          // 解码 Base64
+          const buffer = Buffer.from(base64, 'base64')
+          const ext = mime.split('/')[1] || 'png'
+          // 生成唯一文件名
+          const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
+          const filePath = path.join('uploads', filename)
+
+          // 写入文件到 uploads 目录
+          await fs.writeFile(filePath, buffer)
+
+          // 在文本中插入一个本地链接
+          const prefix = text ? '\n\n' : ''
+          text += `${prefix}![Generated Image](/uploads/${filename})`
+        }
+      }
+
+      if (!text)
+        text = JSON.stringify(data)
+
+      const usageRes: any = data.usageMetadata
+        ? {
+            prompt_tokens: data.usageMetadata.promptTokenCount ?? 0,
+            completion_tokens: data.usageMetadata.candidatesTokenCount ?? 0,
+            total_tokens: data.usageMetadata.totalTokenCount ?? 0,
+            estimated: true,
+          }
+        : undefined
+
+      // 回调给前端（非流式，只回一次）
+      process?.({
+        id: customMessageId,
+        text,
+        role: 'assistant',
+        conversationId: lastContext.conversationId,
+        parentMessageId: lastContext.parentMessageId,
+        // detail 可不需要，用不到 usage 的话也可以省略
+        detail: undefined as any,
+      })
+
+      // 返回统一结构给前端
+      return sendResponse({
+        type: 'Success',
+        data: {
+          object: 'chat.completion',
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: text,
+            },
+            finish_reason: 'stop',
+            index: 0,
+            logprobs: null,
+          }],
+          created: Date.now(),
+          conversationId: lastContext.conversationId,
+          model,
+          text,
+          id: customMessageId,
+          detail: {
+            usage: usageRes,
+          },
+        },
+      })
+    }
+
+    // ====== ② 其它模型仍然走 OpenAI SDK ======
     const api = await initApi(key, {
       model,
       maxContextCount,
