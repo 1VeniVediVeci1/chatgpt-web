@@ -249,7 +249,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           'Content-Type': 'application/json',
         },
         // node-fetch 支持 AbortController.signal
-        // @ts-expect-error
         signal: abort.signal,
         body: JSON.stringify(body),
       })
