@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import fetch from 'node-fetch' // 新增 fetch 依赖
+import fetch from 'node-fetch'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -13,18 +13,14 @@ import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { JWT, ModelConfig } from '../types'
 import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
 import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
-import * as fs from 'node:fs/promises' // 引入 fs
-import * as path from 'node:path'      // 引入 path
-// 导入自定义 ID 生成器
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
 
-// 在文件开头添加模型配置
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
-  // 其他特殊模型可以在这里添加
 }
 
-// 添加一个辅助函数来判断是否为文本文件
 function isTextFile(filename: string): boolean {
   const ext = path.extname(filename).toLowerCase()
   const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log']
@@ -54,7 +50,6 @@ export async function initApi(key: KeyConfig, {
   content,
   systemMessage,
   lastMessageId,
-  //传入是否为图片模型的标记
   isImageModel,
 }: Pick<OpenAI.ChatCompletionCreateParams, 'temperature' | 'model' | 'top_p'> & {
   maxContextCount: number
@@ -71,7 +66,7 @@ export async function initApi(key: KeyConfig, {
     apiKey: key.key,
     maxRetries: 0,
   })
-  // 根据模型类型调整参数
+  
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
   const finalTemperature = modelConfig.defaultTemperature ?? temperature
   const shouldUseTopP = modelConfig.supportTopP
@@ -83,9 +78,17 @@ export async function initApi(key: KeyConfig, {
     const message = await getMessageById(lastMessageId)
     if (!message)
       break
+    
+    // 即使是 OpenAI 调用，也确保 content 里没有超长 base64
+    let safeContent = message.text
+    if (typeof safeContent === 'string') {
+       // 二次清洗，防止 getMessageById 漏网（虽然那里已经处理了）
+       safeContent = safeContent.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
+    }
+
     messages.push({
       role: message.role as any,
-      content: message.text,
+      content: safeContent,
     })
     lastMessageId = message.parentMessageId
   }
@@ -110,22 +113,12 @@ export async function initApi(key: KeyConfig, {
     messages,
   }
   options.temperature = finalTemperature
-  // 只有支持 top_p 的模型才添加该参数
   if (shouldUseTopP) {
     options.top_p = top_p
   }
 
-  // [调试模式] - 开始 - 新增的调试代码块
-  console.log('\n/==================== OpenAI API 请求体 (调试模式) ====================/')
-  console.log(`[调试] 请求时间: ${new Date().toISOString()}`)
-  console.log(`[调试] 目标 URL: ${OPENAI_API_BASE_URL}`)
-  // 为安全起见，只打印 API Key 的前5位和后4位
-  console.log(`[调试] 使用 API Key: ${key.key.substring(0, 5)}...${key.key.slice(-4)}`)
-  console.log('[调试] 完整请求负载 (Payload):')
-  // 使用 console.dir 可以更好地格式化对象，并完整打印嵌套内容
-  console.dir(options, { depth: null, colors: true })
-  console.log('/=======================================================================/\n')
-  // [调试模式] - 结束
+  // [调试日志]
+  console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
@@ -150,21 +143,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
   let content: MessageContent = message
   let fileContext = ''
-  //获取全局配置，判断当前模型是否在图片模型列表中
   const globalConfig = await getCacheConfig()
   const imageModelsStr = globalConfig.siteConfig.imageModels || ''
-  //将配置字符串按逗号分割，去除空格，生成数组
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
-  //判断当前模型是否包含在配置列表中 (支持模糊匹配，比如配置 gemini-3-pro 会匹配 gemini-3-pro-image)
   
   const isImage = imageModelList.some(m => model.includes(m))
-  // 特殊判断是否为 gemini-3-pro-image-pro 模型
   const isGeminiImageModel = isImage && model === 'gemini-3-pro-image-pro'
 
   if (uploadFileKeys && uploadFileKeys.length > 0) {
-    // 1. 先处理文本文件，读取内容拼接到 Prompt 中
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
-    const imageFiles = uploadFileKeys.filter(key => !isTextFile(key)) // 假设非文本即图片，或者你可以加更严格的校验
+    const imageFiles = uploadFileKeys.filter(key => !isTextFile(key))
 
     if (textFiles.length > 0) {
       for (const fileKey of textFiles) {
@@ -178,15 +166,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
     }
 
-    // 组合新的 Prompt
     const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
 
-    // 2. 如果有图片，使用多模态格式
     if (imageFiles.length > 0) {
       content = [
         {
           type: 'text',
-          text: finalMessage, // 使用包含文件内容的文本
+          text: finalMessage,
         },
       ]
       for (const uploadFileKey of imageFiles) {
@@ -198,27 +184,22 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         })
       }
     } else {
-      // 3. 如果没有图片，只有文本文件，直接作为字符串发送
       content = finalMessage
     }
   }
 
   const abort = new AbortController()
-
   const customMessageId = generateMessageId()
 
   try {
-    // ====== ① Gemini 图片模型，单独走 Google 接口 ======
+    // ====== ① Gemini 图片模型 ======
     if (isGeminiImageModel) {
-      // 优先使用 Key 的 baseUrl，如果没有配置，则使用默认的 Google 官方地址
-      // 这样你可以通过配置 Key 的 baseUrl 实现自定义反代
       const GEMINI_BASE_URL = isNotEmptyString(key.baseUrl)
         ? key.baseUrl
         : 'https://generativelanguage.googleapis.com'
 
       const endpoint = `${GEMINI_BASE_URL.replace(/\/+$/, '')}/v1beta/models/gemini-3-pro-image:generateContent?key=${encodeURIComponent(key.key)}`
 
-      // 从 content 中提取纯文本 prompt（只用文本，不用图片，避免再次塞 base64）
       let promptText = ''
       if (typeof content === 'string') {
         promptText = content
@@ -230,6 +211,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
+      // [关键优化] 图片生成通常不需要过长的历史上下文，但为了支持"变成蓝色"这种指令，可以尝试带一点点最近的文本历史
+      // 但为了防止 Token 爆炸，这里目前策略是：只发当前 Prompt。
+      // 如果你需要上下文，必须确保上文没有 Base64。
+      
       const body = {
         contents: [
           {
@@ -248,7 +233,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         headers: {
           'Content-Type': 'application/json',
         },
-        // node-fetch 支持 AbortController.signal
         signal: abort.signal,
         body: JSON.stringify(body),
       })
@@ -259,41 +243,29 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
 
       const data: any = await resp.json()
-
       let text = ''
       
       const candidate = data.candidates?.[0]
       const parts = candidate?.content?.parts ?? []
 
       for (const part of parts) {
-        // 普通文本
-        if (part.text)
-          text += part.text
+        if (part.text) text += part.text
 
-        // 图片结果：inlineData.base64 -> 写入 uploads/ 下的文件，再用 /uploads/xxx.png 引用
-        // 这样避免将超长 base64 放入 text 导致 token 溢出
         if (part.inlineData?.data) {
           const mime = part.inlineData.mimeType || 'image/png'
           const base64 = part.inlineData.data as string
-
-          // 解码 Base64
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
-          // 生成唯一文件名
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           const filePath = path.join('uploads', filename)
-
-          // 写入文件到 uploads 目录
           await fs.writeFile(filePath, buffer)
-
-          // 在文本中插入一个本地链接
+          
           const prefix = text ? '\n\n' : ''
           text += `${prefix}![Generated Image](/uploads/${filename})`
         }
       }
 
-      if (!text)
-        text = JSON.stringify(data)
+      if (!text) text = JSON.stringify(data)
 
       const usageRes: any = data.usageMetadata
         ? {
@@ -304,27 +276,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           }
         : undefined
 
-      // 回调给前端（非流式，只回一次）
       process?.({
         id: customMessageId,
         text,
         role: 'assistant',
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
-        // detail 可不需要，用不到 usage 的话也可以省略
-        detail: undefined as any,
+        detail: undefined,
       })
 
-      // 返回统一结构给前端
       return sendResponse({
         type: 'Success',
         data: {
           object: 'chat.completion',
           choices: [{
-            message: {
-              role: 'assistant',
-              content: text,
-            },
+            message: { role: 'assistant', content: text },
             finish_reason: 'stop',
             index: 0,
             logprobs: null,
@@ -334,14 +300,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           model,
           text,
           id: customMessageId,
-          detail: {
-            usage: usageRes,
-          },
+          detail: { usage: usageRes },
         },
       })
     }
 
-    // ====== ② 其它模型仍然走 OpenAI SDK ======
+    // ====== ② 其它模型 (OpenAI SDK) ======
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -360,18 +324,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let modelRes = ''
     let usageRes: OpenAI.Completions.CompletionUsage
 
-    //分支处理
     if (isImage) {
-      // --- 图片模型 (非流式处理) ---
-      // 注意：这里 api 的类型不仅是 ChatCompletionChunk，也可能是 ChatCompletion
-      const response = api as any // 简单处理类型推断问题
+      const response = api as any
       const choice = response.choices[0]
       let rawContent = choice.message?.content || ''
-      
       modelRes = response.model
       usageRes = response.usage
 
-      // 自动包装 Markdown 图片语法
       if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) {
          text = `![Generated Image](${rawContent})`
       } else {
@@ -384,7 +343,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         role: choice.message.role || 'assistant',
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
-        // 伪造一个 detail 对象给前端
         detail: {
             choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
             created: response.created,
@@ -396,14 +354,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
 
     } else {
-      // --- 文本模型 (流式处理) ---
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
-         // ... (原有的流式处理逻辑保持不变) ...
          text += chunk.choices[0]?.delta.content ?? ''
          chatIdRes = customMessageId
          modelRes = chunk.model
          usageRes = usageRes || chunk.usage
- 
          process?.({
            ...chunk,
            id: customMessageId,
@@ -420,10 +375,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       data: {
         object: 'chat.completion',
         choices: [{
-          message: {
-            role: 'assistant',
-            content: text,
-          },
+          message: { role: 'assistant', content: text },
           finish_reason: 'stop',
           index: 0,
           logprobs: null,
@@ -432,19 +384,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         conversationId: lastContext.conversationId,
         model: modelRes,
         text,
-        //最终返回的数据中包含自定义 ID
         id: chatIdRes,
         detail: {
-          usage: usageRes && {
-            ...usageRes,
-            estimated: false,
-          },
+          usage: usageRes && { ...usageRes, estimated: false },
         },
       },
     })
   }
   catch (error: any) {
-    // 保留了原有的复杂错误处理和重试机制
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
       if (options.tryCount++ < 3) {
@@ -459,19 +406,15 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
-    // 保留了原有的 Abort 清理逻辑
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1)
       processThreads.splice(index, 1)
   }
 }
 
-// --- 以下所有辅助函数均保持不变，因为它们与ID生成无关 ---
-
 export function abortChatProcess(userId: string) {
   const index = processThreads.findIndex(d => d.userId === userId)
-  if (index <= -1)
-    return
+  if (index <= -1) return
   const messageId = processThreads[index].messageId
   processThreads[index].abort.abort()
   processThreads.splice(index, 1)
@@ -479,8 +422,7 @@ export function abortChatProcess(userId: string) {
 }
 
 export function initAuditService(audit: AuditConfig) {
-  if (!audit || !audit.options || !audit.options.apiKey || !audit.options.apiSecret)
-    return
+  if (!audit || !audit.options || !audit.options.apiKey || !audit.options.apiSecret) return
   const Service = textAuditServices[audit.provider]
   auditService = new Service(audit.options)
 }
@@ -489,12 +431,10 @@ async function containsSensitiveWords(audit: AuditConfig, text: string): Promise
   if (audit.customizeEnabled && isNotEmptyString(audit.sensitiveWords)) {
     const textLower = text.toLowerCase()
     const notSafe = audit.sensitiveWords.split('\n').filter(d => textLower.includes(d.trim().toLowerCase())).length > 0
-    if (notSafe)
-      return true
+    if (notSafe) return true
   }
   if (audit.enabled) {
-    if (!auditService)
-      initAuditService(audit)
+    if (!auditService) initAuditService(audit)
     return await auditService.containsSensitiveWords(text)
   }
   return false
@@ -502,12 +442,10 @@ async function containsSensitiveWords(audit: AuditConfig, text: string): Promise
 
 async function chatConfig() {
   const config = await getOriginConfig() as ModelConfig
-  return sendResponse<ModelConfig>({
-    type: 'Success',
-    data: config,
-  })
+  return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
 
+// [重要修改] 在获取历史消息时，清洗掉可能存在的旧 Base64 数据
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -515,22 +453,18 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   if (chatInfo) {
     const parentMessageId = isPrompt
       ? chatInfo.options.parentMessageId
-      : `prompt_${id}` // parent message is the prompt
+      : `prompt_${id}`
 
     if (chatInfo.status !== Status.Normal) {
-      return parentMessageId
-        ? getMessageById(parentMessageId)
-        : undefined
+      return parentMessageId ? getMessageById(parentMessageId) : undefined
     }
     else {
       if (isPrompt) {
         let promptText = chatInfo.prompt
-        const allFileKeys = chatInfo.images || [] // 数据库中我们将所有文件key都存在了 images 字段里
-        
+        const allFileKeys = chatInfo.images || []
         const textFiles = allFileKeys.filter(k => isTextFile(k))
         const imageFiles = allFileKeys.filter(k => !isTextFile(k))
 
-        // 1. 如果历史记录里有文本文件，重新读取内容并拼接到 Prompt 中
         if (textFiles.length > 0) {
           let fileContext = ''
           for (const fileKey of textFiles) {
@@ -544,24 +478,20 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
+        
+        // 强制清理 Prompt 中的 Base64 脏数据
+        if (promptText && typeof promptText === 'string') {
+           promptText = promptText.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
+        }
 
-        // 2. 构建返回给 OpenAI 的 content
         let content: MessageContent = promptText
 
-        // 如果还有图片文件，则转为多模态数组格式
         if (imageFiles.length > 0) {
-          content = [
-            {
-              type: 'text',
-              text: promptText,
-            },
-          ]
+          content = [{ type: 'text', text: promptText }]
           for (const image of imageFiles) {
             content.push({
               type: 'image_url',
-              image_url: {
-                url: await convertImageUrl(image),
-              },
+              image_url: { url: await convertImageUrl(image) },
             })
           }
         }
@@ -574,12 +504,20 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         }
       }
       else {
+        // [Fix] 清洗 Assistant 回复中的 Base64 图片
+        // 如果历史记录里有旧的 base64 图片，这里会把它变成简短文字，从而避免后续请求 Token 爆炸
+        let responseText = chatInfo.response || ''
+        if (responseText.includes('data:image') && responseText.includes('base64')) {
+            // 正则替换 Markdown 图片语法中包含 data:image 的部分
+            responseText = responseText.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image History]')
+        }
+        
         return {
           id,
           conversationId: chatInfo.options.conversationId,
           parentMessageId,
           role: 'assistant',
-          text: chatInfo.response,
+          text: responseText,
         }
       }
     }
@@ -588,20 +526,16 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
 }
 
 async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
-  if (keys.length <= 0)
-    return null
+  if (keys.length <= 0) return null
   _lockedKeys.filter(d => d.lockedTime <= Date.now() - 1000 * 20).forEach(d => _lockedKeys.splice(_lockedKeys.indexOf(d), 1))
-
   let unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
   const start = Date.now()
   while (unsedKeys.length <= 0) {
-    if (Date.now() - start > 3000)
-      break
+    if (Date.now() - start > 3000) break
     await new Promise(resolve => setTimeout(resolve, 1000))
     unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
   }
-  if (unsedKeys.length <= 0)
-    return null
+  if (unsedKeys.length <= 0) return null
   const thisKey = unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
   return thisKey
 }
