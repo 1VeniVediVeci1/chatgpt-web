@@ -57,7 +57,6 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 
 const currentNavIndexRef = ref<number>(-1)
 
-//const isVisionModel = computed(() => currentChatModel.value && (currentChatModel.value?.includes('vision') || ['gpt-4-turbo', 'gpt-4-turbo-2024-04-09'].includes(currentChatModel.value) || currentChatModel.value?.includes('gpt-4o')))
 const isVisionModel = ref(true)
   
 let loadingms: MessageReactive
@@ -80,7 +79,9 @@ function handleSubmit() {
   onConversation()
 }
 
-const uploadFileKeysRef = ref<string[]>([])
+// [修改] 拆分为图片和文本两个列表
+const imageUploadFileKeysRef = ref<string[]>([])
+const textUploadFileKeysRef = ref<string[]>([])
 
 async function onConversation() {
   let message = prompt.value
@@ -94,8 +95,17 @@ async function onConversation() {
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
-  const uploadFileKeys = isVisionModel.value ? uploadFileKeysRef.value : []
-  uploadFileKeysRef.value = []
+  // [修改] 合并上传列表，并加上类型前缀
+  const uploadFileKeys = isVisionModel.value 
+    ? [
+        ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
+        ...textUploadFileKeysRef.value.map(k => `txt:${k}`)
+      ] 
+    : []
+  
+  // 清空列表
+  imageUploadFileKeysRef.value = []
+  textUploadFileKeysRef.value = []
 
   controller = new AbortController()
 
@@ -152,7 +162,6 @@ async function onConversation() {
         onDownloadProgress: ({ event }) => {
           const xhr = event.target
           const { responseText } = xhr
-          // Always process the final line
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
           if (lastIndex !== -1)
@@ -311,7 +320,6 @@ async function onRegenerate(index: number) {
         onDownloadProgress: ({ event }) => {
           const xhr = event.target
           const { responseText } = xhr
-          // Always process the final line
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
           if (lastIndex !== -1)
@@ -544,7 +552,6 @@ async function loadMoreMessage(event: any) {
 const handleLoadMoreMessage = debounce(loadMoreMessage, 300)
 const handleSyncChat
   = debounce(() => {
-    // 直接刷 极小概率不请求
     chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
       firstLoading.value = false
       const scrollRef = document.querySelector('#scrollRef')
@@ -574,9 +581,6 @@ async function handleToggleUsingContext() {
     ms.warning(t('chat.turnOffContext'))
 }
 
-// 可优化部分
-// 搜索选项计算，这里使用value作为索引项，所以当出现重复value时渲染异常(多项同时出现选中效果)
-// 理想状态下其实应该是key作为索引项,但官方的renderOption会出现问题，所以就需要value反renderLabel实现
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
     return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
@@ -591,7 +595,6 @@ const searchOptions = computed(() => {
   }
 })
 
-// value反渲染key
 function renderOption(option: { label: string }) {
   for (const i of promptTemplate.value) {
     if (i.value === option.label)
@@ -627,7 +630,6 @@ function formatTooltip(value: number) {
 }
 
 function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
-  // 限制文件大小，例如 10MB
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
     return false
@@ -635,17 +637,32 @@ function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileIn
   return true
 }
   
-// https://github.com/tusen-ai/naive-ui/issues/4887
-function handleFinish(options: { file: UploadFileInfo; event?: ProgressEvent }) {
+// [新增] 分开处理图片和文本的上传回调
+function handleFinishImage(options: { file: UploadFileInfo; event?: ProgressEvent }) {
   if (options.file.status === 'finished') {
     const response = (options.event?.target as XMLHttpRequest).response
-    uploadFileKeysRef.value.push(`${response.data.fileKey}`)
-    ms.success('上传成功')
+    const key = `${response.data.fileKey}`
+    imageUploadFileKeysRef.value.push(key)
+    ms.success('图片上传成功')
   }
 }
 
-function handleDeleteUploadFile(index: number) {
-  uploadFileKeysRef.value.splice(index, 1)
+function handleFinishText(options: { file: UploadFileInfo; event?: ProgressEvent }) {
+  if (options.file.status === 'finished') {
+    const response = (options.event?.target as XMLHttpRequest).response
+    const key = `${response.data.fileKey}`
+    textUploadFileKeysRef.value.push(key)
+    ms.success('文件上传成功')
+  }
+}
+
+// [新增] 分开处理删除
+function handleDeleteImageFile(index: number) {
+  imageUploadFileKeysRef.value.splice(index, 1)
+}
+
+function handleDeleteTextFile(index: number) {
+  textUploadFileKeysRef.value.splice(index, 1)
 }
 
 const uploadHeaders = computed(() => {
@@ -736,42 +753,77 @@ onUnmounted(() => {
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          <!-- 1. 显示已上传的文件列表 (新增) -->
-          <div v-if="uploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
+          
+          <!-- [修改] 显示已上传的图片列表 -->
+          <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div 
-              v-for="(key, index) in uploadFileKeysRef" 
-              :key="index"
+              v-for="(key, index) in imageUploadFileKeysRef" 
+              :key="`img-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
+              <SvgIcon icon="ri:image-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteUploadFile(index)">
+              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteImageFile(index)">
+                <SvgIcon icon="ri:close-line" />
+              </button>
+            </div>
+          </div>
+
+          <!-- [修改] 显示已上传的文本列表 -->
+          <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
+            <div 
+              v-for="(key, index) in textUploadFileKeysRef" 
+              :key="`txt-${index}`"
+              class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
+            >
+              <SvgIcon icon="ri:file-text-line" class="mr-1" />
+              <span class="truncate max-w-[150px]">{{ key }}</span>
+              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteTextFile(index)">
                 <SvgIcon icon="ri:close-line" />
               </button>
             </div>
           </div>
     
           <div class="flex items-center space-x-2">
-            <!-- 2. 修改或新增上传按钮 -->
+            
+            <!-- [修改] 上传图片按钮 -->
             <div>
-              <!-- 这里的 accept 增加了常用的文本格式 -->
-              <!-- action 指向现有的上传接口，它使用 multer，通常能处理所有文件 -->
               <NUpload
                 action="/api/upload-image" 
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
-                accept="image/*,.txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log"
-                @finish="handleFinish"
+                accept="image/*"
+                @finish="handleFinishImage"
                 @before-upload="handleBeforeUpload"
               >
                 <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
                    <span class="text-xl text-[#4f555e] dark:text-white">
-                      <!-- 换一个图标表示附件 -->
+                      <SvgIcon icon="ri:image-add-line" />
+                   </span>
+                </div>
+              </NUpload>
+            </div>
+
+            <!-- [修改] 上传文件按钮 -->
+            <div>
+              <NUpload
+                action="/api/upload-image" 
+                :headers="uploadHeaders"
+                :show-file-list="false"
+                response-type="json"
+                accept=".txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log,.ini,.config"
+                @finish="handleFinishText"
+                @before-upload="handleBeforeUpload"
+              >
+                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
+                   <span class="text-xl text-[#4f555e] dark:text-white">
                       <SvgIcon icon="ri:attachment-2" />
                    </span>
                 </div>
               </NUpload>
             </div>
+
             <HoverButton @click="handleClear">
               <span class="text-xl text-[#4f555e] dark:text-white">
                 <SvgIcon icon="ri:delete-bin-line" />
@@ -791,7 +843,6 @@ onUnmounted(() => {
               <span class="text-xl">
                 <SvgIcon icon="ri:chat-history-line" />
               </span>
-              <!-- <span style="margin-left:.25em">{{ usingContext ? '包含上下文' : '不含上下文' }}</span> -->
             </HoverButton>
             <NSelect
               style="width: 250px"
