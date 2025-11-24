@@ -129,6 +129,95 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
+/**
+ * 为 Gemini 构造多轮对话结构的 contents（仅文本，不带历史图片）
+ * 结构遵循：
+ * contents: [
+ *   { role: 'user' | 'model', parts: [{ text: '...' }] },
+ *   ...
+ * ]
+ */
+async function buildGeminiContents(options: {
+  lastMessageId?: string
+  systemMessage?: string
+  currentPromptText: string
+  maxContextCount: number
+}) {
+  const { lastMessageId, systemMessage, currentPromptText, maxContextCount } = options
+
+  type GeminiTurn = { role: 'user' | 'model'; text: string }
+
+  const historyTurns: GeminiTurn[] = []
+
+  let cursorId = lastMessageId
+  for (let i = 0; i < maxContextCount; i++) {
+    if (!cursorId)
+      break
+    const msg = await getMessageById(cursorId)
+    if (!msg)
+      break
+
+    // 提取纯文本（忽略历史里的 image_url 等，以免上下文膨胀）
+    let textStr = ''
+    const raw = msg.text
+    if (typeof raw === 'string') {
+      textStr = raw
+    }
+    else if (Array.isArray(raw)) {
+      for (const part of raw) {
+        // OpenAI.ChatCompletionContentPart 里 type === 'text' 时才取文本
+        if ((part as any).type === 'text' && (part as any).text)
+          textStr += `${(part as any).text}\n`
+      }
+    }
+
+    if (textStr) {
+      // 进一步清洗掉可能残留的 base64 图片
+      textStr = textStr.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
+      // 把历史中 /uploads/xxx 的图标记为占位，避免模型对本地 URL 产生误解
+      textStr = textStr.replace(/!\[.*?\]\(\/uploads\/.*?\)/g, '[Image]')
+    }
+
+    const role: 'user' | 'model'
+      = msg.role === 'assistant'
+        ? 'model'
+        : 'user'
+
+    historyTurns.push({ role, text: textStr })
+
+    cursorId = msg.parentMessageId
+  }
+
+  // 从最早到最近的顺序
+  historyTurns.reverse()
+
+  const contents: any[] = []
+
+  if (systemMessage) {
+    contents.push({
+      role: 'user',
+      parts: [{ text: systemMessage }],
+    })
+  }
+
+  for (const turn of historyTurns) {
+    if (!turn.text?.trim())
+      continue
+    contents.push({
+      role: turn.role,
+      parts: [{ text: turn.text }],
+    })
+  }
+
+  // 当前这一轮用户请求
+  contents.push({
+    role: 'user',
+    parts: [{ text: currentPromptText }],
+  })
+
+  return contents
+}
+
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
@@ -194,7 +283,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const customMessageId = generateMessageId()
 
   try {
-    // ====== ① Gemini 图片模型 ======
+    // ====== ① Gemini 图片模型（多轮结构，仅文本历史） ======
     if (isGeminiImageModel) {
       const GEMINI_BASE_URL = isNotEmptyString(key.baseUrl)
         ? key.baseUrl
@@ -202,6 +291,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const endpoint = `${GEMINI_BASE_URL.replace(/\/+$/, '')}/v1beta/models/gemini-3-pro-image:generateContent?key=${encodeURIComponent(key.key)}`
 
+      // 当前这轮的 prompt 文本
       let promptText = ''
       if (typeof content === 'string') {
         promptText = content
@@ -213,20 +303,15 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      // [关键优化] 图片生成通常不需要过长的历史上下文，但为了支持"变成蓝色"这种指令，可以尝试带一点点最近的文本历史
-      // 但为了防止 Token 爆炸，这里目前策略是：只发当前 Prompt。
-      // 如果你需要上下文，必须确保上文没有 Base64。
-      
-      const body = {
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: promptText },
-            ],
-          },
-        ],
-      }
+      // 构造符合 Gemini 标准多轮结构的 contents
+      const contents = await buildGeminiContents({
+        lastMessageId: lastContext?.parentMessageId,
+        systemMessage,
+        currentPromptText: promptText,
+        maxContextCount,
+      })
+
+      const body = { contents }
 
       processThreads.push({ userId, abort, messageId })
 
