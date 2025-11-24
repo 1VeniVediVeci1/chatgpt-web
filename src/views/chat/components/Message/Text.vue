@@ -30,60 +30,66 @@ const markdownPreviewUrl = ref<string>('')
 const markdownPreviewRef = ref<any>(null)
 
 function handleImageClickFromMarkdown(src: string) {
-  // 1. 设置预览图地址
   markdownPreviewUrl.value = src
-  
+
   nextTick(() => {
-    // 2. 模拟点击隐藏的 NImage
     const nImageEl = markdownPreviewRef.value?.$el
     if (nImageEl) {
       const imgTag = nImageEl.querySelector('img')
-      // 必须阻止这次模拟点击的冒泡，虽然移出了容器，但为了保险加上 stop
-      if (imgTag) {
+      if (imgTag)
         imgTag.click()
-      } else {
+      else
         nImageEl.click()
-      }
     }
   })
 }
-// ----------------------------------------
 
 function handleMarkdownClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null
   if (!target)
     return
 
-  // 只有点击的是 img 标签才处理
   if (target.tagName.toLowerCase() === 'img') {
-    // 获取 src
-    const src = (target as HTMLImageElement).src
-    
-    // 如果点击的是我们要预览的那张隐藏图本身，直接返回，防止死循环（双重保险）
-    // 检查 class 或者父级是否是隐藏容器
-    if (target.closest('.hidden-preview-image')) {
-        return
-    }
+    // 避免点击隐藏预览图自身时死循环
+    if (target.closest('.hidden-preview-image'))
+      return
 
     e.stopPropagation()
-    e.preventDefault() // 阻止默认行为
-    
+    e.preventDefault()
+
+    const src = (target as HTMLImageElement).src
     if (src)
       handleImageClickFromMarkdown(src)
   }
 }
+// ----------------------------------------
 
-function isImage(filename: string | undefined): boolean {
-  if (!filename) return false
-  return /\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(filename)
+// 去掉 img:/txt: 前缀，兼容历史数据
+function stripTypePrefix(filename: string): string {
+  return filename.replace(/^(img:|txt:)/, '')
 }
 
+// 根据“真实文件名”判断是否为图片
+function isImage(filename: string | undefined): boolean {
+  if (!filename) return false
+  const realName = stripTypePrefix(filename)
+  return /\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(realName)
+}
+
+// 图片列表：只保留图片，并去掉前缀，直接返回真实文件名
 const imageList = computed(() => {
-  return (props.images || []).filter(file => isImage(file))
+  const list = props.images || []
+  return list
+    .filter(file => isImage(file))
+    .map(file => stripTypePrefix(file))
 })
 
+// 文件列表：非图片附件，同样去掉前缀
 const fileList = computed(() => {
-  return (props.images || []).filter(file => !isImage(file))
+  const list = props.images || []
+  return list
+    .filter(file => !isImage(file))
+    .map(file => stripTypePrefix(file))
 })
 
 const mdi = new MarkdownIt({
@@ -184,16 +190,12 @@ onUnmounted(() => {
 
 <template>
   <div class="text-black" :class="wrapClass">
-    <!-- 
-      注意：这个 div 绑定了 click 事件，
-      所以 NImage 必须放在这个 div 外面，否则模拟点击会冒泡回来导致死循环 
-    -->
+    <!-- Markdown / 文本内容 -->
     <div
       ref="textRef"
       class="leading-relaxed break-words"
       @click="handleMarkdownClick"
     >
-      <!-- 文本 / Markdown -->
       <div v-if="!inversion" class="flex items-end">
         <div
           v-if="!asRawText"
@@ -205,7 +207,7 @@ onUnmounted(() => {
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
 
-      <!-- 附件图片 -->
+      <!-- 附件图片（来自 props.images） -->
       <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
         <NImageGroup>
           <NImage
@@ -223,7 +225,7 @@ onUnmounted(() => {
         </NImageGroup>
       </div>
 
-      <!-- 附件文件 -->
+      <!-- 附件文件（来自 props.images） -->
       <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
         <a
           v-for="(v, i) of fileList"
@@ -239,18 +241,14 @@ onUnmounted(() => {
             <SvgIcon icon="ri:file-text-line" class="text-lg" />
           </div>
           <div class="flex flex-col overflow-hidden">
-            <span class="text-sm font-medium truncate w-48">{{ v }}</span>
+            <span class="text-sm font-medium truncate max-w-[150px]">{{ v }}</span>
             <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载</span>
           </div>
         </a>
       </div>
     </div>
 
-    <!-- 
-      【重要修改】
-      隐藏的 NImage 移到了 @click="handleMarkdownClick" 的容器外面
-      这样模拟点击它时，不会再次触发上面的 click 事件，避免死循环。
-    -->
+    <!-- 用于 Markdown 内联图片预览的隐藏 NImage -->
     <NImage
       ref="markdownPreviewRef"
       :src="markdownPreviewUrl"
