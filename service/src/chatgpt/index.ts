@@ -82,46 +82,9 @@ export async function initApi(key: KeyConfig, {
     const message = await getMessageById(lastMessageId)
     if (!message)
       break
-    
-    // --- 核心修改开始：自动将生成的 Base64 图片转为下一轮附件 ---
-    let historyContent: any = message.text
-
-    // 正则表达式：匹配 Markdown 图片语法中的 Base64 数据
-    // 格式: ![描述](data:image/png;base64,...)
-    const base64ImgRegex = /!\[(.*?)\]\((data:image\/.*?;base64,.*?)\)/
-
-    // 检查历史记录是否包含 Base64 图片
-    if (typeof historyContent === 'string' && base64ImgRegex.test(historyContent)) {
-      const match = historyContent.match(base64ImgRegex)
-      
-      if (match && match[2]) {
-        const altText = match[1] || 'Generated Image'
-        const imageUrl = match[2] // 提取出 data:image... Base64字符串
-
-        // 1. 清理文本：把巨大的 Base64 字符串替换成简短的占位符，防止 Text Token 爆炸
-        const cleanText = historyContent.replace(base64ImgRegex, `[图片: ${altText}]`)
-
-        // 2. 重构为多模态格式：将图片作为 image_url 附件发送给模型
-        // 这样模型能看到上一轮生成的图，从而支持基于该图的修改指令
-        historyContent = [
-          {
-            type: 'text',
-            text: cleanText, 
-          },
-          {
-            type: 'image_url',
-            image_url: {
-              url: imageUrl, // 这里作为真正的 Vision Input 发送
-            },
-          },
-        ]
-      }
-    }
-    // --- 核心修改结束 ---
-
     messages.push({
       role: message.role as any,
-      content: historyContent,
+      content: message.text,
     })
     lastMessageId = message.parentMessageId
   }
@@ -151,7 +114,7 @@ export async function initApi(key: KeyConfig, {
     options.top_p = top_p
   }
 
-  // [调试模式] - 开始
+  // [调试模式] - 开始 - 新增的调试代码块
   console.log('\n/==================== OpenAI API 请求体 (调试模式) ====================/')
   console.log(`[调试] 请求时间: ${new Date().toISOString()}`)
   console.log(`[调试] 目标 URL: ${OPENAI_API_BASE_URL}`)
@@ -192,6 +155,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   //将配置字符串按逗号分割，去除空格，生成数组
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   //判断当前模型是否包含在配置列表中 (支持模糊匹配，比如配置 gemini-3-pro 会匹配 gemini-3-pro-image)
+  //或者精确匹配： const isImage = imageModelList.includes(model)
   const isImage = imageModelList.some(m => model.includes(m))
   
   if (uploadFileKeys && uploadFileKeys.length > 0) {
@@ -365,7 +329,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 }
 
-// --- 以下所有辅助函数均保持不变 ---
+// --- 以下所有辅助函数均保持不变，因为它们与ID生成无关 ---
 
 export function abortChatProcess(userId: string) {
   const index = processThreads.findIndex(d => d.userId === userId)
