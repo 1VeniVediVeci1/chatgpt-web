@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import fetch from 'node-fetch' // 保留 node-fetch 用于 OpenAI 或其他用途
+import fetch, { Request } from 'node-fetch'
 import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai' // [新增] 引入 SDK
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
