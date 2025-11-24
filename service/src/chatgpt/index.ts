@@ -1,7 +1,8 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import fetch from 'node-fetch'
+import fetch from 'node-fetch' // 保留 node-fetch 用于 OpenAI 或其他用途
+import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai' // [新增] 引入 SDK
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -40,6 +41,10 @@ const ErrorCodeMessage: Record<string, string> = {
 
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
+
+// [新增] Gemini 会话内存缓存：Key = userId:roomId:model
+// 用于在多轮对话中保持 SDK 的 ChatSession 实例，从而自动携带 thought_signature
+const geminiChats = new Map<string, ChatSession>()
 
 export async function initApi(key: KeyConfig, {
   model,
@@ -129,93 +134,55 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
-/**
- * 为 Gemini 构造多轮对话结构的 contents（仅文本，不带历史图片）
- * 结构遵循：
- * contents: [
- *   { role: 'user' | 'model', parts: [{ text: '...' }] },
- *   ...
- * ]
- */
-async function buildGeminiContents(options: {
-  lastMessageId?: string
-  systemMessage?: string
-  currentPromptText: string
-  maxContextCount: number
-}) {
-  const { lastMessageId, systemMessage, currentPromptText, maxContextCount } = options
-
-  type GeminiTurn = { role: 'user' | 'model'; text: string }
-
-  const historyTurns: GeminiTurn[] = []
-
-  let cursorId = lastMessageId
-  for (let i = 0; i < maxContextCount; i++) {
-    if (!cursorId)
-      break
-    const msg = await getMessageById(cursorId)
-    if (!msg)
-      break
-
-    // 提取纯文本（忽略历史里的 image_url 等，以免上下文膨胀）
-    let textStr = ''
-    const raw = msg.text
-    if (typeof raw === 'string') {
-      textStr = raw
+// [新增] 辅助函数：为了让 SDK 支持自定义 baseUrl (反代)，我们需要劫持 fetch
+function createCustomFetch(baseUrl: string) {
+  return async (url: string | Request | URL, init?: any) => {
+    let fetchUrl = url.toString()
+    // SDK 默认请求 https://generativelanguage.googleapis.com/...
+    // 我们将其替换为用户配置的 baseUrl
+    if (baseUrl && fetchUrl.includes('generativelanguage.googleapis.com')) {
+      fetchUrl = fetchUrl.replace('https://generativelanguage.googleapis.com', baseUrl.replace(/\/+$/, ''))
     }
-    else if (Array.isArray(raw)) {
-      for (const part of raw) {
-        // OpenAI.ChatCompletionContentPart 里 type === 'text' 时才取文本
-        if ((part as any).type === 'text' && (part as any).text)
-          textStr += `${(part as any).text}\n`
-      }
-    }
-
-    if (textStr) {
-      // 进一步清洗掉可能残留的 base64 图片
-      textStr = textStr.replace(/!\[.*?\]\(data:image\/.*?;base64,.*?\)/g, '[Image Data Removed]')
-      // 把历史中 /uploads/xxx 的图标记为占位，避免模型对本地 URL 产生误解
-      textStr = textStr.replace(/!\[.*?\]\(\/uploads\/.*?\)/g, '[Image]')
-    }
-
-    const role: 'user' | 'model'
-      = msg.role === 'assistant'
-        ? 'model'
-        : 'user'
-
-    historyTurns.push({ role, text: textStr })
-
-    cursorId = msg.parentMessageId
+    console.log(`[Gemini SDK] Fetching: ${fetchUrl}`)
+    return fetch(fetchUrl, init) // 使用 node-fetch
   }
+}
 
-  // 从最早到最近的顺序
-  historyTurns.reverse()
+// [新增] 获取或创建 Gemini ChatSession
+function getGeminiChatSession(
+  apiKey: string,
+  modelName: string,
+  baseUrl: string | undefined,
+  sessionKey: string,
+  systemInstruction?: string
+): ChatSession {
+  // 注意：如果不希望重启服务后丢失 history，需要做持久化加载
+  // 现阶段为了解决 400 thought_signature 问题，我们优先使用内存中的会话
+  let chatSession = geminiChats.get(sessionKey)
 
-  const contents: any[] = []
+  if (!chatSession) {
+    console.log(`[Gemini SDK] Creating new session for ${sessionKey}`)
+    const genAI = new GoogleGenerativeAI(apiKey)
+    
+    // 如果有 baseUrl，通过自定义 requestOptions 传入 fetch
+    // 注意：Google SDK 的 requestOptions 在 getGenerativeModel 中设置
+    const requestOptions: any = {}
+    if (baseUrl) {
+      requestOptions.customFetch = createCustomFetch(baseUrl)
+    }
 
-  if (systemMessage) {
-    contents.push({
-      role: 'user',
-      parts: [{ text: systemMessage }],
+    const model = genAI.getGenerativeModel({ 
+      model: modelName,
+      systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }], role: "system" } : undefined
+    }, requestOptions)
+
+    chatSession = model.startChat({
+      history: [], // 初始为空，后续 SDK 会自动维护
     })
+    geminiChats.set(sessionKey, chatSession)
   }
 
-  for (const turn of historyTurns) {
-    if (!turn.text?.trim())
-      continue
-    contents.push({
-      role: turn.role,
-      parts: [{ text: turn.text }],
-    })
-  }
-
-  // 当前这一轮用户请求
-  contents.push({
-    role: 'user',
-    parts: [{ text: currentPromptText }],
-  })
-
-  return contents
+  return chatSession
 }
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
@@ -283,57 +250,62 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const customMessageId = generateMessageId()
 
   try {
-    // ====== ① Gemini 图片模型（多轮结构，仅文本历史） ======
+    // ====== ① Gemini 图片模型（SDK 托管会话） [修改] ======
     if (isGeminiImageModel) {
-      const GEMINI_BASE_URL = isNotEmptyString(key.baseUrl)
-        ? key.baseUrl
-        : 'https://generativelanguage.googleapis.com'
+      // 1. 构造 Session Key (相同房间复用同一个 SDK session)
+      const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
+      const sessionKey = `${userId}:${options.room.roomId}:${model}` // 用户:房间:模型
+      
+      // 2. 初始化或获取 Session
+      const chatSession = getGeminiChatSession(key.key, model, baseUrl, sessionKey, systemMessage)
 
-      const endpoint = `${GEMINI_BASE_URL.replace(/\/+$/, '')}/v1beta/models/gemini-3-pro-image:generateContent?key=${encodeURIComponent(key.key)}`
-
-      // 当前这轮的 prompt 文本
+      // 3. 构造本轮输入 (Parts)
+      const inputParts: Part[] = []
+      
+      // 3.1 提取文本
       let promptText = ''
       if (typeof content === 'string') {
         promptText = content
-      }
-      else if (Array.isArray(content)) {
+      } else if (Array.isArray(content)) {
         for (const part of content) {
-          if ((part as any).type === 'text' && (part as any).text)
+          if ((part as any).type === 'text' && (part as any).text) {
             promptText += `${(part as any).text}\n`
+          }
+        }
+      }
+      if (promptText) inputParts.push({ text: promptText })
+
+      // 3.2 提取图片 (OpenAI 格式转 Gemini InlineData)
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
+            // part.image_url.url 格式如: data:image/png;base64,xxxxx
+            const dataUrl = (part as any).image_url.url as string
+            const [header, base64Data] = dataUrl.split(',')
+            if (header && base64Data) {
+              const mimeMatch = header.match(/:(.*?);/)
+              const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
+              
+              inputParts.push({
+                inlineData: {
+                  mimeType,
+                  data: base64Data
+                }
+              })
+            }
+          }
         }
       }
 
-      // 构造符合 Gemini 标准多轮结构的 contents
-      const contents = await buildGeminiContents({
-        lastMessageId: lastContext?.parentMessageId,
-        systemMessage,
-        currentPromptText: promptText,
-        maxContextCount,
-      })
-
-      const body = { contents }
-
       processThreads.push({ userId, abort, messageId })
 
-      const resp = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        signal: abort.signal,
-        body: JSON.stringify(body),
-      })
-
-      if (!resp.ok) {
-        const errText = await resp.text()
-        throw new Error(`Gemini API error: ${resp.status} ${errText}`)
-      }
-
-      const data: any = await resp.json()
-      let text = ''
+      // 4. 发送消息
+      const result = await chatSession.sendMessage(inputParts) // SDK 自动处理 history 和 signature
+      const response = await result.response
       
-      const candidate = data.candidates?.[0]
-      const parts = candidate?.content?.parts ?? []
+      // 5. 解析结果并保存生成的图片
+      let text = ''
+      const parts = response.candidates?.[0]?.content?.parts ?? []
 
       for (const part of parts) {
         if (part.text) text += part.text
@@ -352,17 +324,18 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      if (!text) text = JSON.stringify(data)
+      if (!text) text = JSON.stringify(response) // Fallback
 
-      const usageRes: any = data.usageMetadata
+      const usageRes: any = response.usageMetadata
         ? {
-            prompt_tokens: data.usageMetadata.promptTokenCount ?? 0,
-            completion_tokens: data.usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: data.usageMetadata.totalTokenCount ?? 0,
+            prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
+            completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
+            total_tokens: response.usageMetadata.totalTokenCount ?? 0,
             estimated: true,
           }
         : undefined
 
+      // 6. 推送前端更新
       process?.({
         id: customMessageId,
         text,
@@ -488,6 +461,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
     }
     globalThis.console.error(error)
+    
+    // 尝试清除 Session 缓存，以防 Session 出错影响后续（例如 Key 变了）
+    if (isGeminiImageModel) {
+        const sessionKey = `${userId}:${options.room.roomId}:${model}`
+        geminiChats.delete(sessionKey)
+    }
+
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
