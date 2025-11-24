@@ -1,7 +1,6 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import fetch, { Request } from 'node-fetch'
 import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
@@ -23,7 +22,7 @@ const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?:
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
 }
 
-// 定义上传文件目录，建议使用绝对路径防止路径错乱
+// 定义上传文件目录
 const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads')
 
 // [新增] 确保上传目录存在
@@ -35,27 +34,45 @@ async function ensureUploadDir() {
   }
 }
 
-// 判断是否为文本文件
+// [新增] 去除类型前缀 img:/txt:
+function stripTypePrefix(key: string): string {
+  return key.replace(/^(img:|txt:)/, '')
+}
+
+// [修改] 判断是否为文本文件（优先看前缀）
 function isTextFile(filename: string): boolean {
-  const ext = path.extname(filename).toLowerCase()
+  if (filename.startsWith('txt:')) return true
+  if (filename.startsWith('img:')) return false
+
+  // 兼容旧数据：无前缀根据后缀判断
+  const realName = stripTypePrefix(filename)
+  const ext = path.extname(realName).toLowerCase()
   const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log', '.ini', '.config']
   return textExtensions.includes(ext)
 }
 
-// [新增] 显式判断是否为图片文件（避免把 PDF 当图片传给 AI）
+// [修改] 判断是否为图片文件（优先看前缀）
 function isImageFile(filename: string): boolean {
-  const ext = path.extname(filename).toLowerCase()
+  if (filename.startsWith('img:')) return true
+  if (filename.startsWith('txt:')) return false
+
+  // 兼容旧数据
+  const realName = stripTypePrefix(filename)
+  const ext = path.extname(realName).toLowerCase()
   const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.bmp']
   return imageExtensions.includes(ext)
 }
 
-// [新增] 从本地文件读取并转为 Base64
+// [修改] 从本地文件读取并转为 Base64 (处理前缀)
 async function getFileBase64(filename: string): Promise<{ mime: string; data: string } | null> {
   try {
-    const filePath = path.join(UPLOAD_DIR, filename)
-    await fs.access(filePath) // 检查是否存在
+    const realFilename = stripTypePrefix(filename)
+    const filePath = path.join(UPLOAD_DIR, realFilename)
+    
+    await fs.access(filePath) 
     const buffer = await fs.readFile(filePath)
-    const ext = path.extname(filename).toLowerCase().replace('.', '')
+    
+    const ext = path.extname(realFilename).toLowerCase().replace('.', '')
     let mime = 'image/png'
     if (ext === 'jpg' || ext === 'jpeg') mime = 'image/jpeg'
     else if (ext === 'webp') mime = 'image/webp'
@@ -171,17 +188,6 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
 
-function createCustomFetch(baseUrl: string) {
-  return async (url: string | Request | URL, init?: any) => {
-    let fetchUrl = url.toString()
-    if (baseUrl && fetchUrl.includes('generativelanguage.googleapis.com')) {
-      fetchUrl = fetchUrl.replace('https://generativelanguage.googleapis.com', baseUrl.replace(/\/+$/, ''))
-    }
-    console.log(`[Gemini SDK] Fetching: ${fetchUrl}`)
-    return fetch(fetchUrl, init)
-  }
-}
-
 function getGeminiChatSession(
   apiKey: string,
   modelName: string,
@@ -197,7 +203,7 @@ function getGeminiChatSession(
     
     const requestOptions: any = {}
     if (baseUrl) {
-      requestOptions.customFetch = createCustomFetch(baseUrl)
+      requestOptions.baseUrl = baseUrl.replace(/\/+$/, '')
     }
 
     const model = genAI.getGenerativeModel({ 
@@ -215,39 +221,40 @@ function getGeminiChatSession(
 }
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
-  // 1. 初始化
-  await ensureUploadDir() // 确保 Docker 内目录存在
+  await ensureUploadDir()
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const userId = options.user._id.toString()
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
   const messageId = options.messageId
-  
   if (key == null || key === undefined)
     throw new Error('没有对应的 apikeys 配置，请再试一次。')
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
-  
-  // 2. 文件分类与文本注入逻辑 [核心修改]
   let content: MessageContent = message
   let fileContext = ''
+  const globalConfig = await getCacheConfig()
+  const imageModelsStr = globalConfig.siteConfig.imageModels || ''
+  const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   
-  // 仅识别文本文件和图片文件
-  if (uploadFileKeys && uploadFileKeys.length > 0) {
-    const textFiles = uploadFileKeys.filter(key => isTextFile(key))
-    const imageFiles = uploadFileKeys.filter(key => isImageFile(key)) // 修复：仅处理已知的图片格式
+  const isImage = imageModelList.some(m => model.includes(m))
+  const isGeminiImageModel = isImage && model.includes('gemini')
 
-    // 处理文本文件：读出内容拼接到 prompt
+  if (uploadFileKeys && uploadFileKeys.length > 0) {
+    // 根据前缀区分类型
+    const textFiles = uploadFileKeys.filter(key => isTextFile(key))
+    const imageFiles = uploadFileKeys.filter(key => isImageFile(key))
+
     if (textFiles.length > 0) {
       for (const fileKey of textFiles) {
         try {
-          const filePath = path.join(UPLOAD_DIR, fileKey)
-          // 检查文件是否存在
+          // [修改] 读取时去掉前缀
+          const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
           await fs.access(filePath)
           const fileContent = await fs.readFile(filePath, 'utf-8')
-          fileContext += `\n\n--- File Start: ${fileKey} ---\n${fileContent}\n--- File End ---\n`
+          fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n`
         } catch (e) {
           console.error(`Error reading text file ${fileKey}`, e)
           fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n`
@@ -257,7 +264,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
     const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
 
-    // 处理图片文件：构造 OpenAI 格式的 MessageContent
     if (imageFiles.length > 0) {
       content = [
         {
@@ -269,27 +275,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         content.push({
           type: 'image_url',
           image_url: {
-            url: await convertImageUrl(uploadFileKey), // 这里返回的是 /uploads/xxx 或 base64
+            // [修改] 读取图片时去掉前缀
+            url: await convertImageUrl(stripTypePrefix(uploadFileKey)),
           },
         })
       }
     } else {
-      // 只有文本
       content = finalMessage
     }
   }
-
-  const globalConfig = await getCacheConfig()
-  const imageModelsStr = globalConfig.siteConfig.imageModels || ''
-  const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
-  const isImage = imageModelList.some(m => model.includes(m))
-  const isGeminiImageModel = isImage && model.includes('gemini')
 
   const abort = new AbortController()
   const customMessageId = generateMessageId()
 
   try {
-    // ====== ① Gemini 图片模型（SDK 托管会话） ======
+    // ====== ① Gemini 图片模型 ======
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
       const sessionKey = `${userId}:${options.room.roomId}:${model}`
@@ -298,7 +298,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const inputParts: Part[] = []
       
-      // 3.1 提取文本
       let promptText = ''
       if (typeof content === 'string') {
         promptText = content
@@ -311,13 +310,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       if (promptText) inputParts.push({ text: promptText })
 
-      // 3.2 提取图片并转为 Gemini SDK 需要的 InlineData
       if (Array.isArray(content)) {
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
             const urlStr = (part as any).image_url.url as string
             
-            // 情况A: Data URL (Base64)
             if (urlStr.startsWith('data:')) {
                 const [header, base64Data] = urlStr.split(',')
                 if (header && base64Data) {
@@ -326,9 +323,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
                   inputParts.push({ inlineData: { mimeType, data: base64Data } })
                 }
             } 
-            // 情况B: 本地路径 /uploads/xxx.png [这是修复文件上传的关键]
+            // 本地文件 /uploads/xxx
             else if (urlStr.includes('/uploads/')) {
                 const filename = path.basename(urlStr)
+                // getFileBase64 内部已经调用了 stripTypePrefix
                 const fileData = await getFileBase64(filename)
                 if (fileData) {
                     inputParts.push({ 
@@ -357,7 +355,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
-          const filePath = path.join(UPLOAD_DIR, filename) // 使用统一的 UPLOAD_DIR
+          const filePath = path.join(UPLOAD_DIR, filename)
           await fs.writeFile(filePath, buffer)
           
           const prefix = text ? '\n\n' : ''
@@ -405,7 +403,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ====== ② 其它模型 (OpenAI SDK) ======
+    // ====== ② 其它模型 ======
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -479,7 +477,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           finish_reason: 'stop',
           index: 0,
           logprobs: null,
-        }],
+          }],
         created: Date.now(),
         conversationId: lastContext.conversationId,
         model: modelRes,
@@ -551,6 +549,7 @@ async function chatConfig() {
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
 
+// [修改] 历史消息恢复逻辑，也要去前缀
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -567,7 +566,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       if (isPrompt) {
         let promptText = chatInfo.prompt
         const allFileKeys = chatInfo.images || []
-        // 使用新的判断函数
         const textFiles = allFileKeys.filter(k => isTextFile(k))
         const imageFiles = allFileKeys.filter(k => isImageFile(k)) 
 
@@ -575,9 +573,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           let fileContext = ''
           for (const fileKey of textFiles) {
             try {
-              const filePath = path.join(UPLOAD_DIR, fileKey) // 使用 UPLOAD_DIR
+              const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
               const fileContent = await fs.readFile(filePath, 'utf-8')
-              fileContext += `\n\n--- Context File: ${fileKey} ---\n${fileContent}\n--- End File ---\n`
+              fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
             } catch (e) {
                // 忽略丢失的历史文件
             }
@@ -596,7 +594,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           for (const image of imageFiles) {
             content.push({
               type: 'image_url',
-              image_url: { url: await convertImageUrl(image) },
+              image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
             })
           }
         }
