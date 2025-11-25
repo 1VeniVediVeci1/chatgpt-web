@@ -405,7 +405,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
 
     } else {
+      // ★★★ 这里加了循环计数日志 ★★★
+      let loopCount = 0; 
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
+         loopCount++;
+         // 每 5 个 chunk 打印一次，防止刷屏太快
+         if (loopCount % 5 === 0) console.log(`[DEBUG] 正在生成第 ${loopCount} 个片段... [${userId}]`);
+
          text += chunk.choices[0]?.delta.content ?? ''
          chatIdRes = customMessageId
          modelRes = chunk.model
@@ -454,7 +460,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
-    // ★★★ 添加 Log 方便排查 ★★★
     console.log(`[DEBUG] 任务彻底结束，清理线程状态。UserId: ${userId}`)
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1)
