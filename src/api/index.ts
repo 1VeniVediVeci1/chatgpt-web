@@ -63,7 +63,7 @@ export function fetchChatStopResponding<T = any>(text: string, messageId: string
   })
 }
 
-// [新增]
+// [新增] 轮询后端任务状态
 export function fetchChatProcessStatus<T = any>() {
   return post<T>({
     url: '/chat-process-status',
