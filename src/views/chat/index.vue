@@ -50,7 +50,7 @@ const conversationList = computed(() => dataSources.value.filter(item => (!item.
 
 const prompt = ref<string>('')
 const firstLoading = ref<boolean>(false)
-const loading = ref<boolean>(false) // 控制 Stop 按钮显示
+const loading = ref<boolean>(false)
 const inputRef = ref<Ref | null>(null)
 const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
@@ -67,7 +67,9 @@ let prevScrollTop: number
 const promptStore = usePromptStore()
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-// 手动重置 loading 状态，防止卡死，但仅针对非当前生成任务
+// 修复：初始化时，如果不是正在生成的特定任务，重置本地 loading 防止卡死
+// 但不能暴力全部重置，否则会跟 checkProcessStatus 冲突。
+// 这里我们可以暂且保留，checkProcessStatus 会在之后重新修正它。
 dataSources.value.forEach((item, index) => {
   if (item.loading)
     updateChatSome(+uuid, index, { loading: false })
@@ -83,30 +85,31 @@ const textUploadFileKeysRef = ref<string[]>([])
 // 轮询定时器
 let pollInterval: NodeJS.Timeout | null = null
 
-// ====== 状态检查：页面加载/房间切换时调用 ======
+// ====== 状态检查：页面加载 / 切换房间 / 刷新时执行 ======
 async function checkProcessStatus() {
   try {
-    // 每次检查前先停止旧轮询，防止叠加
+    // 先停止旧轮询
     stopPolling()
     
     const { data } = await fetchChatProcessStatus()
     
-    // 只有当后端正在生成的任务属于当前房间时，才恢复 loading 状态
+    // 只有当后端正在生成的任务属于当前房间 ID 时
     if (data.isProcessing && data.roomId === +uuid) {
-      loading.value = true
+      loading.value = true // 恢复 Stop 按钮
       
-      // 恢复 lastChatInfo，确保 Stop 按钮点击时能传参
+      // 恢复 lastChatInfo，确保 Stop 按钮有效
+      // 如果是刷新回来对话 ID 可能丢失，设为 null，后端 handleStop 需做兼容
       lastChatInfo = {
         id: data.messageId,
-        conversationId: null, // 恢复时 conversationId 可能未知，传 null 后端只更新文本
+        conversationId: null, 
         text: '...',
       }
 
-      // 检查 UI 上最后一条消息状态
+      // 恢复 UI 的 loading 状态（小圆圈）
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
       
-      // 如果当前页面没消息，或者最后一条是用户的提问 -> 补一个 AI 的占位气泡
+      // 情况 1: 当前列表为空，或者最后一条是用户发的消息 -> 补一个 "..."
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(
           +uuid,
@@ -124,49 +127,58 @@ async function checkProcessStatus() {
         scrollToBottom()
       }
       else {
-        // 如果已经有 AI 的气泡（可能是之前的 LOADING 状态被上面的 forEach 重置了），重新设为 true
+        // 情况 2: 已经有 AI 的回复气泡（可能是历史记录拉下来的），强制设为转圈
         updateChatSome(+uuid, lastIndex, { loading: true })
       }
 
-      // 开始轮询直到结束
+      // 启动轮询
       startPolling()
     }
   }
   catch (error) {
-    console.error('checkProcessStatus error:', error)
+    console.error('Check process status failed:', error)
   }
 }
 
-// ====== 轮询后端任务状态 ======
+// ====== 轮询逻辑 ======
 function startPolling() {
-  stopPolling() // 安全起见
+  stopPolling()
   pollInterval = setInterval(async () => {
     try {
       const { data } = await fetchChatProcessStatus()
       
-      // 1. 如果当前房间切走了 (data.roomId !== +uuid)，虽然任务可能还在跑，但当前页面不需要 loading
+      // 如果已切到其他房间，停止轮询当前状态，但不改变 loading（由 active watch 处理）
       if (data.roomId !== +uuid) {
         stopPolling()
-        loading.value = false
         return
       }
 
-      // 2. 如果任务结束了 (!data.isProcessing) 且就在当前房间
-      if (!data.isProcessing) {
+      // 如果任务正在进行：
+      if (data.isProcessing) {
+        loading.value = true
+        
+        // [关键] 防止 syncChat（历史同步）把最后一条消息的 loading 状态覆盖成 false
+        // 我们在轮询中不断强制把最后一条消息设为 loading
+        const lastIndex = dataSources.value.length - 1
+        if (lastIndex > -1 && !dataSources.value[lastIndex].inversion && !dataSources.value[lastIndex].loading) {
+           updateChatSome(+uuid, lastIndex, { loading: true })
+        }
+      } 
+      // 如果任务结束：
+      else {
         stopPolling()
         loading.value = false
 
-        // 延迟拉取，确保后端数据库写入完成
+        // 延迟 1.5s 重新拉取完整历史，解决“空回复”问题
         setTimeout(async () => {
-          // [关键] 清空当前房间的本地缓存，强制 syncChat 发起网络请求拉取最新完整回复
-          // 避免 syncChat 发现本地有数据直接 return，导致页面只显示空的占位符
+          // [核心修复] 强制清空本地缓存，逼迫 syncChat 去后端拉取最新数据
           const chatIndex = chatStore.chat.findIndex(d => d.uuid === Number(uuid))
           if (chatIndex > -1)
             chatStore.chat[chatIndex].data = []
 
           await chatStore.syncChat(
             { uuid: Number(uuid) } as Chat.History,
-            undefined, // lastId undefined 代表拉取最新一页
+            undefined,
             () => {
               scrollToBottom()
             },
@@ -175,7 +187,7 @@ function startPolling() {
       }
     }
     catch (e) {
-      console.error('poll status error:', e)
+      console.error('Poll error:', e)
       stopPolling()
     }
   }, 2000)
@@ -188,7 +200,7 @@ function stopPolling() {
   }
 }
 
-// ================== 提问 / 重新回答 逻辑 ==================
+// ================== 发送消息逻辑 ==================
 async function onConversation() {
   let message = prompt.value
 
@@ -201,16 +213,17 @@ async function onConversation() {
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
-  const uploadFileKeys = isVisionModel.value
+  const uploadFileKeys = isVisionModel.value 
     ? [
         ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
         ...textUploadFileKeysRef.value.map(k => `txt:${k}`),
       ]
     : []
-
+  
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
+  // 新建 Controller 用于本次请求
   controller = new AbortController()
 
   const chatUuid = Date.now()
@@ -272,7 +285,7 @@ async function onConversation() {
             chunk = responseText.substring(lastIndex)
           try {
             const data = JSON.parse(chunk)
-            // 实时保存对话信息，供 Stop 功能使用
+            // 实时记录 ID，用于 Stop 操作
             lastChatInfo = data
             const usage = (data.detail && data.detail.usage)
               ? {
@@ -378,6 +391,26 @@ async function onConversation() {
   }
 }
 
+// ================== 停止响应逻辑 ==================
+async function handleStop() {
+  if (loading.value) {
+    // 1. 前端主动断开流（仅对当前会话有效）
+    controller.abort()
+    
+    // 2. 停止轮询
+    loading.value = false
+    stopPolling()
+    
+    // 3. 核心：即使前端断了，后端任务还在跑，必须调接口通知后端 kill 线程
+    await fetchChatStopResponding(
+      lastChatInfo.text || 'Stopped', 
+      lastChatInfo.id, 
+      lastChatInfo.conversationId
+    )
+  }
+}
+
+// ================== 其他功能逻辑 ==================
 async function onRegenerate(index: number) {
   if (loading.value)
     return
@@ -533,7 +566,6 @@ async function onResponseHistory(index: number, historyIndex: number) {
   )
 }
 
-// ================= 导出 / 删除 / 清空 / Stop =================
 function handleExport() {
   if (loading.value)
     return
@@ -630,18 +662,6 @@ function handleEnter(event: KeyboardEvent) {
   }
 }
 
-async function handleStop() {
-  if (loading.value) {
-    // 中断前端的可读流
-    controller.abort()
-    loading.value = false
-    stopPolling()
-    // 调用后端接口，真正停止后台线程并保存当前内容
-    await fetchChatStopResponding(lastChatInfo.text || 'Stopped', lastChatInfo.id, lastChatInfo.conversationId)
-  }
-}
-
-// ================ 上滚加载更多历史 ================
 async function loadMoreMessage(event: any) {
   const chatIndex = chatStore.chat.findIndex(d => d.uuid === +uuid)
   if (chatIndex <= -1 || chatStore.chat[chatIndex].data.length <= 0)
@@ -700,7 +720,7 @@ async function handleToggleUsingContext() {
     ms.warning(t('chat.turnOffContext'))
 }
 
-// ================ Prompt 模板 & 文本提示 ================
+// ================ Prompt 搜索 ================
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
     return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
@@ -749,7 +769,7 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
-// ================ 附件上传 ================
+// ================ 附件处理 ================
 function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
@@ -791,11 +811,12 @@ const uploadHeaders = computed(() => {
   }
 })
 
-// ================ 生命周期 & 监听 ================
+// ================ 生命周期 ================
 onMounted(() => {
   firstLoading.value = true
+  // 加载历史记录
   handleSyncChat()
-  // 进入房间时检查是否有正在进行的任务
+  // 检查是否有未完成的任务（例如页面刷新）
   checkProcessStatus()
 
   if (authStore.token) {
@@ -807,15 +828,15 @@ onMounted(() => {
 
 watch(() => chatStore.active, () => {
   handleSyncChat()
-  // 切换房间时停止旧的轮询，并检查新房间的状态
+  // 切换房间时，先停止旧轮询，再检查新房间状态
   stopPolling()
   checkProcessStatus()
 })
 
 onUnmounted(() => {
-  // 修改核心点：卸载组件（切房/刷新）时，不要 abort controller。
-  // 否则会导致前端主动发终止信号，后端收到后会杀死生成线程，导致切回来时任务已断。
-  /* if (loading.value) controller.abort() */
+  // [重要] 组件卸载（如切换房间）时，不要调用 controller.abort()
+  // 这会导致后端任务被终止。我们希望后台任务继续运行，以便切回来时恢复。
+  // if (loading.value) controller.abort()
   
   stopPolling()
 })
@@ -882,8 +903,8 @@ onUnmounted(() => {
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
           <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div
-              v-for="(key, index) in imageUploadFileKeysRef"
+            <div 
+              v-for="(key, index) in imageUploadFileKeysRef" 
               :key="`img-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
@@ -896,8 +917,8 @@ onUnmounted(() => {
           </div>
 
           <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div
-              v-for="(key, index) in textUploadFileKeysRef"
+            <div 
+              v-for="(key, index) in textUploadFileKeysRef" 
               :key="`txt-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
@@ -908,11 +929,11 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-
+    
           <div class="flex items-center space-x-2">
             <div>
               <NUpload
-                action="/api/upload-image"
+                action="/api/upload-image" 
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -930,7 +951,7 @@ onUnmounted(() => {
 
             <div>
               <NUpload
-                action="/api/upload-image"
+                action="/api/upload-image" 
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
