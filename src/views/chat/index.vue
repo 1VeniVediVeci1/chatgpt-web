@@ -26,7 +26,7 @@ import IconPrompt from '@/icons/Prompt.vue'
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
 let controller = new AbortController()
-let lastChatInfo: any = { text: 'Stopped', id: null, conversationId: null } // 默认值防止报错
+let lastChatInfo: any = { text: 'Stopped', id: null, conversationId: null }
 
 const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
 
@@ -41,14 +41,16 @@ const { isMobile } = useBasicLayout()
 const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
-// 注意：这里的 uuid 是进入组件时的初始值，切换房间时可能不会变（取决于路由策略）
-// 建议后续逻辑主要依赖 chatStore.active
+// 从路由获取 UUID
 const { uuid } = route.params as { uuid: string }
 
 const currentChatHistory = computed(() => chatStore.getChatHistoryByCurrentActive)
 const usingContext = computed(() => currentChatHistory?.value?.usingContext ?? true)
-// 确保 dataSources 是基于 store 的 active 状态，或者显式传入 current uuid
-const dataSources = computed(() => chatStore.getChatByUuid(chatStore.active ?? +uuid))
+// 优先使用 store active，兜底使用路由 uuid
+const dataSources = computed(() => {
+  const id = chatStore.active ?? Number(uuid)
+  return chatStore.getChatByUuid(id)
+})
 const conversationList = computed(() => dataSources.value.filter(item => (!item.inversion && !!item.conversationOptions)))
 
 const prompt = ref<string>('')
@@ -77,18 +79,27 @@ function handleSubmit() {
 const imageUploadFileKeysRef = ref<string[]>([])
 const textUploadFileKeysRef = ref<string[]>([])
 
-// 轮询定时器
 let pollInterval: NodeJS.Timeout | null = null
 
-// ================== 核心修复：状态一致性检查 ==================
+// ================== 核心修复逻辑 ==================
 
-// 1. 在“历史记录同步完成后”调用此函数
+// 获取当前准确的 RoomId
+function getCurrentRoomId(): number {
+  // 优先取 store 里的活跃 ID，如果没有（比如刚刷新未 hydrates），取路由上的 uuid 转数字
+  return chatStore.active ? chatStore.active : Number(uuid)
+}
+
+// 1. 状态检查 (Debug 版)
 async function checkProcessStatus() {
   try {
-    stopPolling() // 先停旧的
-    
-    const currentRoomId = chatStore.active
-    if (!currentRoomId) return
+    stopPolling() 
+    const roomId = getCurrentRoomId()
+    if (!roomId) {
+      console.error('[Debug] CheckStatus: No RoomId found', roomId)
+      return
+    }
+
+    console.log('[Debug] Checking status for Room:', roomId)
 
     const { data } = await fetchChatProcessStatus<{
       isProcessing: boolean
@@ -96,11 +107,13 @@ async function checkProcessStatus() {
       messageId: string | null
     }>()
 
-    // 只有当【后端正在生成】且【生成的是当前房间】
-    if (data.isProcessing && data.roomId === currentRoomId) {
+    console.log('[Debug] Backend Status:', data)
+
+    // 强转 string/number 对比，防止类型错误
+    if (data.isProcessing && Number(data.roomId) === roomId) {
+      console.log('[Debug] Resume loading state')
       loading.value = true
       
-      // 更新 lastChatInfo 以便 Stop 按钮能工作
       lastChatInfo = {
         id: data.messageId,
         conversationId: null,
@@ -110,10 +123,12 @@ async function checkProcessStatus() {
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 关键逻辑：如果最后一条是用户提问（说明DB里还没存并推回来AI的回复），我们手动补一个 loading 气泡
+      // 如果最后一条是用户发的消息，或者列表为空，说明回复还没存入数据库
+      // 我们补一个假的“...”
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
+        console.log('[Debug] Appending fake loading bubble')
         addChat(
-          currentRoomId,
+          roomId,
           {
             uuid: Date.now(),
             dateTime: new Date().toLocaleString(),
@@ -127,25 +142,29 @@ async function checkProcessStatus() {
         )
         scrollToBottom()
       } else if (lastItem) {
-        // 如果已经有气泡（比如切走再切回来时DB可能有部分数据了），强制转圈
-        updateChatSome(currentRoomId, lastIndex, { loading: true })
+        // 已经有回复了，强制转圈
+        console.log('[Debug] Updating existing bubble loading=true')
+        updateChatSome(roomId, lastIndex, { loading: true })
       }
 
-      // 启动轮询
       startPolling()
+    } else {
+      console.log('[Debug] No active process for this room')
     }
   } catch (error) {
-    console.error('Check process status failed:', error)
+    console.error('[Debug] Check process status failed:', error)
   }
 }
 
-// 2. 轮询逻辑
+// 2. 轮询逻辑 (Debug 版)
 function startPolling() {
-  stopPolling()
+  stopPolling() // 防抖
+  console.log('[Debug] Start Polling...')
+  
   pollInterval = setInterval(async () => {
     try {
-      const currentRoomId = chatStore.active
-      if (!currentRoomId) return
+      const roomId = getCurrentRoomId()
+      if (!roomId) return
 
       const { data } = await fetchChatProcessStatus<{
         isProcessing: boolean
@@ -153,35 +172,38 @@ function startPolling() {
         messageId: string | null
       }>()
 
-      // 如果切房间了，停止当前轮询
-      if (data.roomId !== currentRoomId) {
-        stopPolling()
+      // 切房间了，停
+      if (Number(data.roomId) !== roomId) {
+        // console.log('[Debug] Room changed, stop polling current.')
+        // 此处不一定要 stop，因为可能后端还在生成上一个房间的，但前端无需展示
+        // 只有当 data.roomId === null 或任务结束时才真正停
+        if (!data.isProcessing) stopPolling()
         return
       }
 
       if (data.isProcessing) {
-        // 持续生成中，强制 UI 保持 loading
         loading.value = true
+        // 维持 loading 状态
         const lastIndex = dataSources.value.length - 1
         if (lastIndex > -1 && !dataSources.value[lastIndex].inversion && !dataSources.value[lastIndex].loading) {
-          updateChatSome(currentRoomId, lastIndex, { loading: true })
+          updateChatSome(roomId, lastIndex, { loading: true })
         }
       } else {
-        // 任务结束
+        console.log('[Debug] Task finished, reloading history.')
         stopPolling()
         loading.value = false
 
-        // 延迟重新拉取完整记录
+        // 延迟重拉
         setTimeout(async () => {
-          const chatIndex = chatStore.chat.findIndex(d => d.uuid === currentRoomId)
-          if (chatIndex > -1) chatStore.chat[chatIndex].data = [] // 清除本地，强拉
+          const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
+          if (chatIndex > -1) chatStore.chat[chatIndex].data = [] 
 
           await chatStore.syncChat(
-            { uuid: currentRoomId } as Chat.History,
+            { uuid: roomId } as Chat.History,
             undefined,
             () => { scrollToBottom() }
           )
-        }, 1500)
+        }, 1000)
       }
     } catch (error) {
       console.error('Poll error', error)
@@ -197,20 +219,18 @@ function stopPolling() {
   }
 }
 
-// 3. 串行化加载逻辑：先 Sync DB -> 再 Check Status
+// 3. 串行加载链
 const handleLoadingChain = async () => {
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
 
-  // (1) 停止轮询，避免旧房间干扰
   stopPolling()
 
-  // (2) 调用 syncChat
+  console.log('[Debug] Syncing chat history for:', roomId)
   await chatStore.syncChat(
-    { uuid: currentRoomId } as Chat.History,
+    { uuid: roomId } as Chat.History,
     undefined,
     () => {
-      // syncChat 完成后的回调
       firstLoading.value = false
       
       nextTick(() => {
@@ -220,29 +240,23 @@ const handleLoadingChain = async () => {
       if (inputRef.value && !isMobile.value)
         (inputRef.value as any)?.focus()
 
-      // (3) 只有等 DB 数据回来了，才去检查是不是要补“正在生成”的状态
+      // [重要] 历史拉完后，去检查是否还在生成
       checkProcessStatus()
     }
   )
 }
 
-// 使用 debounce 包装主入口
 const debouncedLoad = debounce(handleLoadingChain, 200)
 
-
-// ================== 发送消息逻辑 ==================
+// ================== 发送消息 ==================
 async function onConversation() {
   let message = prompt.value
 
-  if (loading.value)
-    return
+  if (loading.value) return
+  if (!message || message.trim() === '') return
 
-  if (!message || message.trim() === '')
-    return
-
-  // 使用 chatStore.active 而不是 uuid
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
 
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
@@ -260,8 +274,9 @@ async function onConversation() {
   controller = new AbortController()
 
   const chatUuid = Date.now()
+  // 用户消息
   addChat(
-    currentRoomId,
+    roomId,
     {
       uuid: chatUuid,
       dateTime: new Date().toLocaleString(),
@@ -284,13 +299,14 @@ async function onConversation() {
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
+  // AI 占位消息
   addChat(
-    currentRoomId,
+    roomId,
     {
       uuid: chatUuid,
       dateTime: new Date().toLocaleString(),
       text: '',
-      loading: true,
+      loading: true, // 初始 loading
       inversion: false,
       error: false,
       conversationOptions: null,
@@ -303,7 +319,7 @@ async function onConversation() {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
       await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: currentRoomId,
+        roomId: roomId,
         uuid: chatUuid,
         prompt: message,
         uploadFileKeys,
@@ -314,8 +330,7 @@ async function onConversation() {
           const { responseText } = xhr
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
-          if (lastIndex !== -1)
-            chunk = responseText.substring(lastIndex)
+          if (lastIndex !== -1) chunk = responseText.substring(lastIndex)
           try {
             const data = JSON.parse(chunk)
             lastChatInfo = data
@@ -328,7 +343,7 @@ async function onConversation() {
                 }
               : undefined
             updateChat(
-              currentRoomId,
+              roomId,
               dataSources.value.length - 1,
               {
                 dateTime: new Date().toLocaleString(),
@@ -342,71 +357,53 @@ async function onConversation() {
               },
             )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+            if (openLongReply && data.detail?.choices?.[0]?.finish_reason === 'length') {
               options.parentMessageId = data.id
               lastText = data.text
               message = ''
               return fetchChatAPIOnce()
             }
-
             scrollToBottomIfAtBottom()
           }
-          catch (error) {
-            //
-          }
+          catch (error) {}
         },
       })
-      updateChatSome(currentRoomId, dataSources.value.length - 1, { loading: false })
+      updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
     }
 
     await fetchChatAPIOnce()
   }
   catch (error: any) {
-    // 处理 canceled
     if (error.message === 'canceled') {
-      updateChatSome(
-        currentRoomId,
-        dataSources.value.length - 1,
-        {
-          loading: false,
-        },
-      )
+      // 主动取消（Stop），前端停 loading，后端通过 /chat-abort 停
+      updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
       scrollToBottomIfAtBottom()
       return
     }
 
     const errorMessage = error?.message ?? t('common.wrong')
-    const currentChat = getChatByUuidAndIndex(currentRoomId, dataSources.value.length - 1)
-    // o1 模型或其他特定逻辑
+    const currentChat = getChatByUuidAndIndex(roomId, dataSources.value.length - 1)
     const iso1model = currentChatModel.value?.includes('o1')
     
     if (currentChat?.text && currentChat.text !== '' && !iso1model) {
-      updateChatSome(
-        currentRoomId,
-        dataSources.value.length - 1,
-        {
+      updateChatSome(roomId, dataSources.value.length - 1, {
           text: `${currentChat.text}\n[${errorMessage}]`,
           error: false,
           loading: false,
-        },
-      )
+        })
       return
     }
     if (currentChat?.text && currentChat.text !== '' && iso1model) {
-      updateChatSome(
-        currentRoomId,
-        dataSources.value.length - 1,
-        {
+      updateChatSome(roomId, dataSources.value.length - 1, {
           text: `${currentChat.text}`,
           error: false,
           loading: false,
-        },
-      )
+        })
       return
     }
 
     updateChat(
-      currentRoomId,
+      roomId,
       dataSources.value.length - 1,
       {
         dateTime: new Date().toLocaleString(),
@@ -425,17 +422,13 @@ async function onConversation() {
   }
 }
 
-// ================== 停止响应 ==================
 async function handleStop() {
   if (loading.value) {
-    // 1. 前端主动断
     controller.abort()
-    
-    // 2. UI 停转
     loading.value = false
     stopPolling()
     
-    // 3. 通知后端
+    // 防御性校验
     if (lastChatInfo.id) {
       await fetchChatStopResponding(
         lastChatInfo.text || 'Stopped',
@@ -446,12 +439,10 @@ async function handleStop() {
   }
 }
 
-// ================== 再生成 ==================
 async function onRegenerate(index: number) {
   if (loading.value) return
-  
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId() // Use dynamic getter
+  if (!roomId) return
 
   controller = new AbortController()
 
@@ -474,11 +465,11 @@ async function onRegenerate(index: number) {
   const chatUuid = dataSources.value[index].uuid
   
   updateChat(
-    currentRoomId,
+    roomId,
     index,
     {
       dateTime: new Date().toLocaleString(),
-      text: '',
+      text: '', // Clear text for redraw
       inversion: false,
       responseCount,
       error: false,
@@ -492,7 +483,7 @@ async function onRegenerate(index: number) {
     let lastText = ''
     const fetchChatAPIOnce = async () => {
       await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: currentRoomId,
+        roomId,
         uuid: chatUuid || Date.now(),
         regenerate: true,
         prompt: message,
@@ -502,16 +493,15 @@ async function onRegenerate(index: number) {
         onDownloadProgress: ({ event }) => {
           const xhr = event.target as XMLHttpRequest
           const chunk = xhr.responseText
-          // 简化 chunk parse 逻辑... 保持和 onConversation 一致即可
           const lastIndex = chunk.lastIndexOf('\n', chunk.length - 2)
           let realChunk = chunk
           if (lastIndex !== -1) realChunk = chunk.substring(lastIndex)
           try {
             const data = JSON.parse(realChunk)
             lastChatInfo = data
-            const usage = (data.detail && data.detail.usage) ? data.detail.usage : undefined // 简化
+            const usage = (data.detail && data.detail.usage) ? data.detail.usage : undefined
             updateChat(
-              currentRoomId,
+              roomId,
               index,
               {
                 dateTime: new Date().toLocaleString(),
@@ -534,18 +524,17 @@ async function onRegenerate(index: number) {
           } catch (error) {}
         },
       })
-      updateChatSome(currentRoomId, index, { loading: false })
+      updateChatSome(roomId, index, { loading: false })
     }
     await fetchChatAPIOnce()
-  }
-  catch (error: any) {
+  } catch (error: any) {
     if (error.message === 'canceled') {
-      updateChatSome(currentRoomId, index, { loading: false })
+      updateChatSome(roomId, index, { loading: false })
       return
     }
     const errorMessage = error?.message ?? t('common.wrong')
     updateChat(
-      currentRoomId,
+      roomId,
       index,
       {
         dateTime: new Date().toLocaleString(),
@@ -558,18 +547,17 @@ async function onRegenerate(index: number) {
         requestOptions: { prompt: message, options: { ...options } },
       },
     )
-  }
-  finally {
+  } finally {
     loading.value = false
   }
 }
 
 async function onResponseHistory(index: number, historyIndex: number) {
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
-  const chat = (await fetchChatResponseoHistory(currentRoomId, dataSources.value[index].uuid || Date.now(), historyIndex)).data
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
+  const chat = (await fetchChatResponseoHistory(roomId, dataSources.value[index].uuid || Date.now(), historyIndex)).data
   updateChat(
-    currentRoomId,
+    roomId,
     index,
     {
       dateTime: chat.dateTime,
@@ -621,11 +609,11 @@ function handleExport() {
 
 function handleDelete(index: number, fast: boolean) {
   if (loading.value) return
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
 
   if (fast === true) {
-    chatStore.deleteChatByUuid(currentRoomId, index)
+    chatStore.deleteChatByUuid(roomId, index)
   } else {
     dialog.warning({
       title: t('chat.deleteMessage'),
@@ -633,7 +621,7 @@ function handleDelete(index: number, fast: boolean) {
       positiveText: t('common.yes'),
       negativeText: t('common.no'),
       onPositiveClick: () => {
-        chatStore.deleteChatByUuid(currentRoomId, index)
+        chatStore.deleteChatByUuid(roomId, index)
       },
     })
   }
@@ -645,8 +633,8 @@ function updateCurrentNavIndex(index: number, newIndex: number) {
 
 function handleClear() {
   if (loading.value) return
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
 
   dialog.warning({
     title: t('chat.clearChat'),
@@ -654,7 +642,7 @@ function handleClear() {
     positiveText: t('common.yes'),
     negativeText: t('common.no'),
     onPositiveClick: () => {
-      chatStore.clearChatByUuid(currentRoomId)
+      chatStore.clearChatByUuid(roomId)
     },
   })
 }
@@ -673,18 +661,17 @@ function handleEnter(event: KeyboardEvent) {
   }
 }
 
-// 加载更多历史
 async function loadMoreMessage(event: any) {
-  const currentRoomId = chatStore.active
-  if (!currentRoomId) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
 
-  const chatIndex = chatStore.chat.findIndex(d => d.uuid === currentRoomId)
+  const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
   if (chatIndex <= -1 || chatStore.chat[chatIndex].data.length <= 0) return
 
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
   const lastId = chatStore.chat[chatIndex].data[0].uuid
 
-  await chatStore.syncChat({ uuid: currentRoomId } as Chat.History, lastId, () => {
+  await chatStore.syncChat({ uuid: roomId } as Chat.History, lastId, () => {
     loadingms && loadingms.destroy()
     nextTick(() => scrollTo(event.target.scrollHeight - scrollPosition))
   }, () => {
@@ -705,9 +692,10 @@ async function handleScroll(event: any) {
 }
 
 async function handleToggleUsingContext() {
-  if (!currentChatHistory.value || !chatStore.active) return
+  const roomId = getCurrentRoomId()
+  if (!currentChatHistory.value || !roomId) return
   currentChatHistory.value.usingContext = !currentChatHistory.value.usingContext
-  chatStore.setUsingContext(currentChatHistory.value.usingContext, chatStore.active)
+  chatStore.setUsingContext(currentChatHistory.value.usingContext, roomId)
   if (currentChatHistory.value.usingContext) ms.success(t('chat.turnOnContext'))
   else ms.warning(t('chat.turnOffContext'))
 }
@@ -744,16 +732,16 @@ const footerClass = computed(() => {
 })
 
 async function handleSyncChatModel(chatModel: string) {
-  if (!chatStore.active) return
+  const roomId = getCurrentRoomId()
+  if (!roomId) return
   nowSelectChatModel.value = chatModel
-  await chatStore.setChatModel(chatModel, chatStore.active)
+  await chatStore.setChatModel(chatModel, roomId)
 }
 
 function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
-// 附件处理
 function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
@@ -793,20 +781,15 @@ const uploadHeaders = computed(() => {
   return { Authorization: `Bearer ${token}` }
 })
 
-// 生命周期
+// 生命周期：页面加载
 onMounted(async () => {
-  firstLoading.value = true
-  // 从 chatStore.active 获取，这比 param 更准
-  const currentRoomId = chatStore.active
-  if (currentRoomId) {
-    // 先加载历史，加载完后再检查状态，避免覆盖
-    debouncedLoad()
-  }
+  firstLoading.value = true  
+  debouncedLoad() // 这里会先同步历史，然后调 checkProcessStatus
 
   if (authStore.token) {
     const chatModels = authStore.session?.chatModels
     if (chatModels != null && chatModels.filter(d => d.value === userStore.userInfo.config.chatModel).length <= 0)
-      ms.error('你选择的模型已不存在，请重新选择', { duration: 7000 })
+      ms.error('你选择的模型已不存在，请重新选择 | The selected model not exists, please choose again.', { duration: 7000 })
   }
 })
 
@@ -814,7 +797,6 @@ onMounted(async () => {
 watch(
   () => chatStore.active,
   () => {
-    // 切换房间时，先清空轮询，再走串行加载流程
     stopPolling()
     if (chatStore.active) {
       firstLoading.value = true
@@ -895,7 +877,6 @@ onUnmounted(() => {
         </div>
       </div>
     </main>
-    
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
