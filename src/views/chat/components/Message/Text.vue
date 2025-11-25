@@ -190,7 +190,14 @@ onUnmounted(() => {
 
 <template>
   <div class="text-black" :class="wrapClass">
-    <!-- Markdown / 文本内容 -->
+    <!-- 
+      [修改说明]
+      将 Markdown 文本渲染 div 与 附件显示 div 分开。
+      click="handleMarkdownClick" 只绑定在文本区域，
+      避免点击 NImageGroup 里的附件图片时，事件冒泡导致触发两次预览。
+    -->
+    
+    <!-- 1. Markdown / 文本内容区域 -->
     <div
       ref="textRef"
       class="leading-relaxed break-words"
@@ -206,46 +213,46 @@ onUnmounted(() => {
         <div v-else class="w-full whitespace-pre-wrap" v-text="text" />
       </div>
       <div v-else class="whitespace-pre-wrap" v-text="text" />
+    </div>
 
-      <!-- 附件图片（来自 props.images） -->
-      <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
-        <NImageGroup>
-          <NImage
-            v-for="(v, i) of imageList"
-            :key="`img-${i}`"
-            :src="`/uploads/${v}`"
-            alt="image"
-            object-fit="contain"
-            class="rounded-md shadow-sm cursor-pointer hover:opacity-90 excludeFastDel"
-            :img-props="{
-              style: { maxWidth: '100%', maxHeight: '300px', objectFit: 'contain' },
-              alt: 'image',
-            }"
-          />
-        </NImageGroup>
-      </div>
+    <!-- 2. 附件图片（移出 textRef div） -->
+    <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
+      <NImageGroup>
+        <NImage
+          v-for="(v, i) of imageList"
+          :key="`img-${i}`"
+          :src="`/uploads/${v}`"
+          alt="image"
+          object-fit="contain"
+          class="rounded-md shadow-sm cursor-pointer hover:opacity-90 excludeFastDel"
+          :img-props="{
+            style: { maxWidth: '100%', maxHeight: '300px', objectFit: 'contain' },
+            alt: 'image',
+          }"
+        />
+      </NImageGroup>
+    </div>
 
-      <!-- 附件文件（来自 props.images） -->
-      <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
-        <a
-          v-for="(v, i) of fileList"
-          :key="`file-${i}`"
-          :href="`/uploads/${v}`"
-          target="_blank"
-          download
-          class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group excludeFastDel"
-          style="text-decoration: none; color: inherit;"
-          @click.stop
-        >
-          <div class="flex items-center justify-center w-8 h-8 mr-2 bg-gray-100 rounded-full dark:bg-gray-700 text-gray-500 dark:text-gray-300">
-            <SvgIcon icon="ri:file-text-line" class="text-lg" />
-          </div>
-          <div class="flex flex-col overflow-hidden">
-            <span class="text-sm font-medium truncate max-w-[150px]">{{ v }}</span>
-            <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载</span>
-          </div>
-        </a>
-      </div>
+    <!-- 3. 附件文件（移出 textRef div） -->
+    <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
+      <a
+        v-for="(v, i) of fileList"
+        :key="`file-${i}`"
+        :href="`/uploads/${v}`"
+        target="_blank"
+        download
+        class="flex items-center p-2 transition-colors bg-white border rounded-md shadow-sm dark:bg-neutral-800 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-700 group excludeFastDel"
+        style="text-decoration: none; color: inherit;"
+        @click.stop
+      >
+        <div class="flex items-center justify-center w-8 h-8 mr-2 bg-gray-100 rounded-full dark:bg-gray-700 text-gray-500 dark:text-gray-300">
+          <SvgIcon icon="ri:file-text-line" class="text-lg" />
+        </div>
+        <div class="flex flex-col overflow-hidden">
+          <span class="text-sm font-medium truncate max-w-[150px]">{{ v }}</span>
+          <span class="text-xs text-gray-400 group-hover:text-blue-500">点击下载</span>
+        </div>
+      </a>
     </div>
 
     <!-- 用于 Markdown 内联图片预览的隐藏 NImage -->
