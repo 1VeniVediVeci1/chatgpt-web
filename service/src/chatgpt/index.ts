@@ -186,7 +186,8 @@ export async function initApi(key: KeyConfig, {
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
-const processThreads: { userId: string; abort: AbortController; messageId: string }[] = []
+// [修改] 增加 roomId 字段
+const processThreads: { userId: string; abort: AbortController; messageId: string; roomId: number }[] = []
 
 function getGeminiChatSession(
   apiKey: string,
@@ -338,7 +339,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      processThreads.push({ userId, abort, messageId })
+      // [修改] 加入 roomId
+      processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
       const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
@@ -415,7 +417,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       lastMessageId: lastContext.parentMessageId,
       isImageModel: isImage,
     })
-    processThreads.push({ userId, abort, messageId })
+    // [修改] 加入 roomId
+    processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
     let text = ''
     let chatIdRes = customMessageId
@@ -657,6 +660,19 @@ function getAccountId(accessToken: string): string {
   catch (error) {
     return ''
   }
+}
+
+// [新增] 获取用户生成状态
+export function getChatProcessState(userId: string) {
+  const thread = processThreads.find(d => d.userId === userId)
+  if (thread) {
+    return {
+      isProcessing: true,
+      roomId: thread.roomId,
+      messageId: thread.messageId,
+    }
+  }
+  return { isProcessing: false, roomId: null, messageId: null }
 }
 
 export { chatReplyProcess, chatConfig, containsSensitiveWords }
