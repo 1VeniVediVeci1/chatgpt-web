@@ -287,11 +287,11 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
         if (chat.detail && chat.detail.choices.length > 0)
           chuck.detail.choices[0].finish_reason = chat.detail.choices[0].finish_reason
 
-        // [修改] 包裹 res.write，忽略写入错误，保证后端继续执行
+        // [核心修复] 包裹 res.write，忽略断连错误，防止中断 chatReplyProcess
         try {
           res.write(firstChunk ? JSON.stringify(chuck) : `\n${JSON.stringify(chuck)}`)
         } catch (err) {
-          // 忽略写入错误
+          // 客户端断开了，这里不做任何处理，让后端逻辑继续跑完
         }
         firstChunk = false
       },
@@ -303,6 +303,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       tryCount: 0,
       room,
     })
+    
     // return the whole response including usage
     if (!result.data.detail?.usage) {
       if (!result.data.detail)
@@ -315,7 +316,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       result.data.detail.usage.estimated = true
     }
     
-    // [修改] 包裹 res.write
+    // [修改] 包裹 res.write，防止最后一次写入崩溃
     try {
       res.write(`\n${JSON.stringify(result.data)}`)
     } catch (err) {
@@ -334,6 +335,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       res.end()
     } catch (err) {}
 
+    // 这里继续执行数据库更新逻辑，不受前端断连影响
     try {
       if (result == null || result === undefined || result.status !== 'Success') {
         if (result && result.status !== 'Success')
