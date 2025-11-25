@@ -67,9 +67,7 @@ let prevScrollTop: number
 const promptStore = usePromptStore()
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-// 修复：初始化时，如果不是正在生成的特定任务，重置本地 loading 防止卡死
-// 但不能暴力全部重置，否则会跟 checkProcessStatus 冲突。
-// 这里我们可以暂且保留，checkProcessStatus 会在之后重新修正它。
+// 初始化时，如果本地有遗留 loading，先清掉，避免假卡死
 dataSources.value.forEach((item, index) => {
   if (item.loading)
     updateChatSome(+uuid, index, { loading: false })
@@ -85,31 +83,33 @@ const textUploadFileKeysRef = ref<string[]>([])
 // 轮询定时器
 let pollInterval: NodeJS.Timeout | null = null
 
-// ====== 状态检查：页面加载 / 切换房间 / 刷新时执行 ======
+// ================== 状态检查：进入房间 / 切换房间 / 刷新 ==================
 async function checkProcessStatus() {
   try {
-    // 先停止旧轮询
+    // 先停止旧房间的轮询
     stopPolling()
     
-    const { data } = await fetchChatProcessStatus()
-    
-    // 只有当后端正在生成的任务属于当前房间 ID 时
+    const { data } = await fetchChatProcessStatus<{
+      isProcessing: boolean
+      roomId: number | null
+      messageId: string | null
+    }>()
+
+    // 仅当后端记录的任务属于当前房间时，才恢复界面状态
     if (data.isProcessing && data.roomId === +uuid) {
-      loading.value = true // 恢复 Stop 按钮
+      loading.value = true // 显示 Stop 按钮
       
-      // 恢复 lastChatInfo，确保 Stop 按钮有效
-      // 如果是刷新回来对话 ID 可能丢失，设为 null，后端 handleStop 需做兼容
+      // 为 Stop 接口准备最少字段
       lastChatInfo = {
         id: data.messageId,
-        conversationId: null, 
+        conversationId: null,
         text: '...',
       }
 
-      // 恢复 UI 的 loading 状态（小圆圈）
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
       
-      // 情况 1: 当前列表为空，或者最后一条是用户发的消息 -> 补一个 "..."
+      // 情况 1：当前房间没有 AI 回复气泡，或者最后一条是用户侧消息 -> 补一个占位的回复
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(
           +uuid,
@@ -125,56 +125,56 @@ async function checkProcessStatus() {
           },
         )
         scrollToBottom()
-      }
+      } 
+      // 情况 2：已经有 AI 回复气泡，但 loading 被之前逻辑改掉了 -> 强制恢复 loading
       else {
-        // 情况 2: 已经有 AI 的回复气泡（可能是历史记录拉下来的），强制设为转圈
         updateChatSome(+uuid, lastIndex, { loading: true })
       }
 
       // 启动轮询
       startPolling()
     }
-  }
-  catch (error) {
+  } catch (error) {
     console.error('Check process status failed:', error)
   }
 }
 
-// ====== 轮询逻辑 ======
+// ================== 轮询逻辑 ==================
 function startPolling() {
   stopPolling()
   pollInterval = setInterval(async () => {
     try {
-      const { data } = await fetchChatProcessStatus()
-      
-      // 如果已切到其他房间，停止轮询当前状态，但不改变 loading（由 active watch 处理）
+      const { data } = await fetchChatProcessStatus<{
+        isProcessing: boolean
+        roomId: number | null
+        messageId: string | null
+      }>()
+
+      // 已经切到别的房间了，停止当前房间轮询
       if (data.roomId !== +uuid) {
         stopPolling()
         return
       }
 
-      // 如果任务正在进行：
       if (data.isProcessing) {
+        // 持续生成中
         loading.value = true
-        
-        // [关键] 防止 syncChat（历史同步）把最后一条消息的 loading 状态覆盖成 false
-        // 我们在轮询中不断强制把最后一条消息设为 loading
+
+        // 防止 syncChat 把 loading 覆盖成 false，定期兜底
         const lastIndex = dataSources.value.length - 1
         if (lastIndex > -1 && !dataSources.value[lastIndex].inversion && !dataSources.value[lastIndex].loading) {
-           updateChatSome(+uuid, lastIndex, { loading: true })
+          updateChatSome(+uuid, lastIndex, { loading: true })
         }
-      } 
-      // 如果任务结束：
-      else {
+      } else {
+        // 后端任务已经结束
         stopPolling()
         loading.value = false
 
-        // 延迟 1.5s 重新拉取完整历史，解决“空回复”问题
+        // 等后端写库稳定，再强制重新拉一次历史，避免“空白/不完整”现象
         setTimeout(async () => {
-          // [核心修复] 强制清空本地缓存，逼迫 syncChat 去后端拉取最新数据
           const chatIndex = chatStore.chat.findIndex(d => d.uuid === Number(uuid))
           if (chatIndex > -1)
-            chatStore.chat[chatIndex].data = []
+            chatStore.chat[chatIndex].data = [] // 清掉本地缓存
 
           await chatStore.syncChat(
             { uuid: Number(uuid) } as Chat.History,
@@ -200,7 +200,7 @@ function stopPolling() {
   }
 }
 
-// ================== 发送消息逻辑 ==================
+// ================== 发送消息 ==================
 async function onConversation() {
   let message = prompt.value
 
@@ -223,7 +223,6 @@ async function onConversation() {
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
-  // 新建 Controller 用于本次请求
   controller = new AbortController()
 
   const chatUuid = Date.now()
@@ -277,7 +276,7 @@ async function onConversation() {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target
+          const xhr = event.target as XMLHttpRequest
           const { responseText } = xhr
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
@@ -285,7 +284,6 @@ async function onConversation() {
             chunk = responseText.substring(lastIndex)
           try {
             const data = JSON.parse(chunk)
-            // 实时记录 ID，用于 Stop 操作
             lastChatInfo = data
             const usage = (data.detail && data.detail.usage)
               ? {
@@ -310,7 +308,12 @@ async function onConversation() {
               },
             )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+            if (
+              openLongReply &&
+              data.detail &&
+              data.detail.choices.length > 0 &&
+              data.detail.choices[0].finish_reason === 'length'
+            ) {
               options.parentMessageId = data.id
               lastText = data.text
               message = ''
@@ -391,26 +394,26 @@ async function onConversation() {
   }
 }
 
-// ================== 停止响应逻辑 ==================
+// ================== 停止响应 ==================
 async function handleStop() {
   if (loading.value) {
-    // 1. 前端主动断开流（仅对当前会话有效）
+    // 1. 中断当前流式请求
     controller.abort()
     
     // 2. 停止轮询
     loading.value = false
     stopPolling()
     
-    // 3. 核心：即使前端断了，后端任务还在跑，必须调接口通知后端 kill 线程
+    // 3. 告诉后端真正停止任务，并保存当前 text
     await fetchChatStopResponding(
-      lastChatInfo.text || 'Stopped', 
-      lastChatInfo.id, 
-      lastChatInfo.conversationId
+      lastChatInfo.text || 'Stopped',
+      lastChatInfo.id,
+      lastChatInfo.conversationId,
     )
   }
 }
 
-// ================== 其他功能逻辑 ==================
+// ================== 再生成 ==================
 async function onRegenerate(index: number) {
   if (loading.value)
     return
@@ -464,7 +467,7 @@ async function onRegenerate(index: number) {
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
-          const xhr = event.target
+          const xhr = event.target as XMLHttpRequest
           const { responseText } = xhr
           const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
           let chunk = responseText
@@ -497,7 +500,12 @@ async function onRegenerate(index: number) {
               },
             )
 
-            if (openLongReply && data.detail && data.detail.choices.length > 0 && data.detail.choices[0].finish_reason === 'length') {
+            if (
+              openLongReply &&
+              data.detail &&
+              data.detail.choices.length > 0 &&
+              data.detail.choices[0].finish_reason === 'length'
+            ) {
               options.parentMessageId = data.id
               lastText = data.text
               message = ''
@@ -696,7 +704,7 @@ const handleSyncChat
       if (scrollRefDom)
         nextTick(() => scrollRefDom.scrollTop = scrollRefDom.scrollHeight)
       if (inputRef.value && !isMobile.value)
-        inputRef.value?.focus()
+        (inputRef.value as any)?.focus()
     })
   }, 200)
 
@@ -723,12 +731,16 @@ async function handleToggleUsingContext() {
 // ================ Prompt 搜索 ================
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
-    return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
-      return {
-        label: obj.value,
-        value: obj.value,
-      }
-    })
+    return promptTemplate.value
+      .filter((item: { title: string }) =>
+        item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase()),
+      )
+      .map((obj: { value: any }) => {
+        return {
+          label: obj.value,
+          value: obj.value,
+        }
+      })
   }
   else {
     return []
@@ -769,7 +781,7 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
-// ================ 附件处理 ================
+// ================ 附件上传 ================
 function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
@@ -814,9 +826,9 @@ const uploadHeaders = computed(() => {
 // ================ 生命周期 ================
 onMounted(() => {
   firstLoading.value = true
-  // 加载历史记录
+  // 加载历史消息
   handleSyncChat()
-  // 检查是否有未完成的任务（例如页面刷新）
+  // 检查是否有后端正在生成的任务
   checkProcessStatus()
 
   if (authStore.token) {
@@ -826,18 +838,18 @@ onMounted(() => {
   }
 })
 
-watch(() => chatStore.active, () => {
-  handleSyncChat()
-  // 切换房间时，先停止旧轮询，再检查新房间状态
-  stopPolling()
-  checkProcessStatus()
-})
+watch(
+  () => chatStore.active,
+  () => {
+    handleSyncChat()
+    // 切换房间：停止旧轮询，检查新房间状态
+    stopPolling()
+    checkProcessStatus()
+  },
+)
 
 onUnmounted(() => {
-  // [重要] 组件卸载（如切换房间）时，不要调用 controller.abort()
-  // 这会导致后端任务被终止。我们希望后台任务继续运行，以便切回来时恢复。
-  // if (loading.value) controller.abort()
-  
+  // 注意：这里不要调用 controller.abort()，避免切房间时中断后端生成
   stopPolling()
 })
 </script>
@@ -848,11 +860,17 @@ onUnmounted(() => {
       v-if="isMobile"
       :using-context="usingContext"
       :show-prompt="showPrompt"
-      @export="handleExport" @toggle-using-context="handleToggleUsingContext"
+      @export="handleExport"
+      @toggle-using-context="handleToggleUsingContext"
       @toggle-show-prompt="showPrompt = true"
     />
     <main class="flex-1 overflow-hidden">
-      <div id="scrollRef" ref="scrollRef" class="h-full overflow-hidden overflow-y-auto" @scroll="handleScroll">
+      <div
+        id="scrollRef"
+        ref="scrollRef"
+        class="h-full overflow-hidden overflow-y-auto"
+        @scroll="handleScroll"
+      >
         <div
           id="image-wrapper"
           class="w-full max-w-screen-xl m-auto dark:bg-[#101014]"
@@ -886,7 +904,11 @@ onUnmounted(() => {
                   @response-history="(ev) => onResponseHistory(index, ev)"
                 />
                 <div class="sticky bottom-0 left-0 flex justify-center">
-                  <NButton v-if="loading" type="warning" @click="handleStop">
+                  <NButton
+                    v-if="loading"
+                    type="warning"
+                    @click="handleStop"
+                  >
                     <template #icon>
                       <SvgIcon icon="ri:stop-circle-line" />
                     </template>
@@ -902,29 +924,41 @@ onUnmounted(() => {
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div 
-              v-for="(key, index) in imageUploadFileKeysRef" 
+          <div
+            v-if="imageUploadFileKeysRef.length > 0"
+            class="flex flex-wrap items-center gap-2 mb-2"
+          >
+            <div
+              v-for="(key, index) in imageUploadFileKeysRef"
               :key="`img-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
               <SvgIcon icon="ri:image-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteImageFile(index)">
+              <button
+                class="ml-1 text-red-500 hover:text-red-700"
+                @click="handleDeleteImageFile(index)"
+              >
                 <SvgIcon icon="ri:close-line" />
               </button>
             </div>
           </div>
 
-          <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div 
-              v-for="(key, index) in textUploadFileKeysRef" 
+          <div
+            v-if="textUploadFileKeysRef.length > 0"
+            class="flex flex-wrap items-center gap-2 mb-2"
+          >
+            <div
+              v-for="(key, index) in textUploadFileKeysRef"
               :key="`txt-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
               <SvgIcon icon="ri:file-text-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteTextFile(index)">
+              <button
+                class="ml-1 text-red-500 hover:text-red-700"
+                @click="handleDeleteTextFile(index)"
+              >
                 <SvgIcon icon="ri:close-line" />
               </button>
             </div>
@@ -933,7 +967,7 @@ onUnmounted(() => {
           <div class="flex items-center space-x-2">
             <div>
               <NUpload
-                action="/api/upload-image" 
+                action="/api/upload-image"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -941,7 +975,9 @@ onUnmounted(() => {
                 @finish="handleFinishImage"
                 @before-upload="handleBeforeUpload"
               >
-                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
+                <div
+                  class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer"
+                >
                   <span class="text-xl text-[#4f555e] dark:text-white">
                     <SvgIcon icon="ri:image-add-line" />
                   </span>
@@ -951,7 +987,7 @@ onUnmounted(() => {
 
             <div>
               <NUpload
-                action="/api/upload-image" 
+                action="/api/upload-image"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -959,7 +995,9 @@ onUnmounted(() => {
                 @finish="handleFinishText"
                 @before-upload="handleBeforeUpload"
               >
-                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
+                <div
+                  class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer"
+                >
                   <span class="text-xl text-[#4f555e] dark:text-white">
                     <SvgIcon icon="ri:attachment-2" />
                   </span>
@@ -972,16 +1010,25 @@ onUnmounted(() => {
                 <SvgIcon icon="ri:delete-bin-line" />
               </span>
             </HoverButton>
-            <HoverButton v-if="!isMobile" @click="handleExport">
+
+            <HoverButton
+              v-if="!isMobile"
+              @click="handleExport"
+            >
               <span class="text-xl text-[#4f555e] dark:text-white">
                 <SvgIcon icon="ri:download-2-line" />
               </span>
             </HoverButton>
-            <HoverButton v-if="!isMobile" @click="showPrompt = true">
+
+            <HoverButton
+              v-if="!isMobile"
+              @click="showPrompt = true"
+            >
               <span class="text-xl text-[#4f555e] dark:text-white">
                 <IconPrompt class="w-[20px] m-auto" />
               </span>
             </HoverButton>
+
             <HoverButton
               v-if="!isMobile"
               :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')"
@@ -992,6 +1039,7 @@ onUnmounted(() => {
                 <SvgIcon icon="ri:chat-history-line" />
               </span>
             </HoverButton>
+
             <NSelect
               style="width: 250px"
               :value="currentChatModel"
@@ -999,6 +1047,7 @@ onUnmounted(() => {
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
               @update-value="(val) => handleSyncChatModel(val)"
             />
+
             <NSlider
               v-model:value="userStore.userInfo.advanced.maxContextCount"
               :max="100"
@@ -1009,8 +1058,13 @@ onUnmounted(() => {
               @update:value="() => { userStore.updateSetting(false) }"
             />
           </div>
+
           <div class="flex items-center justify-between space-x-2">
-            <NAutoComplete v-model:value="prompt" :options="searchOptions" :render-label="renderOption">
+            <NAutoComplete
+              v-model:value="prompt"
+              :options="searchOptions"
+              :render-label="renderOption"
+            >
               <template #default="{ handleInput, handleBlur, handleFocus }">
                 <NInput
                   ref="inputRef"
@@ -1026,7 +1080,12 @@ onUnmounted(() => {
                 />
               </template>
             </NAutoComplete>
-            <NButton type="primary" :disabled="buttonDisabled" @click="handleSubmit">
+
+            <NButton
+              type="primary"
+              :disabled="buttonDisabled"
+              @click="handleSubmit"
+            >
               <template #icon>
                 <span class="dark:text-black">
                   <SvgIcon icon="ri:send-plane-fill" />
@@ -1037,6 +1096,11 @@ onUnmounted(() => {
         </NSpace>
       </div>
     </footer>
-    <Prompt v-if="showPrompt" v-model:roomId="uuid" v-model:visible="showPrompt" />
+
+    <Prompt
+      v-if="showPrompt"
+      v-model:roomId="uuid"
+      v-model:visible="showPrompt"
+    />
   </div>
 </template>
