@@ -41,12 +41,10 @@ const { isMobile } = useBasicLayout()
 const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
-// 从路由获取 UUID
 const { uuid } = route.params as { uuid: string }
 
 const currentChatHistory = computed(() => chatStore.getChatHistoryByCurrentActive)
 const usingContext = computed(() => currentChatHistory?.value?.usingContext ?? true)
-// 优先使用 store active，兜底使用路由 uuid
 const dataSources = computed(() => {
   const id = chatStore.active ?? Number(uuid)
   return chatStore.getChatByUuid(id)
@@ -81,25 +79,19 @@ const textUploadFileKeysRef = ref<string[]>([])
 
 let pollInterval: NodeJS.Timeout | null = null
 
-// ================== 核心修复逻辑 ==================
-
-// 获取当前准确的 RoomId
+// Helper: 获取当前房间ID
 function getCurrentRoomId(): number {
-  // 优先取 store 里的活跃 ID，如果没有（比如刚刷新未 hydrates），取路由上的 uuid 转数字
   return chatStore.active ? chatStore.active : Number(uuid)
 }
 
-// 1. 状态检查 (Debug 版)
+// ================== 核心修复逻辑 ==================
+
+// 1. 状态检查
 async function checkProcessStatus() {
   try {
-    stopPolling() 
+    stopPolling()
     const roomId = getCurrentRoomId()
-    if (!roomId) {
-      console.error('[Debug] CheckStatus: No RoomId found', roomId)
-      return
-    }
-
-    console.log('[Debug] Checking status for Room:', roomId)
+    if (!roomId) return
 
     const { data } = await fetchChatProcessStatus<{
       isProcessing: boolean
@@ -107,13 +99,13 @@ async function checkProcessStatus() {
       messageId: string | null
     }>()
 
-    console.log('[Debug] Backend Status:', data)
+    // [日志] 状态检查结果
+    // console.log('[Debug] Status Check:', data)
 
-    // 强转 string/number 对比，防止类型错误
     if (data.isProcessing && Number(data.roomId) === roomId) {
-      console.log('[Debug] Resume loading state')
       loading.value = true
       
+      // 恢复 lastChatInfo 供 Stop 使用
       lastChatInfo = {
         id: data.messageId,
         conversationId: null,
@@ -123,10 +115,8 @@ async function checkProcessStatus() {
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 如果最后一条是用户发的消息，或者列表为空，说明回复还没存入数据库
-      // 我们补一个假的“...”
+      // 如果当前没有任何回复气泡，或者最后是用户消息 -> 补一个 loading 气泡
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
-        console.log('[Debug] Appending fake loading bubble')
         addChat(
           roomId,
           {
@@ -142,68 +132,92 @@ async function checkProcessStatus() {
         )
         scrollToBottom()
       } else if (lastItem) {
-        // 已经有回复了，强制转圈
-        console.log('[Debug] Updating existing bubble loading=true')
+        // 如果已有气泡，强制恢复转圈状态
         updateChatSome(roomId, lastIndex, { loading: true })
       }
 
       startPolling()
-    } else {
-      console.log('[Debug] No active process for this room')
     }
   } catch (error) {
-    console.error('[Debug] Check process status failed:', error)
+    console.error('Check process status failed:', error)
   }
 }
 
-// 2. 轮询逻辑 (Debug 版)
+// 2. 轮询逻辑
 function startPolling() {
-  stopPolling() // 防抖
-  console.log('[Debug] Start Polling...')
+  stopPolling() // 确保只有一个定时器
   
+  // console.log('[Debug] Poll started.')
+
   pollInterval = setInterval(async () => {
     try {
       const roomId = getCurrentRoomId()
-      if (!roomId) return
+      // 如果房间ID没了，停止轮询
+      if (!roomId) {
+        stopPolling()
+        return
+      }
 
+      // [重要] 加时间戳防止缓存
       const { data } = await fetchChatProcessStatus<{
         isProcessing: boolean
         roomId: number | null
         messageId: string | null
       }>()
 
-      // 切房间了，停
-      if (Number(data.roomId) !== roomId) {
-        // console.log('[Debug] Room changed, stop polling current.')
-        // 此处不一定要 stop，因为可能后端还在生成上一个房间的，但前端无需展示
-        // 只有当 data.roomId === null 或任务结束时才真正停
-        if (!data.isProcessing) stopPolling()
+      // console.log('[Debug] Poll result:', data)
+
+      // 1. 如果已经切换房间，忽略旧结果
+      if (Number(data.roomId) !== roomId && data.isProcessing) {
+        // 后端在生成别的房间的任务，前端当前房间不展示 loading
+        // 但不要 stopPolling，因为用户可能切回去
         return
       }
 
+      // 2. 仍在生成中
       if (data.isProcessing) {
         loading.value = true
-        // 维持 loading 状态
+        // 持续强制设置 loading，防止被 syncChat 覆盖
         const lastIndex = dataSources.value.length - 1
-        if (lastIndex > -1 && !dataSources.value[lastIndex].inversion && !dataSources.value[lastIndex].loading) {
-          updateChatSome(roomId, lastIndex, { loading: true })
+        if (lastIndex > -1 && !dataSources.value[lastIndex].inversion) {
+           // 只有当 loading 不为 true 时才更新，减少渲染开销
+           if (!dataSources.value[lastIndex].loading) {
+             updateChatSome(roomId, lastIndex, { loading: true })
+           }
         }
-      } else {
-        console.log('[Debug] Task finished, reloading history.')
-        stopPolling()
-        loading.value = false
+      } 
+      // 3. 任务结束
+      else {
+        console.log('[Debug] Task finished (isProcessing=false). Stopping poll & reload.')
+        
+        // 只有当 loading 确实是 true 的时候才执行结束逻辑，防止重复刷新
+        if (loading.value) {
+          loading.value = false
+          stopPolling()
 
-        // 延迟重拉
-        setTimeout(async () => {
-          const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
-          if (chatIndex > -1) chatStore.chat[chatIndex].data = [] 
+          // 延迟刷新，确保数据库落盘
+          setTimeout(async () => {
+            console.log('[Debug] Reloading chat history...')
+            
+            // ★★★ 强制清空本地数据，逼迫 UI 重绘 ★★★
+            const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
+            if (chatIndex > -1) {
+               chatStore.chat[chatIndex].data = [] 
+            }
 
-          await chatStore.syncChat(
-            { uuid: roomId } as Chat.History,
-            undefined,
-            () => { scrollToBottom() }
-          )
-        }, 1000)
+            await chatStore.syncChat(
+              { uuid: roomId } as Chat.History,
+              undefined,
+              () => { 
+                console.log('[Debug] History reloaded.');
+                scrollToBottom() 
+              }
+            )
+          }, 2000) // 延时 2 秒比较稳妥
+        } else {
+          // 如果 loading 本来就是 false，说明已经处理过了，直接停轮询
+          stopPolling()
+        }
       }
     } catch (error) {
       console.error('Poll error', error)
@@ -224,9 +238,9 @@ const handleLoadingChain = async () => {
   const roomId = getCurrentRoomId()
   if (!roomId) return
 
+  // 在拉历史之前，先停掉旧轮询
   stopPolling()
 
-  console.log('[Debug] Syncing chat history for:', roomId)
   await chatStore.syncChat(
     { uuid: roomId } as Chat.History,
     undefined,
@@ -240,7 +254,7 @@ const handleLoadingChain = async () => {
       if (inputRef.value && !isMobile.value)
         (inputRef.value as any)?.focus()
 
-      // [重要] 历史拉完后，去检查是否还在生成
+      // 这里的关键：拉完历史后，再去查状态
       checkProcessStatus()
     }
   )
@@ -299,14 +313,14 @@ async function onConversation() {
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // AI 占位消息
+  // AI 占位
   addChat(
     roomId,
     {
       uuid: chatUuid,
       dateTime: new Date().toLocaleString(),
       text: '',
-      loading: true, // 初始 loading
+      loading: true,
       inversion: false,
       error: false,
       conversationOptions: null,
@@ -334,14 +348,7 @@ async function onConversation() {
           try {
             const data = JSON.parse(chunk)
             lastChatInfo = data
-            const usage = (data.detail && data.detail.usage)
-              ? {
-                  completion_tokens: data.detail.usage.completion_tokens || null,
-                  prompt_tokens: data.detail.usage.prompt_tokens || null,
-                  total_tokens: data.detail.usage.total_tokens || null,
-                  estimated: data.detail.usage.estimated || null,
-                }
-              : undefined
+            const usage = (data.detail && data.detail.usage) ? data.detail.usage : undefined
             updateChat(
               roomId,
               dataSources.value.length - 1,
@@ -375,7 +382,6 @@ async function onConversation() {
   }
   catch (error: any) {
     if (error.message === 'canceled') {
-      // 主动取消（Stop），前端停 loading，后端通过 /chat-abort 停
       updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
       scrollToBottomIfAtBottom()
       return
@@ -428,7 +434,6 @@ async function handleStop() {
     loading.value = false
     stopPolling()
     
-    // 防御性校验
     if (lastChatInfo.id) {
       await fetchChatStopResponding(
         lastChatInfo.text || 'Stopped',
@@ -441,7 +446,7 @@ async function handleStop() {
 
 async function onRegenerate(index: number) {
   if (loading.value) return
-  const roomId = getCurrentRoomId() // Use dynamic getter
+  const roomId = getCurrentRoomId()
   if (!roomId) return
 
   controller = new AbortController()
@@ -469,7 +474,7 @@ async function onRegenerate(index: number) {
     index,
     {
       dateTime: new Date().toLocaleString(),
-      text: '', // Clear text for redraw
+      text: '',
       inversion: false,
       responseCount,
       error: false,
@@ -781,10 +786,9 @@ const uploadHeaders = computed(() => {
   return { Authorization: `Bearer ${token}` }
 })
 
-// 生命周期：页面加载
 onMounted(async () => {
   firstLoading.value = true  
-  debouncedLoad() // 这里会先同步历史，然后调 checkProcessStatus
+  debouncedLoad()
 
   if (authStore.token) {
     const chatModels = authStore.session?.chatModels
@@ -793,7 +797,6 @@ onMounted(async () => {
   }
 })
 
-// 监听房间切换
 watch(
   () => chatStore.active,
   () => {
