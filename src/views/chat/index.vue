@@ -17,7 +17,7 @@ import {
   fetchChatAPIProcess,
   fetchChatResponseoHistory,
   fetchChatStopResponding,
-  fetchChatProcessStatus, // [新增]
+  fetchChatProcessStatus,
 } from '@/api'
 import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
@@ -64,13 +64,10 @@ let loadingms: MessageReactive
 let allmsg: MessageReactive
 let prevScrollTop: number
 
-// 添加PromptStore
 const promptStore = usePromptStore()
-
-// 使用storeToRefs，保证store修改后，联想部分能够重新渲染
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-// 未知原因刷新页面，loading 状态不会重置，手动重置
+// 修复：切换房间或者刷新时，手动重置 loading 状态，防止卡死
 dataSources.value.forEach((item, index) => {
   if (item.loading)
     updateChatSome(+uuid, index, { loading: false })
@@ -80,26 +77,53 @@ function handleSubmit() {
   onConversation()
 }
 
-// 拆分为图片和文本两个列表
 const imageUploadFileKeysRef = ref<string[]>([])
 const textUploadFileKeysRef = ref<string[]>([])
 
-// [新增] 轮询变量
+// 轮询定时器
 let pollInterval: NodeJS.Timeout | null = null
 
-// [新增] 检查后台任务状态
+// [核心修改 1] 检查状态并恢复 UI
 async function checkProcessStatus() {
   try {
     const { data } = await fetchChatProcessStatus()
-    // 如果正在生成，且 roomId 匹配当前打开的窗口
+    // 如果正在生成，且任务属于当前房间
     if (data.isProcessing && data.roomId === +uuid) {
       loading.value = true
-      // 恢复 lastChatInfo 的关键信息，以便 handleStop 能工作
+      
+      // 恢复 lastChatInfo 关键信息用于中断
       lastChatInfo = {
         id: data.messageId,
         conversationId: null, 
         text: '...',
       }
+
+      // --- 修复切换房间不显示 Loading 气泡的问题 ---
+      // 检查当前列表最后一条消息
+      const lastItem = dataSources.value[dataSources.value.length - 1]
+      
+      // 如果最后一条是用户的提问（inversion=true），说明还没有 AI 回复的气泡
+      if (!lastItem || lastItem.inversion) {
+         addChat(
+          +uuid,
+          {
+            uuid: Date.now(), // 临时占位 ID
+            dateTime: new Date().toLocaleString(),
+            text: '...', // 显示等待字符
+            loading: true, // 关键：显示光标转圈
+            inversion: false,
+            error: false,
+            conversationOptions: null,
+            requestOptions: { prompt: '...', options: null },
+          },
+        )
+        scrollToBottom()
+      } else {
+        // 如果已经有 AI 气泡（可能是上次保存的半截），强制设为 loading
+        updateChatSome(+uuid, dataSources.value.length - 1, { loading: true })
+      }
+      // ----------------------------------------
+
       startPolling()
     }
   } catch (error) {
@@ -107,26 +131,35 @@ async function checkProcessStatus() {
   }
 }
 
-// [新增] 开始轮询
+// [核心修改 2] 轮询逻辑优化
 function startPolling() {
-  stopPolling()
+  stopPolling() // 先清理旧的
   pollInterval = setInterval(async () => {
     try {
       const { data } = await fetchChatProcessStatus()
-      // 如果任务结束了 (isProcessing 变为 false) 或者 切换了房间
+      
+      // 任务结束（后端队列里没了）或者切到了别的房间
       if (!data.isProcessing || data.roomId !== +uuid) {
         stopPolling()
         loading.value = false
-        // 重新拉取最新消息，把后台生成好的内容显示出来
-        await handleSyncChat() 
+        
+        // --- 修复空回复问题 ---
+        // 后端是先移除队列(isProcessing=false)，再写入数据库(UpdateChat)
+        // 这里必须延迟 1-2秒再拉取，等待数据库写入完成，否则会拉取到空文本
+        setTimeout(async () => {
+           // 强制刷新当前列表
+           await chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
+              scrollToBottom()
+           })
+        }, 1500) 
+        // ---------------------
       }
     } catch (e) {
       stopPolling()
     }
-  }, 2000)
+  }, 2000) // 每2秒检查一次
 }
 
-// [新增] 停止轮询
 function stopPolling() {
   if (pollInterval) {
     clearInterval(pollInterval)
@@ -574,7 +607,6 @@ function handleEnter(event: KeyboardEvent) {
   }
 }
 
-// [修改] handleStop 增加停止轮询逻辑
 async function handleStop() {
   if (loading.value) {
     controller.abort()
@@ -730,7 +762,6 @@ const uploadHeaders = computed(() => {
   }
 })
 
-// [修改] onMounted 增加状态检查
 onMounted(() => {
   firstLoading.value = true
   handleSyncChat()
@@ -743,14 +774,12 @@ onMounted(() => {
   }
 })
 
-// [修改] watch 切换房间时增加状态检查
 watch(() => chatStore.active, () => {
   handleSyncChat()
   stopPolling()
   checkProcessStatus()
 })
 
-// [修改] onUnmounted 增加停止轮询
 onUnmounted(() => {
   if (loading.value)
     controller.abort()
