@@ -63,6 +63,13 @@ export function fetchChatStopResponding<T = any>(text: string, messageId: string
   })
 }
 
+// [新增]
+export function fetchChatProcessStatus<T = any>() {
+  return post<T>({
+    url: '/chat-process-status',
+  })
+}
+
 export function fetchChatResponseoHistory<T = any>(roomId: number, uuid: number, index: number) {
   return get<T>({
     url: '/chat-response-history',
