@@ -5,7 +5,6 @@ import Router from 'express'
 import type OpenAI from 'openai'
 import type { ChatMessage, ChatResponse } from 'src/chatgpt/types'
 import { limiter } from '../middleware/limiter'
-// [修改] 引入 getChatProcessState
 import { abortChatProcess, chatReplyProcess, containsSensitiveWords, getChatProcessState } from '../chatgpt'
 import { auth } from '../middleware/auth'
 import { getCacheConfig } from '../storage/config'
@@ -243,12 +242,10 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   let message: ChatInfo
   let user = await getUserById(userId)
   try {
-    // If use the fixed fakeuserid(some probability of duplicated with real ones), redefine user which is send to chatReplyProcess
     if (userId === '6406d8c50aedd633885fa16f') {
       user = { _id: userId, roles: [UserRole.User], useAmount: 999, advanced: { maxContextCount: 999 }, limit_switch: false } as UserInfo
     }
     else {
-      // If global usage count limit is enabled, check can use amount before process chat.
       if (config.siteConfig?.usageCountLimit) {
         const useAmount = user ? (user.useAmount ?? 0) : 0
         if (useAmount <= 0 && user.limit_switch) {
@@ -287,11 +284,13 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
         if (chat.detail && chat.detail.choices.length > 0)
           chuck.detail.choices[0].finish_reason = chat.detail.choices[0].finish_reason
 
-        // [核心修复] 包裹 res.write，忽略断连错误，防止中断 chatReplyProcess
+        // ★★★ 核心修改 ★★★
         try {
           res.write(firstChunk ? JSON.stringify(chuck) : `\n${JSON.stringify(chuck)}`)
         } catch (err) {
-          // 客户端断开了，这里不做任何处理，让后端逻辑继续跑完
+          // ★★★ 添加 Log ★★★
+          // 如果你刷新页面，这里应该疯狂输出，但不会导致进程挂掉
+          console.log('[DEBUG] 前端断开了，但我还在继续生成...') 
         }
         firstChunk = false
       },
@@ -304,38 +303,30 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       room,
     })
     
-    // return the whole response including usage
     if (!result.data.detail?.usage) {
       if (!result.data.detail)
         result.data.detail = {}
       result.data.detail.usage = new UsageResponse()
-      // if no usage data, calculate using Tiktoken library
       result.data.detail.usage.prompt_tokens = textTokens(prompt, 'gpt-3.5-turbo' as TiktokenModel)
       result.data.detail.usage.completion_tokens = textTokens(result.data.text, 'gpt-3.5-turbo' as TiktokenModel)
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
     
-    // [修改] 包裹 res.write，防止最后一次写入崩溃
     try {
       res.write(`\n${JSON.stringify(result.data)}`)
-    } catch (err) {
-      // 忽略
-    }
+    } catch (err) {}
   }
   catch (error) {
-    // [修改] 包裹 res.write
     try {
       res.write(JSON.stringify({ message: error?.message }))
     } catch (err) {}
   }
   finally {
-    // [修改] 包裹 res.end
     try {
       res.end()
     } catch (err) {}
 
-    // 这里继续执行数据库更新逻辑，不受前端断连影响
     try {
       if (result == null || result === undefined || result.status !== 'Success') {
         if (result && result.status !== 'Success')
@@ -344,7 +335,6 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       }
 
       if (result.data === undefined)
-      // eslint-disable-next-line no-unsafe-finally
         return
 
       if (regenerate && message.options.messageId) {
@@ -375,8 +365,6 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
           model,
           result.data.detail?.usage as UsageResponse)
       }
-      // update personal useAmount moved here
-      // if not fakeuserid, and has valid user info and valid useAmount set by admin nut null and limit is enabled
       if (config.siteConfig?.usageCountLimit) {
         if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
           await updateAmountMinusOne(userId)
@@ -405,7 +393,6 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
   }
 })
 
-// [新增] 获取任务状态接口
 router.post('/chat-process-status', auth, async (req, res) => {
   try {
     const userId = req.headers.userId as string
