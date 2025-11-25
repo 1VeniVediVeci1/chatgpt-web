@@ -186,7 +186,7 @@ export async function initApi(key: KeyConfig, {
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
-// [修改] 增加 roomId 字段
+// [修改] 增加 roomId 字段，记录每个用户当前生成所在房间
 const processThreads: { userId: string; abort: AbortController; messageId: string; roomId: number }[] = []
 
 function getGeminiChatSession(
@@ -339,7 +339,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      // [修改] 加入 roomId
+      // [修改] 记录当前用户正在处理的线程（带 roomId）
       processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
       const result = await chatSession.sendMessage(inputParts)
@@ -417,7 +417,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       lastMessageId: lastContext.parentMessageId,
       isImageModel: isImage,
     })
-    // [修改] 加入 roomId
+    // [修改] 记录当前处理线程（带 roomId）
     processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
     let text = ''
@@ -503,7 +503,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     globalThis.console.error(error)
     
-    if (isGeminiImageModel) {
+    const isImageModel = isGeminiImageModel
+    if (isImageModel) {
         const sessionKey = `${userId}:${options.room.roomId}:${model}`
         geminiChats.delete(sessionKey)
     }
@@ -662,7 +663,7 @@ function getAccountId(accessToken: string): string {
   }
 }
 
-// [新增] 获取用户生成状态
+// [新增] 获取用户生成状态，返回是否在处理 + roomId + messageId
 export function getChatProcessState(userId: string) {
   const thread = processThreads.find(d => d.userId === userId)
   if (thread) {
