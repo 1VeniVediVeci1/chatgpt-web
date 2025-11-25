@@ -83,34 +83,33 @@ const textUploadFileKeysRef = ref<string[]>([])
 // 轮询定时器
 let pollInterval: NodeJS.Timeout | null = null
 
-// [核心修改 1] 检查状态并恢复 UI
+// ====== 状态检查：页面加载/房间切换时调用 ======
 async function checkProcessStatus() {
   try {
     const { data } = await fetchChatProcessStatus()
-    // 如果正在生成，且任务属于当前房间
+    // 如果正在生成，并且任务属于当前房间
     if (data.isProcessing && data.roomId === +uuid) {
       loading.value = true
       
-      // 恢复 lastChatInfo 关键信息用于中断
+      // 恢复 lastChatInfo 关键字段，便于中断用
       lastChatInfo = {
         id: data.messageId,
-        conversationId: null, 
+        conversationId: null,
         text: '...',
       }
 
-      // --- 修复切换房间不显示 Loading 气泡的问题 ---
-      // 检查当前列表最后一条消息
+      // 检查当前房间最后一条消息
       const lastItem = dataSources.value[dataSources.value.length - 1]
       
-      // 如果最后一条是用户的提问（inversion=true），说明还没有 AI 回复的气泡
+      // 如果最后一条是用户提问（inversion=true），说明还没有 AI 回复气泡 -> 插入占位回复
       if (!lastItem || lastItem.inversion) {
-         addChat(
+        addChat(
           +uuid,
           {
-            uuid: Date.now(), // 临时占位 ID
+            uuid: Date.now(),
             dateTime: new Date().toLocaleString(),
-            text: '...', // 显示等待字符
-            loading: true, // 关键：显示光标转圈
+            text: '...',
+            loading: true,
             inversion: false,
             error: false,
             conversationOptions: null,
@@ -118,46 +117,54 @@ async function checkProcessStatus() {
           },
         )
         scrollToBottom()
-      } else {
-        // 如果已经有 AI 气泡（可能是上次保存的半截），强制设为 loading
+      }
+      else {
+        // 已经有一条 AI 消息了，强制设为 loading
         updateChatSome(+uuid, dataSources.value.length - 1, { loading: true })
       }
-      // ----------------------------------------
 
       startPolling()
     }
-  } catch (error) {
-    console.error('Check status failed', error)
+  }
+  catch (error) {
+    console.error('checkProcessStatus error:', error)
   }
 }
 
-// [核心修改 2] 轮询逻辑优化
+// ====== 轮询后端任务状态 ======
 function startPolling() {
-  stopPolling() // 先清理旧的
+  stopPolling()
   pollInterval = setInterval(async () => {
     try {
       const { data } = await fetchChatProcessStatus()
       
-      // 任务结束（后端队列里没了）或者切到了别的房间
+      // 任务结束 或 已经切到别的房间
       if (!data.isProcessing || data.roomId !== +uuid) {
         stopPolling()
         loading.value = false
-        
-        // --- 修复空回复问题 ---
-        // 后端是先移除队列(isProcessing=false)，再写入数据库(UpdateChat)
-        // 这里必须延迟 1-2秒再拉取，等待数据库写入完成，否则会拉取到空文本
+
+        // 后端先从队列移除，再写 DB，这里延迟一点再拉
         setTimeout(async () => {
-           // 强制刷新当前列表
-           await chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
+          // 关键：清空当前房间本地缓存，强制 syncChat 去请求后端
+          const chatIndex = chatStore.chat.findIndex(d => d.uuid === Number(uuid))
+          if (chatIndex > -1)
+            chatStore.chat[chatIndex].data = []
+
+          await chatStore.syncChat(
+            { uuid: Number(uuid) } as Chat.History,
+            undefined,
+            () => {
               scrollToBottom()
-           })
-        }, 1500) 
-        // ---------------------
+            },
+          )
+        }, 1500)
       }
-    } catch (e) {
+    }
+    catch (e) {
+      console.error('poll status error:', e)
       stopPolling()
     }
-  }, 2000) // 每2秒检查一次
+  }, 2000)
 }
 
 function stopPolling() {
@@ -167,6 +174,7 @@ function stopPolling() {
   }
 }
 
+// ================== 提问 / 重新回答 逻辑 ==================
 async function onConversation() {
   let message = prompt.value
 
@@ -182,8 +190,8 @@ async function onConversation() {
   const uploadFileKeys = isVisionModel.value 
     ? [
         ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
-        ...textUploadFileKeysRef.value.map(k => `txt:${k}`)
-      ] 
+        ...textUploadFileKeysRef.value.map(k => `txt:${k}`),
+      ]
     : []
   
   imageUploadFileKeysRef.value = []
@@ -315,9 +323,9 @@ async function onConversation() {
         +uuid,
         dataSources.value.length - 1,
         {
-            text: `${currentChat.text}\n[${errorMessage}]`,
-            error: false,
-            loading: false,
+          text: `${currentChat.text}\n[${errorMessage}]`,
+          error: false,
+          loading: false,
         },
       )
       return
@@ -327,9 +335,9 @@ async function onConversation() {
         +uuid,
         dataSources.value.length - 1,
         {
-            text: `${currentChat.text}`,
-            error: false,
-            loading: false,
+          text: `${currentChat.text}`,
+          error: false,
+          loading: false,
         },
       )
       return
@@ -375,9 +383,8 @@ async function onRegenerate(index: number) {
   let uploadFileKeys: string[] = []
   if (index > 0) {
     const previousMessage = dataSources.value[index - 1]
-    if (previousMessage && previousMessage.inversion && previousMessage.images && previousMessage.images.length > 0) {
+    if (previousMessage && previousMessage.inversion && previousMessage.images && previousMessage.images.length > 0)
       uploadFileKeys = previousMessage.images
-    }
   }
 
   loading.value = true
@@ -405,7 +412,7 @@ async function onRegenerate(index: number) {
         uuid: chatUuid || Date.now(),
         regenerate: true,
         prompt: message,
-        uploadFileKeys, 
+        uploadFileKeys,
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
@@ -511,6 +518,7 @@ async function onResponseHistory(index: number, historyIndex: number) {
   )
 }
 
+// ================= 导出 / 删除 / 清空 =================
 function handleExport() {
   if (loading.value)
     return
@@ -616,6 +624,7 @@ async function handleStop() {
   }
 }
 
+// ================ 上滚加载更多历史 ================
 async function loadMoreMessage(event: any) {
   const chatIndex = chatStore.chat.findIndex(d => d.uuid === +uuid)
   if (chatIndex <= -1 || chatStore.chat[chatIndex].data.length <= 0)
@@ -646,9 +655,9 @@ const handleSyncChat
   = debounce(() => {
     chatStore.syncChat({ uuid: Number(uuid) } as Chat.History, undefined, () => {
       firstLoading.value = false
-      const scrollRef = document.querySelector('#scrollRef')
-      if (scrollRef)
-        nextTick(() => scrollRef.scrollTop = scrollRef.scrollHeight)
+      const scrollRefDom = document.querySelector('#scrollRef')
+      if (scrollRefDom)
+        nextTick(() => scrollRefDom.scrollTop = scrollRefDom.scrollHeight)
       if (inputRef.value && !isMobile.value)
         inputRef.value?.focus()
     })
@@ -661,6 +670,7 @@ async function handleScroll(event: any) {
   prevScrollTop = scrollTop
 }
 
+// ================ 上下文开关 ================
 async function handleToggleUsingContext() {
   if (!currentChatHistory.value)
     return
@@ -673,6 +683,7 @@ async function handleToggleUsingContext() {
     ms.warning(t('chat.turnOffContext'))
 }
 
+// ================ Prompt 模板 & 文本提示 ================
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
     return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
@@ -721,6 +732,7 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
+// ================ 附件上传 ================
 function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
@@ -762,6 +774,7 @@ const uploadHeaders = computed(() => {
   }
 })
 
+// ================ 生命周期 ================
 onMounted(() => {
   firstLoading.value = true
   handleSyncChat()
@@ -847,7 +860,6 @@ onUnmounted(() => {
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          
           <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div 
               v-for="(key, index) in imageUploadFileKeysRef" 
@@ -877,7 +889,6 @@ onUnmounted(() => {
           </div>
     
           <div class="flex items-center space-x-2">
-            
             <div>
               <NUpload
                 action="/api/upload-image" 
@@ -889,9 +900,9 @@ onUnmounted(() => {
                 @before-upload="handleBeforeUpload"
               >
                 <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                   <span class="text-xl text-[#4f555e] dark:text-white">
-                      <SvgIcon icon="ri:image-add-line" />
-                   </span>
+                  <span class="text-xl text-[#4f555e] dark:text-white">
+                    <SvgIcon icon="ri:image-add-line" />
+                  </span>
                 </div>
               </NUpload>
             </div>
@@ -907,9 +918,9 @@ onUnmounted(() => {
                 @before-upload="handleBeforeUpload"
               >
                 <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                   <span class="text-xl text-[#4f555e] dark:text-white">
-                      <SvgIcon icon="ri:attachment-2" />
-                   </span>
+                  <span class="text-xl text-[#4f555e] dark:text-white">
+                    <SvgIcon icon="ri:attachment-2" />
+                  </span>
                 </div>
               </NUpload>
             </div>
@@ -929,7 +940,12 @@ onUnmounted(() => {
                 <IconPrompt class="w-[20px] m-auto" />
               </span>
             </HoverButton>
-            <HoverButton v-if="!isMobile" :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')" :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }" @click="handleToggleUsingContext">
+            <HoverButton
+              v-if="!isMobile"
+              :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')"
+              :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }"
+              @click="handleToggleUsingContext"
+            >
               <span class="text-xl">
                 <SvgIcon icon="ri:chat-history-line" />
               </span>
@@ -941,7 +957,15 @@ onUnmounted(() => {
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
               @update-value="(val) => handleSyncChatModel(val)"
             />
-            <NSlider v-model:value="userStore.userInfo.advanced.maxContextCount" :max="100" :min="0" :step="1" style="width: 88px" :format-tooltip="formatTooltip" @update:value="() => { userStore.updateSetting(false) }" />
+            <NSlider
+              v-model:value="userStore.userInfo.advanced.maxContextCount"
+              :max="100"
+              :min="0"
+              :step="1"
+              style="width: 88px"
+              :format-tooltip="formatTooltip"
+              @update:value="() => { userStore.updateSetting(false) }"
+            />
           </div>
           <div class="flex items-center justify-between space-x-2">
             <NAutoComplete v-model:value="prompt" :options="searchOptions" :render-label="renderOption">
