@@ -15,9 +15,9 @@ import { useBasicLayout } from '@/hooks/useBasicLayout'
 import { useAuthStore, useChatStore, usePromptStore, useUserStore } from '@/store'
 import {
   fetchChatAPIProcess,
+  fetchChatProcessStatus,
   fetchChatResponseoHistory,
   fetchChatStopResponding,
-  fetchChatProcessStatus,
 } from '@/api'
 import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
@@ -39,7 +39,7 @@ const chatStore = useChatStore()
 
 const { isMobile } = useBasicLayout()
 const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
-const { scrollRef, scrollToBottom, scrollToBottomIfAtBottom, scrollTo } = useScroll()
+const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
 const { uuid } = route.params as { uuid: string }
 
@@ -50,7 +50,7 @@ const conversationList = computed(() => dataSources.value.filter(item => (!item.
 
 const prompt = ref<string>('')
 const firstLoading = ref<boolean>(false)
-const loading = ref<boolean>(false)
+const loading = ref<boolean>(false) // 控制 Stop 按钮显示
 const inputRef = ref<Ref | null>(null)
 const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
@@ -59,7 +59,7 @@ const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatH
 const currentNavIndexRef = ref<number>(-1)
 
 const isVisionModel = ref(true)
-  
+
 let loadingms: MessageReactive
 let allmsg: MessageReactive
 let prevScrollTop: number
@@ -67,7 +67,7 @@ let prevScrollTop: number
 const promptStore = usePromptStore()
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-// 修复：切换房间或者刷新时，手动重置 loading 状态，防止卡死
+// 手动重置 loading 状态，防止卡死，但仅针对非当前生成任务
 dataSources.value.forEach((item, index) => {
   if (item.loading)
     updateChatSome(+uuid, index, { loading: false })
@@ -86,23 +86,28 @@ let pollInterval: NodeJS.Timeout | null = null
 // ====== 状态检查：页面加载/房间切换时调用 ======
 async function checkProcessStatus() {
   try {
+    // 每次检查前先停止旧轮询，防止叠加
+    stopPolling()
+    
     const { data } = await fetchChatProcessStatus()
-    // 如果正在生成，并且任务属于当前房间
+    
+    // 只有当后端正在生成的任务属于当前房间时，才恢复 loading 状态
     if (data.isProcessing && data.roomId === +uuid) {
       loading.value = true
       
-      // 恢复 lastChatInfo 关键字段，便于中断用
+      // 恢复 lastChatInfo，确保 Stop 按钮点击时能传参
       lastChatInfo = {
         id: data.messageId,
-        conversationId: null,
+        conversationId: null, // 恢复时 conversationId 可能未知，传 null 后端只更新文本
         text: '...',
       }
 
-      // 检查当前房间最后一条消息
-      const lastItem = dataSources.value[dataSources.value.length - 1]
+      // 检查 UI 上最后一条消息状态
+      const lastIndex = dataSources.value.length - 1
+      const lastItem = dataSources.value[lastIndex]
       
-      // 如果最后一条是用户提问（inversion=true），说明还没有 AI 回复气泡 -> 插入占位回复
-      if (!lastItem || lastItem.inversion) {
+      // 如果当前页面没消息，或者最后一条是用户的提问 -> 补一个 AI 的占位气泡
+      if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(
           +uuid,
           {
@@ -119,10 +124,11 @@ async function checkProcessStatus() {
         scrollToBottom()
       }
       else {
-        // 已经有一条 AI 消息了，强制设为 loading
-        updateChatSome(+uuid, dataSources.value.length - 1, { loading: true })
+        // 如果已经有 AI 的气泡（可能是之前的 LOADING 状态被上面的 forEach 重置了），重新设为 true
+        updateChatSome(+uuid, lastIndex, { loading: true })
       }
 
+      // 开始轮询直到结束
       startPolling()
     }
   }
@@ -133,26 +139,34 @@ async function checkProcessStatus() {
 
 // ====== 轮询后端任务状态 ======
 function startPolling() {
-  stopPolling()
+  stopPolling() // 安全起见
   pollInterval = setInterval(async () => {
     try {
       const { data } = await fetchChatProcessStatus()
       
-      // 任务结束 或 已经切到别的房间
-      if (!data.isProcessing || data.roomId !== +uuid) {
+      // 1. 如果当前房间切走了 (data.roomId !== +uuid)，虽然任务可能还在跑，但当前页面不需要 loading
+      if (data.roomId !== +uuid) {
+        stopPolling()
+        loading.value = false
+        return
+      }
+
+      // 2. 如果任务结束了 (!data.isProcessing) 且就在当前房间
+      if (!data.isProcessing) {
         stopPolling()
         loading.value = false
 
-        // 后端先从队列移除，再写 DB，这里延迟一点再拉
+        // 延迟拉取，确保后端数据库写入完成
         setTimeout(async () => {
-          // 关键：清空当前房间本地缓存，强制 syncChat 去请求后端
+          // [关键] 清空当前房间的本地缓存，强制 syncChat 发起网络请求拉取最新完整回复
+          // 避免 syncChat 发现本地有数据直接 return，导致页面只显示空的占位符
           const chatIndex = chatStore.chat.findIndex(d => d.uuid === Number(uuid))
           if (chatIndex > -1)
             chatStore.chat[chatIndex].data = []
 
           await chatStore.syncChat(
             { uuid: Number(uuid) } as Chat.History,
-            undefined,
+            undefined, // lastId undefined 代表拉取最新一页
             () => {
               scrollToBottom()
             },
@@ -187,13 +201,13 @@ async function onConversation() {
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
-  const uploadFileKeys = isVisionModel.value 
+  const uploadFileKeys = isVisionModel.value
     ? [
         ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
         ...textUploadFileKeysRef.value.map(k => `txt:${k}`),
       ]
     : []
-  
+
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
@@ -258,6 +272,7 @@ async function onConversation() {
             chunk = responseText.substring(lastIndex)
           try {
             const data = JSON.parse(chunk)
+            // 实时保存对话信息，供 Stop 功能使用
             lastChatInfo = data
             const usage = (data.detail && data.detail.usage)
               ? {
@@ -518,7 +533,7 @@ async function onResponseHistory(index: number, historyIndex: number) {
   )
 }
 
-// ================= 导出 / 删除 / 清空 =================
+// ================= 导出 / 删除 / 清空 / Stop =================
 function handleExport() {
   if (loading.value)
     return
@@ -617,9 +632,11 @@ function handleEnter(event: KeyboardEvent) {
 
 async function handleStop() {
   if (loading.value) {
+    // 中断前端的可读流
     controller.abort()
     loading.value = false
     stopPolling()
+    // 调用后端接口，真正停止后台线程并保存当前内容
     await fetchChatStopResponding(lastChatInfo.text || 'Stopped', lastChatInfo.id, lastChatInfo.conversationId)
   }
 }
@@ -740,7 +757,7 @@ function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileIn
   }
   return true
 }
-  
+
 function handleFinishImage(options: { file: UploadFileInfo; event?: ProgressEvent }) {
   if (options.file.status === 'finished') {
     const response = (options.event?.target as XMLHttpRequest).response
@@ -774,10 +791,11 @@ const uploadHeaders = computed(() => {
   }
 })
 
-// ================ 生命周期 ================
+// ================ 生命周期 & 监听 ================
 onMounted(() => {
   firstLoading.value = true
   handleSyncChat()
+  // 进入房间时检查是否有正在进行的任务
   checkProcessStatus()
 
   if (authStore.token) {
@@ -789,13 +807,16 @@ onMounted(() => {
 
 watch(() => chatStore.active, () => {
   handleSyncChat()
+  // 切换房间时停止旧的轮询，并检查新房间的状态
   stopPolling()
   checkProcessStatus()
 })
 
 onUnmounted(() => {
-  if (loading.value)
-    controller.abort()
+  // 修改核心点：卸载组件（切房/刷新）时，不要 abort controller。
+  // 否则会导致前端主动发终止信号，后端收到后会杀死生成线程，导致切回来时任务已断。
+  /* if (loading.value) controller.abort() */
+  
   stopPolling()
 })
 </script>
@@ -861,8 +882,8 @@ onUnmounted(() => {
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
           <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div 
-              v-for="(key, index) in imageUploadFileKeysRef" 
+            <div
+              v-for="(key, index) in imageUploadFileKeysRef"
               :key="`img-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
@@ -875,8 +896,8 @@ onUnmounted(() => {
           </div>
 
           <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div 
-              v-for="(key, index) in textUploadFileKeysRef" 
+            <div
+              v-for="(key, index) in textUploadFileKeysRef"
               :key="`txt-${index}`"
               class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
             >
@@ -887,11 +908,11 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-    
+
           <div class="flex items-center space-x-2">
             <div>
               <NUpload
-                action="/api/upload-image" 
+                action="/api/upload-image"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -909,7 +930,7 @@ onUnmounted(() => {
 
             <div>
               <NUpload
-                action="/api/upload-image" 
+                action="/api/upload-image"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
