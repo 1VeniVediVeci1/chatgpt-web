@@ -5,7 +5,8 @@ import Router from 'express'
 import type OpenAI from 'openai'
 import type { ChatMessage, ChatResponse } from 'src/chatgpt/types'
 import { limiter } from '../middleware/limiter'
-import { abortChatProcess, chatReplyProcess, containsSensitiveWords } from '../chatgpt'
+// [修改] 引入 getChatProcessState
+import { abortChatProcess, chatReplyProcess, containsSensitiveWords, getChatProcessState } from '../chatgpt'
 import { auth } from '../middleware/auth'
 import { getCacheConfig } from '../storage/config'
 import type { ChatInfo, ChatOptions, UserInfo } from '../storage/model'
@@ -286,7 +287,12 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
         if (chat.detail && chat.detail.choices.length > 0)
           chuck.detail.choices[0].finish_reason = chat.detail.choices[0].finish_reason
 
-        res.write(firstChunk ? JSON.stringify(chuck) : `\n${JSON.stringify(chuck)}`)
+        // [修改] 包裹 res.write，忽略写入错误，保证后端继续执行
+        try {
+          res.write(firstChunk ? JSON.stringify(chuck) : `\n${JSON.stringify(chuck)}`)
+        } catch (err) {
+          // 忽略写入错误
+        }
         firstChunk = false
       },
       systemMessage,
@@ -308,13 +314,26 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
-    res.write(`\n${JSON.stringify(result.data)}`)
+    
+    // [修改] 包裹 res.write
+    try {
+      res.write(`\n${JSON.stringify(result.data)}`)
+    } catch (err) {
+      // 忽略
+    }
   }
   catch (error) {
-    res.write(JSON.stringify({ message: error?.message }))
+    // [修改] 包裹 res.write
+    try {
+      res.write(JSON.stringify({ message: error?.message }))
+    } catch (err) {}
   }
   finally {
-    res.end()
+    // [修改] 包裹 res.end
+    try {
+      res.end()
+    } catch (err) {}
+
     try {
       if (result == null || result === undefined || result.status !== 'Success') {
         if (result && result.status !== 'Success')
@@ -381,5 +400,17 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
   }
   catch (error) {
     res.send({ status: 'Fail', message: '重置邮件已发送 | Reset email has been sent', data: null })
+  }
+})
+
+// [新增] 获取任务状态接口
+router.post('/chat-process-status', auth, async (req, res) => {
+  try {
+    const userId = req.headers.userId as string
+    const status = getChatProcessState(userId)
+    res.send({ status: 'Success', message: '', data: status })
+  }
+  catch (error) {
+    res.send({ status: 'Fail', message: error.message, data: null })
   }
 })
