@@ -16,16 +16,14 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
-import * as fsData from 'fs' // 用于流式写入
+import * as fsData from 'fs' 
 
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
 }
 
-// 定义上传文件目录
 const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads')
 
-// [新增] 确保上传目录存在
 async function ensureUploadDir() {
   try {
     await fs.access(UPLOAD_DIR)
@@ -34,51 +32,40 @@ async function ensureUploadDir() {
   }
 }
 
-// [新增] 去除类型前缀 img:/txt:
 function stripTypePrefix(key: string): string {
   return key.replace(/^(img:|txt:)/, '')
 }
 
-// [修改] 判断是否为文本文件（优先看前缀）
 function isTextFile(filename: string): boolean {
   if (filename.startsWith('txt:')) return true
   if (filename.startsWith('img:')) return false
-
-  // 兼容旧数据：无前缀根据后缀判断
   const realName = stripTypePrefix(filename)
   const ext = path.extname(realName).toLowerCase()
   const textExtensions = ['.txt', '.md', '.json', '.csv', '.js', '.ts', '.py', '.java', '.html', '.css', '.xml', '.yml', '.yaml', '.log', '.ini', '.config']
   return textExtensions.includes(ext)
 }
 
-// [修改] 判断是否为图片文件（优先看前缀）
 function isImageFile(filename: string): boolean {
   if (filename.startsWith('img:')) return true
   if (filename.startsWith('txt:')) return false
-
-  // 兼容旧数据
   const realName = stripTypePrefix(filename)
   const ext = path.extname(realName).toLowerCase()
   const imageExtensions = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.bmp']
   return imageExtensions.includes(ext)
 }
 
-// [修改] 从本地文件读取并转为 Base64 (处理前缀)
 async function getFileBase64(filename: string): Promise<{ mime: string; data: string } | null> {
   try {
     const realFilename = stripTypePrefix(filename)
     const filePath = path.join(UPLOAD_DIR, realFilename)
-    
     await fs.access(filePath) 
     const buffer = await fs.readFile(filePath)
-    
     const ext = path.extname(realFilename).toLowerCase().replace('.', '')
     let mime = 'image/png'
     if (ext === 'jpg' || ext === 'jpeg') mime = 'image/jpeg'
     else if (ext === 'webp') mime = 'image/webp'
     else if (ext === 'gif') mime = 'image/gif'
     else if (ext === 'heic') mime = 'image/heic'
-    
     return { mime, data: buffer.toString('base64') }
   } catch (e) {
     console.error(`[File Read Error] ${filename}:`, e)
@@ -99,8 +86,6 @@ const ErrorCodeMessage: Record<string, string> = {
 
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
-
-// Gemini 会话内存缓存
 const geminiChats = new Map<string, ChatSession>()
 
 export async function initApi(key: KeyConfig, {
@@ -135,11 +120,9 @@ export async function initApi(key: KeyConfig, {
 
   const messages: OpenAI.ChatCompletionMessageParam[] = []
   for (let i = 0; i < maxContextCount; i++) {
-    if (!lastMessageId)
-      break
+    if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
-    if (!message)
-      break
+    if (!message) break
     
     let safeContent = message.text
     if (typeof safeContent === 'string') {
@@ -186,7 +169,6 @@ export async function initApi(key: KeyConfig, {
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
-// [修改] 增加 roomId 字段，记录每个用户当前生成所在房间
 const processThreads: { userId: string; abort: AbortController; messageId: string; roomId: number }[] = []
 
 function getGeminiChatSession(
@@ -244,14 +226,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const isGeminiImageModel = isImage && model.includes('gemini')
 
   if (uploadFileKeys && uploadFileKeys.length > 0) {
-    // 根据前缀区分类型
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
     const imageFiles = uploadFileKeys.filter(key => isImageFile(key))
 
     if (textFiles.length > 0) {
       for (const fileKey of textFiles) {
         try {
-          // [修改] 读取时去掉前缀
           const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
           await fs.access(filePath)
           const fileContent = await fs.readFile(filePath, 'utf-8')
@@ -267,18 +247,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
     if (imageFiles.length > 0) {
       content = [
-        {
-          type: 'text',
-          text: finalMessage,
-        },
+        { type: 'text', text: finalMessage },
       ]
       for (const uploadFileKey of imageFiles) {
         content.push({
           type: 'image_url',
-          image_url: {
-            // [修改] 读取图片时去掉前缀
-            url: await convertImageUrl(stripTypePrefix(uploadFileKey)),
-          },
+          image_url: { url: await convertImageUrl(stripTypePrefix(uploadFileKey)) },
         })
       }
     } else {
@@ -315,7 +289,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
             const urlStr = (part as any).image_url.url as string
-            
             if (urlStr.startsWith('data:')) {
                 const [header, base64Data] = urlStr.split(',')
                 if (header && base64Data) {
@@ -323,23 +296,17 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
                   const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
                   inputParts.push({ inlineData: { mimeType, data: base64Data } })
                 }
-            } 
-            // 本地文件 /uploads/xxx
-            else if (urlStr.includes('/uploads/')) {
+            } else if (urlStr.includes('/uploads/')) {
                 const filename = path.basename(urlStr)
-                // getFileBase64 内部已经调用了 stripTypePrefix
                 const fileData = await getFileBase64(filename)
                 if (fileData) {
-                    inputParts.push({ 
-                        inlineData: { mimeType: fileData.mime, data: fileData.data } 
-                    })
+                    inputParts.push({ inlineData: { mimeType: fileData.mime, data: fileData.data } })
                 }
             }
           }
         }
       }
 
-      // [修改] 记录当前用户正在处理的线程（带 roomId）
       processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
       const result = await chatSession.sendMessage(inputParts)
@@ -350,7 +317,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       for (const part of parts) {
         if (part.text) text += part.text
-
         if (part.inlineData?.data) {
           const mime = part.inlineData.mimeType || 'image/png'
           const base64 = part.inlineData.data as string
@@ -359,7 +325,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           const filePath = path.join(UPLOAD_DIR, filename)
           await fs.writeFile(filePath, buffer)
-          
           const prefix = text ? '\n\n' : ''
           text += `${prefix}![Generated Image](/uploads/${filename})`
         }
@@ -371,8 +336,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         ? {
             prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
             completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: response.usageMetadata.totalTokenCount ?? 0,
-            estimated: true,
+            total_tokens: response.usageMetadata.totalTokenCount ?? 0, estimated: true,
           }
         : undefined
 
@@ -389,17 +353,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         type: 'Success',
         data: {
           object: 'chat.completion',
-          choices: [{
-            message: { role: 'assistant', content: text },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
+          choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
           created: Date.now(),
           conversationId: lastContext.conversationId,
-          model,
-          text,
-          id: customMessageId,
+          model, text, id: customMessageId,
           detail: { usage: usageRes },
         },
       })
@@ -417,7 +374,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       lastMessageId: lastContext.parentMessageId,
       isImageModel: isImage,
     })
-    // [修改] 记录当前处理线程（带 roomId）
+    
     processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
 
     let text = ''
@@ -444,14 +401,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         role: choice.message.role || 'assistant',
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
-        detail: {
-            choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
-            created: response.created,
-            id: response.id,
-            model: response.model,
-            object: 'chat.completion',
-            usage: response.usage
-        } as any 
+        detail: { choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }], created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage } as any 
       })
 
     } else {
@@ -475,20 +425,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       type: 'Success',
       data: {
         object: 'chat.completion',
-        choices: [{
-          message: { role: 'assistant', content: text },
-          finish_reason: 'stop',
-          index: 0,
-          logprobs: null,
-          }],
+        choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
         created: Date.now(),
         conversationId: lastContext.conversationId,
-        model: modelRes,
-        text,
-        id: chatIdRes,
-        detail: {
-          usage: usageRes && { ...usageRes, estimated: false },
-        },
+        model: modelRes, text, id: chatIdRes,
+        detail: { usage: usageRes && { ...usageRes, estimated: false } },
       },
     })
   }
@@ -503,8 +444,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     globalThis.console.error(error)
     
-    const isImageModel = isGeminiImageModel
-    if (isImageModel) {
+    if (isGeminiImageModel) {
         const sessionKey = `${userId}:${options.room.roomId}:${model}`
         geminiChats.delete(sessionKey)
     }
@@ -514,6 +454,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
+    // ★★★ 添加 Log 方便排查 ★★★
+    console.log(`[DEBUG] 任务彻底结束，清理线程状态。UserId: ${userId}`)
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1)
       processThreads.splice(index, 1)
@@ -553,7 +495,6 @@ async function chatConfig() {
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
 
-// [修改] 历史消息恢复逻辑，也要去前缀
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -580,9 +521,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
               const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
               const fileContent = await fs.readFile(filePath, 'utf-8')
               fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            } catch (e) {
-               // 忽略丢失的历史文件
-            }
+            } catch (e) {}
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
@@ -663,7 +602,6 @@ function getAccountId(accessToken: string): string {
   }
 }
 
-// [新增] 获取用户生成状态，返回是否在处理 + roomId + messageId
 export function getChatProcessState(userId: string) {
   const thread = processThreads.find(d => d.userId === userId)
   if (thread) {
