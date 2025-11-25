@@ -204,14 +204,41 @@ function getGeminiChatSession(
 }
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
+  // 1. 基础参数初始化
+  const userId = options.user._id.toString()
+  const messageId = options.messageId
+  const roomId = options.room.roomId
+  const abort = new AbortController()
+  const customMessageId = generateMessageId()
+
+  // ★★★ 2. 核心修复：立即 Push 状态！在任何 await 之前！★★★
+  // 先检查是否已存在（防止重复推），再推入
+  const existingIdx = processThreads.findIndex(t => t.userId === userId)
+  if (existingIdx > -1) {
+    // 如果之前的任务还没清，这里可以策略性地清掉或者保留
+    // 稳妥起见，这里我们不在这删，而是直接 Push 新的，或者覆盖
+    // 但为了简单，直接 Push（数组允许多个，但查询函数只取第一个）
+    // 更好是先删再推，确保状态最新
+    processThreads.splice(existingIdx, 1) 
+  }
+  
+  console.log(`[DEBUG] Pushing thread for userId: ${userId}, roomId: ${roomId}`)
+  processThreads.push({ userId, abort, messageId, roomId })
+
+  // 3. 之后的流程即使慢一点，也不怕刷新查不到状态了
   await ensureUploadDir()
   const model = options.room.chatModel
+  
+  // 耗时操作：查数据库 Key
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
-  const userId = options.user._id.toString()
+  
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
-  const messageId = options.messageId
-  if (key == null || key === undefined)
+  if (key == null || key === undefined) {
+    // 如果这里报错返回，要记得清理刚刚推入的状态，不然会卡死
+    const idx = processThreads.findIndex(d => d.userId === userId)
+    if (idx > -1) processThreads.splice(idx, 1)
     throw new Error('没有对应的 apikeys 配置，请再试一次。')
+  }
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
@@ -260,15 +287,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
-  const abort = new AbortController()
-  const customMessageId = generateMessageId()
-
   try {
     // ====== ① Gemini 图片模型 ======
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
       const sessionKey = `${userId}:${options.room.roomId}:${model}`
       
+      // 耗时操作：连接 Gemini
       const chatSession = getGeminiChatSession(key.key, model, baseUrl, sessionKey, systemMessage)
 
       const inputParts: Part[] = []
@@ -289,6 +314,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
             const urlStr = (part as any).image_url.url as string
+            
             if (urlStr.startsWith('data:')) {
                 const [header, base64Data] = urlStr.split(',')
                 if (header && base64Data) {
@@ -296,7 +322,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
                   const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
                   inputParts.push({ inlineData: { mimeType, data: base64Data } })
                 }
-            } else if (urlStr.includes('/uploads/')) {
+            } 
+            // 本地文件 /uploads/xxx
+            else if (urlStr.includes('/uploads/')) {
                 const filename = path.basename(urlStr)
                 const fileData = await getFileBase64(filename)
                 if (fileData) {
@@ -307,7 +335,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
+      // 此时已在开头 push 过了，这里不需要再 push
 
       const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
@@ -317,6 +345,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       for (const part of parts) {
         if (part.text) text += part.text
+
         if (part.inlineData?.data) {
           const mime = part.inlineData.mimeType || 'image/png'
           const base64 = part.inlineData.data as string
@@ -325,6 +354,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           const filePath = path.join(UPLOAD_DIR, filename)
           await fs.writeFile(filePath, buffer)
+          
           const prefix = text ? '\n\n' : ''
           text += `${prefix}![Generated Image](/uploads/${filename})`
         }
@@ -336,7 +366,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         ? {
             prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
             completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: response.usageMetadata.totalTokenCount ?? 0, estimated: true,
+            total_tokens: response.usageMetadata.totalTokenCount ?? 0,
+            estimated: true,
           }
         : undefined
 
@@ -353,16 +384,24 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         type: 'Success',
         data: {
           object: 'chat.completion',
-          choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
+          choices: [{
+            message: { role: 'assistant', content: text },
+            finish_reason: 'stop',
+            index: 0,
+            logprobs: null,
+          }],
           created: Date.now(),
           conversationId: lastContext.conversationId,
-          model, text, id: customMessageId,
+          model,
+          text,
+          id: customMessageId,
           detail: { usage: usageRes },
         },
       })
     }
 
     // ====== ② 其它模型 ======
+    // 耗时操作：连接 OpenAI
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -374,8 +413,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       lastMessageId: lastContext.parentMessageId,
       isImageModel: isImage,
     })
-    
-    processThreads.push({ userId, abort, messageId, roomId: options.room.roomId })
+    // 同样不需要再 push
 
     let text = ''
     let chatIdRes = customMessageId
@@ -401,15 +439,22 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         role: choice.message.role || 'assistant',
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
-        detail: { choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }], created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage } as any 
+        detail: {
+            choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
+            created: response.created,
+            id: response.id,
+            model: response.model,
+            object: 'chat.completion',
+            usage: response.usage
+        } as any 
       })
 
     } else {
-      // ★★★ 这里加了循环计数日志 ★★★
-      let loopCount = 0; 
+      // 循环计数日志
+      let loopCount = 0;
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
          loopCount++;
-         // 每 5 个 chunk 打印一次，防止刷屏太快
+         // 调试日志
          if (loopCount % 5 === 0) console.log(`[DEBUG] 正在生成第 ${loopCount} 个片段... [${userId}]`);
 
          text += chunk.choices[0]?.delta.content ?? ''
@@ -431,11 +476,20 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       type: 'Success',
       data: {
         object: 'chat.completion',
-        choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
+        choices: [{
+          message: { role: 'assistant', content: text },
+          finish_reason: 'stop',
+          index: 0,
+          logprobs: null,
+          }],
         created: Date.now(),
         conversationId: lastContext.conversationId,
-        model: modelRes, text, id: chatIdRes,
-        detail: { usage: usageRes && { ...usageRes, estimated: false } },
+        model: modelRes,
+        text,
+        id: chatIdRes,
+        detail: {
+          usage: usageRes && { ...usageRes, estimated: false },
+        },
       },
     })
   }
@@ -445,6 +499,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       if (options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
+        
+        // 重试前也要记得清理旧的状态（因为递归会 push 新的，或者你可以复用）
+        // 这里简单起见，让递归自己去 push，我们把当前的删了
+        const index = processThreads.findIndex(d => d.userId === userId)
+        if (index > -1) processThreads.splice(index, 1)
+        
         return await chatReplyProcess(options)
       }
     }
@@ -526,7 +586,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
               const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
               const fileContent = await fs.readFile(filePath, 'utf-8')
               fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            } catch (e) {}
+            } catch (e) {
+               // 忽略丢失的历史文件
+            }
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
@@ -607,7 +669,9 @@ function getAccountId(accessToken: string): string {
   }
 }
 
+// [新增] 获取用户生成状态
 export function getChatProcessState(userId: string) {
+  // ★★★ 加上日志 ★★★
   console.log(`[DEBUG] Querying status for userId: ${userId}. Current threads:`, processThreads.map(t => ({ uid: t.userId, rid: t.roomId })))
 
   const thread = processThreads.find(d => d.userId === userId)
