@@ -17,6 +17,7 @@ import {
   fetchChatAPIProcess,
   fetchChatResponseoHistory,
   fetchChatStopResponding,
+  fetchChatProcessStatus, // [新增]
 } from '@/api'
 import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
@@ -79,9 +80,59 @@ function handleSubmit() {
   onConversation()
 }
 
-// [修改] 拆分为图片和文本两个列表
+// 拆分为图片和文本两个列表
 const imageUploadFileKeysRef = ref<string[]>([])
 const textUploadFileKeysRef = ref<string[]>([])
+
+// [新增] 轮询变量
+let pollInterval: NodeJS.Timeout | null = null
+
+// [新增] 检查后台任务状态
+async function checkProcessStatus() {
+  try {
+    const { data } = await fetchChatProcessStatus()
+    // 如果正在生成，且 roomId 匹配当前打开的窗口
+    if (data.isProcessing && data.roomId === +uuid) {
+      loading.value = true
+      // 恢复 lastChatInfo 的关键信息，以便 handleStop 能工作
+      lastChatInfo = {
+        id: data.messageId,
+        conversationId: null, 
+        text: '...',
+      }
+      startPolling()
+    }
+  } catch (error) {
+    console.error('Check status failed', error)
+  }
+}
+
+// [新增] 开始轮询
+function startPolling() {
+  stopPolling()
+  pollInterval = setInterval(async () => {
+    try {
+      const { data } = await fetchChatProcessStatus()
+      // 如果任务结束了 (isProcessing 变为 false) 或者 切换了房间
+      if (!data.isProcessing || data.roomId !== +uuid) {
+        stopPolling()
+        loading.value = false
+        // 重新拉取最新消息，把后台生成好的内容显示出来
+        await handleSyncChat() 
+      }
+    } catch (e) {
+      stopPolling()
+    }
+  }, 2000)
+}
+
+// [新增] 停止轮询
+function stopPolling() {
+  if (pollInterval) {
+    clearInterval(pollInterval)
+    pollInterval = null
+  }
+}
 
 async function onConversation() {
   let message = prompt.value
@@ -95,7 +146,6 @@ async function onConversation() {
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
-  // [修改] 合并上传列表，并加上类型前缀
   const uploadFileKeys = isVisionModel.value 
     ? [
         ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
@@ -103,7 +153,6 @@ async function onConversation() {
       ] 
     : []
   
-  // 清空列表
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
@@ -290,16 +339,13 @@ async function onRegenerate(index: number) {
   if (requestOptions.options)
     options = { ...requestOptions.options }
 
-  // ================= [修复] 获取上一条消息的附件并重新发送 =================
   let uploadFileKeys: string[] = []
   if (index > 0) {
     const previousMessage = dataSources.value[index - 1]
-    // 检查上一条是否为用户消息且包含图片
     if (previousMessage && previousMessage.inversion && previousMessage.images && previousMessage.images.length > 0) {
       uploadFileKeys = previousMessage.images
     }
   }
-  // ====================================================================
 
   loading.value = true
   const chatUuid = dataSources.value[index].uuid
@@ -326,7 +372,7 @@ async function onRegenerate(index: number) {
         uuid: chatUuid || Date.now(),
         regenerate: true,
         prompt: message,
-        uploadFileKeys, // 传入找回的附件
+        uploadFileKeys, 
         options,
         signal: controller.signal,
         onDownloadProgress: ({ event }) => {
@@ -528,11 +574,13 @@ function handleEnter(event: KeyboardEvent) {
   }
 }
 
+// [修改] handleStop 增加停止轮询逻辑
 async function handleStop() {
   if (loading.value) {
     controller.abort()
     loading.value = false
-    await fetchChatStopResponding(lastChatInfo.text, lastChatInfo.id, lastChatInfo.conversationId)
+    stopPolling()
+    await fetchChatStopResponding(lastChatInfo.text || 'Stopped', lastChatInfo.id, lastChatInfo.conversationId)
   }
 }
 
@@ -649,7 +697,6 @@ function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileIn
   return true
 }
   
-// [新增] 分开处理图片和文本的上传回调
 function handleFinishImage(options: { file: UploadFileInfo; event?: ProgressEvent }) {
   if (options.file.status === 'finished') {
     const response = (options.event?.target as XMLHttpRequest).response
@@ -668,7 +715,6 @@ function handleFinishText(options: { file: UploadFileInfo; event?: ProgressEvent
   }
 }
 
-// [新增] 分开处理删除
 function handleDeleteImageFile(index: number) {
   imageUploadFileKeysRef.value.splice(index, 1)
 }
@@ -684,9 +730,11 @@ const uploadHeaders = computed(() => {
   }
 })
 
+// [修改] onMounted 增加状态检查
 onMounted(() => {
   firstLoading.value = true
   handleSyncChat()
+  checkProcessStatus()
 
   if (authStore.token) {
     const chatModels = authStore.session?.chatModels
@@ -695,13 +743,18 @@ onMounted(() => {
   }
 })
 
+// [修改] watch 切换房间时增加状态检查
 watch(() => chatStore.active, () => {
   handleSyncChat()
+  stopPolling()
+  checkProcessStatus()
 })
 
+// [修改] onUnmounted 增加停止轮询
 onUnmounted(() => {
   if (loading.value)
     controller.abort()
+  stopPolling()
 })
 </script>
 
@@ -766,7 +819,6 @@ onUnmounted(() => {
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
           
-          <!-- [修改] 显示已上传的图片列表 -->
           <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div 
               v-for="(key, index) in imageUploadFileKeysRef" 
@@ -781,7 +833,6 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- [修改] 显示已上传的文本列表 -->
           <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div 
               v-for="(key, index) in textUploadFileKeysRef" 
@@ -798,7 +849,6 @@ onUnmounted(() => {
     
           <div class="flex items-center space-x-2">
             
-            <!-- [修改] 上传图片按钮 -->
             <div>
               <NUpload
                 action="/api/upload-image" 
@@ -817,7 +867,6 @@ onUnmounted(() => {
               </NUpload>
             </div>
 
-            <!-- [修改] 上传文件按钮 -->
             <div>
               <NUpload
                 action="/api/upload-image" 
