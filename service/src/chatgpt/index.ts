@@ -608,6 +608,8 @@ function getAccountId(accessToken: string): string {
 }
 
 export function getChatProcessState(userId: string) {
+  console.log(`[DEBUG] Querying status for userId: ${userId}. Current threads:`, processThreads.map(t => ({ uid: t.userId, rid: t.roomId })))
+
   const thread = processThreads.find(d => d.userId === userId)
   if (thread) {
     return {
