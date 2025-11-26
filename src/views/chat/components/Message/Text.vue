@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { computed, onMounted, onUnmounted, onUpdated, ref, nextTick } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref } from 'vue'
 import { NImage, NImageGroup } from 'naive-ui'
 import MarkdownIt from 'markdown-it'
 import mdKatex from '@traptitech/markdown-it-katex'
@@ -76,7 +76,7 @@ function isImage(filename: string | undefined): boolean {
   return /\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(realName)
 }
 
-// 图片列表：只保留图片，并去掉前缀，直接返回真实文件名
+// 图片列表
 const imageList = computed(() => {
   const list = props.images || []
   return list
@@ -84,7 +84,7 @@ const imageList = computed(() => {
     .map(file => stripTypePrefix(file))
 })
 
-// 文件列表：非图片附件，同样去掉前缀
+// 文件列表
 const fileList = computed(() => {
   const list = props.images || []
   return list
@@ -108,14 +108,22 @@ const mdi = new MarkdownIt({
 mdi.use(mila, { attrs: { target: '_blank', rel: 'noopener' } })
 mdi.use(mdKatex, { blockClass: 'katexmath-block rounded-md p-[10px]', errorColor: ' #cc0000' })
 
-function replaceBracketsWithDollar(input: string): string {
-  const regex = /\\$$(.*?)\\$$/gs
-  return input.replace(regex, (_, content) => `$$${content}$$`)
-}
+/**
+ * [修复] 增强的 LaTeX 预处理函数
+ * 将 OpenAI/DeepSeek 常用的 \[ \] 和 \( \) 转换为 Katex 支持的 $$ 和 $
+ */
+function preprocessLaTeX(content: string): string {
+  if (typeof content !== 'string') return ''
+  
+  // 1. 替换块级公式：将 \[ ... \] 替换为 $$ ... $$
+  // [\s\S]*? 非贪婪匹配所有字符（包括换行），解决公式跨行问题
+  let result = content.replace(/\\\[([\s\S]*?)\\\]/g, (_, equation) => `$$${equation}$$`)
 
-function replaceBracketsWithDollar2(input: string): string {
-  const regex = /\\\( (.*?) \\\)/g
-  return input.replace(regex, (_, content) => `$${content}$`)
+  // 2. 替换行内公式：将 $...$ 替换为 $ ... $
+  // 同样使用非贪婪匹配
+  result = result.replace(/\\\((.*?)\\\)/g, (_, equation) => `$${equation}$`)
+
+  return result
 }
 
 const wrapClass = computed(() => {
@@ -134,9 +142,9 @@ const wrapClass = computed(() => {
 const text = computed(() => {
   let value = props.text ?? ''
   if (!props.asRawText) {
-    value = replaceBracketsWithDollar(value)
-    value = replaceBracketsWithDollar2(value)
-    return mdi.render(value)
+    // 使用新的预处理逻辑
+    const processedValue = preprocessLaTeX(value)
+    return mdi.render(processedValue)
   }
   return value
 })
@@ -190,13 +198,6 @@ onUnmounted(() => {
 
 <template>
   <div class="text-black" :class="wrapClass">
-    <!-- 
-      [修改说明]
-      将 Markdown 文本渲染 div 与 附件显示 div 分开。
-      click="handleMarkdownClick" 只绑定在文本区域，
-      避免点击 NImageGroup 里的附件图片时，事件冒泡导致触发两次预览。
-    -->
-    
     <!-- 1. Markdown / 文本内容区域 -->
     <div
       ref="textRef"
@@ -215,7 +216,7 @@ onUnmounted(() => {
       <div v-else class="whitespace-pre-wrap" v-text="text" />
     </div>
 
-    <!-- 2. 附件图片（移出 textRef div） -->
+    <!-- 2. 附件图片 -->
     <div v-if="imageList.length > 0" class="flex flex-col gap-2 my-2">
       <NImageGroup>
         <NImage
@@ -233,7 +234,7 @@ onUnmounted(() => {
       </NImageGroup>
     </div>
 
-    <!-- 3. 附件文件（移出 textRef div） -->
+    <!-- 3. 附件文件 -->
     <div v-if="fileList.length > 0" class="flex flex-col gap-2 my-2">
       <a
         v-for="(v, i) of fileList"
