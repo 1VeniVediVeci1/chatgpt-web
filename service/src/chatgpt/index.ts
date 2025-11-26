@@ -112,6 +112,7 @@ export async function initApi(key: KeyConfig, {
     baseURL: OPENAI_API_BASE_URL,
     apiKey: key.key,
     maxRetries: 0,
+    timeout: config.timeoutMs,
   })
   
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
