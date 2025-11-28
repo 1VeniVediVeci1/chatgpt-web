@@ -303,12 +303,12 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       room,
     })
     
-    if (result.status === 'Success' && result.data && !result.data.detail?.usage) {
+    if (!result.data.detail?.usage) {
       if (!result.data.detail)
         result.data.detail = {}
       result.data.detail.usage = new UsageResponse()
       result.data.detail.usage.prompt_tokens = textTokens(prompt, 'gpt-3.5-turbo' as TiktokenModel)
-      result.data.detail.usage.completion_tokens = textTokens(result.data.text || '', 'gpt-3.5-turbo' as TiktokenModel)
+      result.data.detail.usage.completion_tokens = textTokens(result.data.text, 'gpt-3.5-turbo' as TiktokenModel)
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
@@ -321,57 +321,70 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
     try {
       res.write(JSON.stringify({ message: error?.message }))
     } catch (err) {}
+
+    // 确保 finally 中能拿到 result，避免后续继续抛出 TypeError
+    result = {
+      status: 'Fail',
+      message: error?.message ?? 'Please check the back-end console',
+      data: lastResponse ?? { text: error?.message ?? '' } as any,
+    }
   }
   finally {
     try {
       res.end()
     } catch (err) {}
 
-    try {
-      if (result == null || result === undefined || result.status !== 'Success') {
-        if (result && result.status !== 'Success')
-          lastResponse = { text: result.message }
-        result = { data: lastResponse, message: lastResponse.text, status: 'Fail' }
-      }
-
-      if (result.data === undefined)
-        return
-
-      if (regenerate && message.options.messageId) {
-        const previousResponse = message.previousResponse || []
-        previousResponse.push({ response: message.response, options: message.options })
-        await updateChat(message._id as unknown as string,
-          result.data.text,
-          result.data.id,
-          result.data.conversationId,
-          model,
-          result.data.detail?.usage as UsageResponse,
-          previousResponse as [])
-      }
-      else {
-        await updateChat(message._id as unknown as string,
-          result.data.text,
-          result.data.id,
-          result.data.conversationId,
-          model,
-          result.data.detail?.usage as UsageResponse)
-      }
-
-      if (result.data.detail?.usage) {
-        await insertChatUsage(ObjectId.createFromHexString(req.headers.userId),
-          roomId,
-          message._id,
-          result.data.id,
-          model,
-          result.data.detail?.usage as UsageResponse)
-      }
-      if (config.siteConfig?.usageCountLimit) {
-        if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
-          await updateAmountMinusOne(userId)
-      }
+    // === 这里开始是新的安全兜底逻辑 ===
+    const safeResult = result ?? {
+      status: 'Fail',
+      message: lastResponse?.text ?? 'Unknown error',
+      data: lastResponse ?? undefined,
     }
-    catch (error) {
-      globalThis.console.error(error)
+
+    if (!safeResult.data && lastResponse)
+      safeResult.data = lastResponse as any
+
+    if (!safeResult.data)
+      return
+
+    if (safeResult.status !== 'Success') {
+      lastResponse = lastResponse ?? { text: safeResult.message }
+      safeResult.data = lastResponse as any
+    }
+
+    const resultData = safeResult.data
+
+    if (regenerate && message.options.messageId) {
+      const previousResponse = message.previousResponse || []
+      previousResponse.push({ response: message.response, options: message.options })
+      await updateChat(message._id as unknown as string,
+        resultData.text,
+        resultData.id,
+        resultData.conversationId,
+        model,
+        resultData.detail?.usage as UsageResponse,
+        previousResponse as [])
+    }
+    else {
+      await updateChat(message._id as unknown as string,
+        resultData.text,
+        resultData.id,
+        resultData.conversationId,
+        model,
+        resultData.detail?.usage as UsageResponse)
+    }
+
+    if (resultData.detail?.usage) {
+      await insertChatUsage(ObjectId.createFromHexString(req.headers.userId),
+        roomId,
+        message._id,
+        resultData.id,
+        model,
+        resultData.detail?.usage as UsageResponse)
+    }
+    if (config.siteConfig?.usageCountLimit) {
+      if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
+        await updateAmountMinusOne(userId)
     }
   }
 })
