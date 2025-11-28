@@ -303,12 +303,12 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       room,
     })
     
-    if (!result.data.detail?.usage) {
+    if (result.status === 'Success' && result.data && !result.data.detail?.usage) {
       if (!result.data.detail)
         result.data.detail = {}
       result.data.detail.usage = new UsageResponse()
       result.data.detail.usage.prompt_tokens = textTokens(prompt, 'gpt-3.5-turbo' as TiktokenModel)
-      result.data.detail.usage.completion_tokens = textTokens(result.data.text, 'gpt-3.5-turbo' as TiktokenModel)
+      result.data.detail.usage.completion_tokens = textTokens(result.data.text || '', 'gpt-3.5-turbo' as TiktokenModel)
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
