@@ -116,8 +116,16 @@ export async function getOriginConfig() {
     )
   }
 
+  // 默认值处理
   if (!isNotEmptyString(config.siteConfig.chatModels))
     config.siteConfig.chatModels = 'gpt-3.5-turbo,gpt-4-turbo-preview,gpt-4-vision-preview'
+
+  // ===== 新增：Init Reasoning Configuration Default Values =====
+  if (config.siteConfig.reasoningModels === undefined)
+    config.siteConfig.reasoningModels = ''
+  if (config.siteConfig.reasoningEffort === undefined)
+    config.siteConfig.reasoningEffort = 'medium'
+
   return config
 }
 
