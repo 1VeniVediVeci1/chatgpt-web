@@ -34,6 +34,9 @@ export class SiteConfig {
   usageCountLimit?: boolean
   showWatermark?: boolean
   imageModels?: string
+  // ===== 新增: 推理模型配置 =====
+  reasoningModels?: string
+  reasoningEffort?: 'none' | 'low' | 'medium' | 'high'
 }
 
 export class MailConfig {
