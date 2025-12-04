@@ -1,6 +1,6 @@
 <script setup lang='ts'>
 import { onMounted, ref } from 'vue'
-import { NButton, NInput, NInputNumber, NSpin, NSwitch, useMessage } from 'naive-ui'
+import { NButton, NInput, NInputNumber, NSelect, NSpin, NSwitch, useMessage } from 'naive-ui'
 import type { ConfigState } from './model'
 import { SiteConfig } from './model'
 import { fetchChatConfig, fetchUpdateSite } from '@/api'
@@ -140,6 +140,38 @@ onMounted(() => {
             />
           </div>
         </div>
+
+        <!-- ===== 新增 Reasoning 配置 UI ===== -->
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">推理模型列表</span>
+          <div class="flex-1">
+            <NInput
+              :value="config && config.reasoningModels"
+              placeholder="需要传 reasoning_effort 的模型，英文逗号分隔，如：o3-mini,gpt-5.1"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              @input="(val) => { if (config) config.reasoningModels = val }"
+            />
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">reasoning_effort</span>
+          <div class="flex-1">
+            <NSelect
+              :value="config && config.reasoningEffort"
+              :options="[
+                { label: 'none（不传参数）', key: 'none', value: 'none' },
+                { label: 'low', key: 'low', value: 'low' },
+                { label: 'medium', key: 'medium', value: 'medium' },
+                { label: 'high', key: 'high', value: 'high' },
+              ]"
+              @update-value="(val) => { if (config) config.reasoningEffort = val as any }"
+            />
+          </div>
+        </div>
+        <!-- ================================== -->
+
         <!-- 增加新注册用户的全局数量设置 -->
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.globalAmount') }}</span>
