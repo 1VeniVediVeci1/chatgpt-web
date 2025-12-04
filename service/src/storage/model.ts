@@ -208,7 +208,10 @@ export class SiteConfig {
     public globalAmount?: number,
     public usageCountLimit?: boolean,
     public showWatermark?: boolean,
-    public imageModels?: string, 
+    public imageModels?: string,
+    // ===== 新增: 推理模型配置 =====
+    public reasoningModels?: string, // 哪些模型启用推理参数，逗号分隔
+    public reasoningEffort?: 'none' | 'low' | 'medium' | 'high', // 推理强度
   ) { }
 }
 
