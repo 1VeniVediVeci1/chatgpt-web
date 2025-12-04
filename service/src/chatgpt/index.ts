@@ -16,7 +16,7 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
-import * as fsData from 'fs' 
+import * as fsData from 'fs'
 
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
@@ -58,7 +58,7 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
   try {
     const realFilename = stripTypePrefix(filename)
     const filePath = path.join(UPLOAD_DIR, realFilename)
-    await fs.access(filePath) 
+    await fs.access(filePath)
     const buffer = await fs.readFile(filePath)
     const ext = path.extname(realFilename).toLowerCase().replace('.', '')
     let mime = 'image/png'
@@ -114,7 +114,7 @@ export async function initApi(key: KeyConfig, {
     maxRetries: 0,
     timeout: config.timeoutMs, // ★★★ 设置 OpenAI SDK 超时 ★★★
   })
-  
+
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
   const finalTemperature = modelConfig.defaultTemperature ?? temperature
   const shouldUseTopP = modelConfig.supportTopP
@@ -124,10 +124,10 @@ export async function initApi(key: KeyConfig, {
     if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
     if (!message) break
-    
+
     let safeContent = message.text
     if (typeof safeContent === 'string') {
-       safeContent = safeContent.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image Data Removed]')
+      safeContent = safeContent.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image Data Removed]')
     }
 
     messages.push({
@@ -161,6 +161,32 @@ export async function initApi(key: KeyConfig, {
     options.top_p = top_p
   }
 
+  // ===== 新增：根据配置决定是否传 reasoning_effort =====
+  try {
+    const siteCfg = config.siteConfig
+    const reasoningModelsStr = siteCfg?.reasoningModels || ''
+    const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
+
+    // 只对配置里列出的模型生效，列表由英文逗号分隔
+    const reasoningModelList = reasoningModelsStr
+      .split(/[,，]/)
+      .map(s => s.trim())
+      .filter(Boolean)
+
+    const isReasoningModel = reasoningModelList.includes(model)
+
+    // reasoningEffort !== 'none' 时才真正传参数；'none' 表示显式不传，让 API 使用默认行为
+    if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none') {
+      // 这里的类型在旧版 openai sdk 中可能未定义，故加 any 断言
+      // 如果使用了最新的 openai sdk，可能已经包含了该字段
+      ; (options as any).reasoning_effort = reasoningEffort
+      console.log(`[OpenAI] reasoning_effort enabled: model=${model}, value=${reasoningEffort}`)
+    }
+  } catch (e) {
+    console.error('[OpenAI] set reasoning_effort failed:', e)
+  }
+  // ==============================================
+
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
   const apiResponse = await openai.chat.completions.create(options, {
@@ -184,27 +210,27 @@ async function getGeminiChatSession(
   if (!chatSession) {
     console.log(`[Gemini SDK] Creating new session for ${sessionKey}`)
     const genAI = new GoogleGenerativeAI(apiKey)
-    
+
     const requestOptions: any = {}
-    
+
     // ★★★ 增加 Gemini 超时设置 ★★★
     const config = await getCacheConfig()
     // timeout 在 requestOptions 里，根据文档单位是毫秒
     if (config.timeoutMs) {
-        requestOptions.timeout = config.timeoutMs
+      requestOptions.timeout = config.timeoutMs
     }
 
     if (baseUrl) {
       requestOptions.baseUrl = baseUrl.replace(/\/+$/, '')
     }
 
-    const model = genAI.getGenerativeModel({ 
+    const model = genAI.getGenerativeModel({
       model: modelName,
       systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }], role: "system" } : undefined
     }, requestOptions)
 
     chatSession = model.startChat({
-      history: [], 
+      history: [],
     })
     geminiChats.set(sessionKey, chatSession)
   }
@@ -222,9 +248,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   // ★★★ 核心逻辑：先清理旧的，再 Push 新的 ★★★
   const existingIdx = processThreads.findIndex(t => t.userId === userId)
   if (existingIdx > -1) {
-    processThreads.splice(existingIdx, 1) 
+    processThreads.splice(existingIdx, 1)
   }
-  
+
   console.log(`[DEBUG] Pushing thread for userId: ${userId}, roomId: ${roomId}`)
   processThreads.push({ userId, abort, messageId, roomId })
 
@@ -246,7 +272,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const globalConfig = await getCacheConfig()
   const imageModelsStr = globalConfig.siteConfig.imageModels || ''
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
-  
+
   const isImage = imageModelList.some(m => model.includes(m))
   const isGeminiImageModel = isImage && model.includes('gemini')
 
@@ -290,12 +316,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
       const sessionKey = `${userId}:${options.room.roomId}:${model}`
-      
+
       // ★★★ 调用处加 await ★★★
       const chatSession = await getGeminiChatSession(key.key, model, baseUrl, sessionKey, systemMessage)
 
       const inputParts: Part[] = []
-      
+
       let promptText = ''
       if (typeof content === 'string') {
         promptText = content
@@ -312,22 +338,22 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
             const urlStr = (part as any).image_url.url as string
-            
+
             if (urlStr.startsWith('data:')) {
-                const [header, base64Data] = urlStr.split(',')
-                if (header && base64Data) {
-                  const mimeMatch = header.match(/:(.*?);/)
-                  const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
-                  inputParts.push({ inlineData: { mimeType, data: base64Data } })
-                }
-            } 
+              const [header, base64Data] = urlStr.split(',')
+              if (header && base64Data) {
+                const mimeMatch = header.match(/:(.*?);/)
+                const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
+                inputParts.push({ inlineData: { mimeType, data: base64Data } })
+              }
+            }
             // 本地文件 /uploads/xxx
             else if (urlStr.includes('/uploads/')) {
-                const filename = path.basename(urlStr)
-                const fileData = await getFileBase64(filename)
-                if (fileData) {
-                    inputParts.push({ inlineData: { mimeType: fileData.mime, data: fileData.data } })
-                }
+              const filename = path.basename(urlStr)
+              const fileData = await getFileBase64(filename)
+              if (fileData) {
+                inputParts.push({ inlineData: { mimeType: fileData.mime, data: fileData.data } })
+              }
             }
           }
         }
@@ -335,7 +361,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
-      
+
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
@@ -350,7 +376,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           const filePath = path.join(UPLOAD_DIR, filename)
           await fs.writeFile(filePath, buffer)
-          
+
           const prefix = text ? '\n\n' : ''
           text += `${prefix}![Generated Image](/uploads/${filename})`
         }
@@ -360,11 +386,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const usageRes: any = response.usageMetadata
         ? {
-            prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
-            completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: response.usageMetadata.totalTokenCount ?? 0,
-            estimated: true,
-          }
+          prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
+          completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
+          total_tokens: response.usageMetadata.totalTokenCount ?? 0,
+          estimated: true,
+        }
         : undefined
 
       process?.({
@@ -408,7 +434,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       lastMessageId: lastContext.parentMessageId,
       isImageModel: isImage,
     })
-    
+
     let text = ''
     let chatIdRes = customMessageId
     let modelRes = ''
@@ -422,9 +448,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       usageRes = response.usage
 
       if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) {
-         text = `![Generated Image](${rawContent})`
+        text = `![Generated Image](${rawContent})`
       } else {
-         text = rawContent
+        text = rawContent
       }
 
       process?.({
@@ -434,33 +460,33 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         conversationId: lastContext.conversationId,
         parentMessageId: lastContext.parentMessageId,
         detail: {
-            choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
-            created: response.created,
-            id: response.id,
-            model: response.model,
-            object: 'chat.completion',
-            usage: response.usage
-        } as any 
+          choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
+          created: response.created,
+          id: response.id,
+          model: response.model,
+          object: 'chat.completion',
+          usage: response.usage
+        } as any
       })
 
     } else {
       let loopCount = 0;
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
-         loopCount++;
-         // if (loopCount % 5 === 0) console.log(`[DEBUG] 正在生成第 ${loopCount} 个片段... [${userId}]`);
+        loopCount++;
+        // if (loopCount % 5 === 0) console.log(`[DEBUG] 正在生成第 ${loopCount} 个片段... [${userId}]`);
 
-         text += chunk.choices[0]?.delta.content ?? ''
-         chatIdRes = customMessageId
-         modelRes = chunk.model
-         usageRes = usageRes || chunk.usage
-         process?.({
-           ...chunk,
-           id: customMessageId,
-           text,
-           role: chunk.choices[0]?.delta.role || 'assistant',
-           conversationId: lastContext.conversationId,
-           parentMessageId: lastContext.parentMessageId,
-         })
+        text += chunk.choices[0]?.delta.content ?? ''
+        chatIdRes = customMessageId
+        modelRes = chunk.model
+        usageRes = usageRes || chunk.usage
+        process?.({
+          ...chunk,
+          id: customMessageId,
+          text,
+          role: chunk.choices[0]?.delta.role || 'assistant',
+          conversationId: lastContext.conversationId,
+          parentMessageId: lastContext.parentMessageId,
+        })
       }
     }
 
@@ -485,15 +511,15 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         // 重试前清理旧状态
         const index = processThreads.findIndex(d => d.userId === userId)
         if (index > -1) processThreads.splice(index, 1)
-        
+
         return await chatReplyProcess(options)
       }
     }
     globalThis.console.error(error)
-    
+
     if (isGeminiImageModel) {
-        const sessionKey = `${userId}:${options.room.roomId}:${model}`
-        geminiChats.delete(sessionKey)
+      const sessionKey = `${userId}:${options.room.roomId}:${model}`
+      geminiChats.delete(sessionKey)
     }
 
     if (Reflect.has(ErrorCodeMessage, code))
@@ -504,13 +530,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     // ★★★ 最后的兜底清理 ★★★
     console.log(`[DEBUG] 任务彻底结束，清理线程状态。UserId: ${userId}`)
     console.log(`[DEBUG] Before Splice Size: ${processThreads.length}`)
-    
+
     // 必须精确匹配 messageId，防止把重试后新 push 进去的给删了
     // 如果没有 messageId，则按 userId 删第一个
     // 但这里最稳妥的是按 userId 删，因为并发限制是 per user
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1) processThreads.splice(index, 1)
-    
+
     console.log(`[DEBUG] After Splice Size: ${processThreads.length}`)
   }
 }
@@ -565,7 +591,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         let promptText = chatInfo.prompt
         const allFileKeys = chatInfo.images || []
         const textFiles = allFileKeys.filter(k => isTextFile(k))
-        const imageFiles = allFileKeys.filter(k => isImageFile(k)) 
+        const imageFiles = allFileKeys.filter(k => isImageFile(k))
 
         if (textFiles.length > 0) {
           let fileContext = ''
@@ -574,13 +600,13 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
               const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
               const fileContent = await fs.readFile(filePath, 'utf-8')
               fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            } catch (e) {}
+            } catch (e) { }
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
-        
+
         if (promptText && typeof promptText === 'string') {
-           promptText = promptText.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image Data Removed]')
+          promptText = promptText.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image Data Removed]')
         }
 
         let content: MessageContent = promptText
@@ -605,9 +631,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       else {
         let responseText = chatInfo.response || ''
         if (responseText.includes('data:image') && responseText.includes('base64')) {
-            responseText = responseText.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image History]')
+          responseText = responseText.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image History]')
         }
-        
+
         return {
           id,
           conversationId: chatInfo.options.conversationId,
