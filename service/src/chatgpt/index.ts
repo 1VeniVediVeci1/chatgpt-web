@@ -140,10 +140,17 @@ async function messageContentToGeminiParts(content: MessageContent, forGeminiIma
   return parts
 }
 
+/**
+ * 从 assistant 的 markdown 文本中提取最近一张 /uploads/... 图片路径
+ * 例如：![Generated Image](/uploads/xxx.png)
+ */
 function extractLastUploadsImageFromAssistantMarkdown(text: string): string | null {
   if (!text) return null
-  // 匹配 ![Gen...](/uploads/xxx.png)
+
+  // ✅ 修复点：正确匹配 markdown 图片语法 ![alt](/uploads/xxx)
+  // 捕获组 1 = /uploads/xxx.png
   const re = /!$$[^$$]*]$(\/uploads\/[^)]+)$/g
+
   let last: string | null = null
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) last = m[1]
