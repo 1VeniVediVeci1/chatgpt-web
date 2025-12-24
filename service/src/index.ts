@@ -44,7 +44,7 @@ import {
   verifyUser,
 } from './storage/mongo'
 import { authLimiter } from './middleware/limiter'
-import { hasAnyRole, isEmail, isNotEmptyString } from './utils/is'
+import { isEmail, isNotEmptyString, hasAnyRole } from './utils/is'
 import { sendNoticeMail, sendResetPasswordMail, sendTestMail, sendVerifyMail, sendVerifyMailAdmin } from './utils/mail'
 import { checkUserResetPassword, checkUserVerify, checkUserVerifyAdmin, getUserResetPasswordUrl, getUserVerifyUrl, getUserVerifyUrlAdmin, md5 } from './utils/security'
 import { isAdmin, rootAuth } from './middleware/rootAuth'
@@ -59,8 +59,8 @@ const app = express()
 const router = express.Router()
 
 app.use(express.static('public'))
-app.use(express.json({ limit: '100mb' }))  // 增加limit参数
-app.use(express.urlencoded({ limit: '100mb', extended: true }))  // 同时处理form数据
+app.use(express.json({ limit: '100mb' }))
+app.use(express.urlencoded({ limit: '100mb', extended: true }))
 
 app.use('/uploads', express.static('uploads'))
 
@@ -323,6 +323,13 @@ router.post('/session', async (req, res) => {
       }
     })
 
+    // 用于前端分组：imageModels 定义了哪些是非流式/图片模型
+    const imageModelsStr = config.siteConfig?.imageModels || ''
+    const nonStreamModelMatchers = imageModelsStr
+      .split(/[,，]/)
+      .map(s => s.trim())
+      .filter(Boolean)
+
     let userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; roles: UserRole[]; config: UserConfig; advanced: AdvancedConfig }
     if (userId != null) {
       const user = await getUserById(userId)
@@ -381,6 +388,11 @@ router.post('/session', async (req, res) => {
         })
       })
 
+      // 提取分组信息
+      const availableModelValues = chatModels.map(m => m.value)
+      const geminiChatModels = availableModelValues.filter(m => m.includes('gemini'))
+      const nonStreamChatModels = availableModelValues.filter(m => nonStreamModelMatchers.some(x => m.includes(x)))
+
       res.send({
         status: 'Success',
         message: '',
@@ -392,6 +404,9 @@ router.post('/session', async (req, res) => {
           title: config.siteConfig.siteTitle,
           chatModels,
           allChatModels: chatModelOptions,
+          // 分组数据
+          geminiChatModels,
+          nonStreamChatModels,
           usageCountLimit: config.siteConfig?.usageCountLimit,
           showWatermark: config.siteConfig?.showWatermark,
           userInfo,
@@ -399,6 +414,11 @@ router.post('/session', async (req, res) => {
       })
       return
     }
+
+    // 未登录/无鉴权模式下，默认全部可选，也返回分组依据
+    const allValues = chatModelOptions.map(m => m.value)
+    const geminiChatModels = allValues.filter(m => m.includes('gemini'))
+    const nonStreamChatModels = allValues.filter(m => nonStreamModelMatchers.some(x => m.includes(x)))
 
     res.send({
       status: 'Success',
@@ -409,8 +429,10 @@ router.post('/session', async (req, res) => {
         allowRegister,
         model: config.apiModel,
         title: config.siteConfig.siteTitle,
-        chatModels: chatModelOptions, // if userId is null which means in nologin mode, open all model options, otherwise user can only choose gpt-3.5-turbo
+        chatModels: chatModelOptions, // if userId is null which means in nologin mode, open all model options
         allChatModels: chatModelOptions,
+        geminiChatModels,
+        nonStreamChatModels,
         showWatermark: config.siteConfig?.showWatermark,
         userInfo,
       },
