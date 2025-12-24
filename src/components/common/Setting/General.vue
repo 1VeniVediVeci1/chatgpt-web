@@ -15,7 +15,7 @@ const appStore = useAppStore()
 const userStore = useUserStore()
 const authStore = useAuthStore()
 
-// 页面加载时读取后端额度（因为扣减计算在后端完成，前端信息滞后）
+// 页面加载时读取后端额度
 onMounted(() => {
   userStore.readUserAmt()
 })
@@ -34,7 +34,6 @@ const name = ref(userInfo.value.name ?? '')
 
 const description = ref(userInfo.value.description ?? '')
 
-// 新创建额度和兑换相关响应式变量，为null的话默认送10次
 const useAmount = computed(() => userStore.userInfo.useAmount ?? 10)
 const redeemCardNo = ref('')
 
@@ -45,6 +44,30 @@ const language = computed({
   set(value: Language) {
     appStore.setLanguage(value)
   },
+})
+
+// 分组模型选项
+const groupedChatModelOptions = computed(() => {
+  const session = authStore.session
+  const base = session?.chatModels ?? []
+  if (!base.length) return []
+  const geminiSet = new Set(session?.geminiChatModels ?? [])
+  const nonStreamSet = new Set(session?.nonStreamChatModels ?? [])
+
+  const gemini: any[] = []
+  const nonStream: any[] = []
+  const others: any[] = []
+  for (const opt of base) {
+    if (geminiSet.has(opt.value)) gemini.push(opt)
+    else if (nonStreamSet.has(opt.value)) nonStream.push(opt)
+    else others.push(opt)
+  }
+
+  const groups: any[] = []
+  if (gemini.length) groups.push({ type: 'group', label: 'Gemini', key: 'g_gemini', children: gemini })
+  if (nonStream.length) groups.push({ type: 'group', label: '非流式/图片模型', key: 'g_nonstream', children: nonStream })
+  if (others.length) groups.push({ type: 'group', label: '其它模型', key: 'g_others', children: others })
+  return groups
 })
 
 const themeOptions: { label: string; key: Theme; icon: string }[] = [
@@ -77,7 +100,6 @@ async function updateUserInfo(options: Partial<UserInfo>) {
   ms.success(`更新个人信息 ${t('common.success')}`)
 }
 
-// 更新并兑换，这里图页面设计方便暂时先放一起了，下方页面新增了两个输入框
 async function redeemandupdateUserInfo(options: { avatar: string; name: string; description: string; useAmount: number; redeemCardNo: string }) {
   const { avatar, name, description, useAmount, redeemCardNo } = options
   let add_amt = 0
@@ -203,10 +225,11 @@ function handleImportButtonClick(): void {
       <div class="flex items-center space-x-4">
         <span class="flex-shrink-0 w-[100px]">{{ $t('setting.defaultChatModel') }}</span>
         <div class="w-[200px]">
+          <!-- 修改为分组的 groupedChatModelOptions -->
           <NSelect
             style="width: 200px"
             :value="userInfo.config.chatModel"
-            :options="authStore.session?.chatModels"
+            :options="groupedChatModelOptions"
             :disabled="!!authStore.session?.auth && !authStore.token"
             @update-value="(val) => updateUserChatModel(val)"
           />
