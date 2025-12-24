@@ -86,7 +86,116 @@ const ErrorCodeMessage: Record<string, string> = {
 
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
-const geminiChats = new Map<string, ChatSession>()
+
+// ====== Gemini 图片模型防爆限制与工具函数 ======
+const GEMINI_IMAGE_MAX_CHARS_PER_TEXT = 120000
+
+function truncateForGeminiImage(text: string, maxChars: number) {
+  if (!text) return ''
+  if (text.length <= maxChars) return text
+  return text.slice(0, maxChars) + `\n\n[Truncated: only first ${maxChars} chars kept]`
+}
+
+async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> {
+  // data url
+  if (urlStr.startsWith('data:')) {
+    const [header, base64Data] = urlStr.split(',')
+    if (!header || !base64Data) return null
+    const mimeMatch = header.match(/:(.*?);/)
+    const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
+    return { inlineData: { mimeType, data: base64Data } }
+  }
+
+  // /uploads/xxx
+  if (urlStr.includes('/uploads/')) {
+    const filename = path.basename(urlStr)
+    const fileData = await getFileBase64(filename)
+    if (!fileData) return null
+    return { inlineData: { mimeType: fileData.mime, data: fileData.data } }
+  }
+
+  return null
+}
+
+async function messageContentToGeminiParts(content: MessageContent, forGeminiImageModel: boolean): Promise<Part[]> {
+  const parts: Part[] = []
+
+  if (typeof content === 'string') {
+    parts.push({ text: forGeminiImageModel ? truncateForGeminiImage(content, GEMINI_IMAGE_MAX_CHARS_PER_TEXT) : content })
+    return parts
+  }
+
+  if (Array.isArray(content)) {
+    for (const p of content as any[]) {
+      if (p?.type === 'text' && p.text) {
+        parts.push({ text: forGeminiImageModel ? truncateForGeminiImage(p.text, GEMINI_IMAGE_MAX_CHARS_PER_TEXT) : p.text })
+      }
+      else if (p?.type === 'image_url' && p.image_url?.url) {
+        const imgPart = await imageUrlToGeminiInlinePart(p.image_url.url)
+        if (imgPart) parts.push(imgPart)
+      }
+    }
+  }
+
+  return parts
+}
+
+function extractLastUploadsImageFromAssistantMarkdown(text: string): string | null {
+  if (!text) return null
+  // 匹配 ![Gen...](/uploads/xxx.png)
+  const re = /!$$[^$$]*]$(\/uploads\/[^)]+)$/g
+  let last: string | null = null
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) last = m[1]
+  return last
+}
+
+/**
+ * 核心逻辑：按原有 DB 链条回溯，构造 Gemini 需要的 history
+ */
+async function buildGeminiHistoryFromLastMessageId(params: {
+  lastMessageId?: string
+  maxContextCount: number
+  forGeminiImageModel: boolean
+}): Promise<any[]> {
+  const { lastMessageId: startId, maxContextCount, forGeminiImageModel } = params
+  const messages: { role: 'user' | 'model'; parts: Part[]; rawText?: string }[] = []
+
+  let lastMessageId = startId
+  for (let i = 0; i < maxContextCount; i++) {
+    if (!lastMessageId) break
+    const msg = await getMessageById(lastMessageId)
+    if (!msg) break
+
+    // 系统内部 assistant 对应 Gemini model
+    const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
+    const parts = await messageContentToGeminiParts(msg.text, forGeminiImageModel)
+    const rawText = typeof msg.text === 'string' ? msg.text : ''
+
+    messages.push({ role, parts, rawText })
+    lastMessageId = msg.parentMessageId
+  }
+
+  // 数据库回溯是倒序的，需反转回正序
+  messages.reverse()
+
+  // 增强：从最近的 assistant 消息中提取生成的图，作为 model part 传回去
+  if (forGeminiImageModel) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m.role !== 'model') continue
+      const imgPath = extractLastUploadsImageFromAssistantMarkdown(m.rawText || '')
+      if (imgPath) {
+        const imgPart = await imageUrlToGeminiInlinePart(imgPath)
+        if (imgPart) m.parts.push(imgPart)
+      }
+      break // 只取最近的一张
+    }
+  }
+
+  // 转换为 Gemini SDK 需要的格式
+  return messages.map(m => ({ role: m.role, parts: m.parts }))
+}
 
 export async function initApi(key: KeyConfig, {
   model,
@@ -112,7 +221,7 @@ export async function initApi(key: KeyConfig, {
     baseURL: OPENAI_API_BASE_URL,
     apiKey: key.key,
     maxRetries: 0,
-    timeout: config.timeoutMs, // ★★★ 设置 OpenAI SDK 超时 ★★★
+    timeout: config.timeoutMs,
   })
 
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
@@ -148,6 +257,7 @@ export async function initApi(key: KeyConfig, {
     content,
   })
 
+  // Gemini 图片模型直接走下方特殊逻辑，这里主要是 Other/Image(DallE)
   const enableStream = !isImageModel
 
   const options: OpenAI.ChatCompletionCreateParams = {
@@ -161,13 +271,11 @@ export async function initApi(key: KeyConfig, {
     options.top_p = top_p
   }
 
-  // ===== 新增：根据配置决定是否传 reasoning_effort =====
   try {
     const siteCfg = config.siteConfig
     const reasoningModelsStr = siteCfg?.reasoningModels || ''
     const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
 
-    // 只对配置里列出的模型生效，列表由英文逗号分隔
     const reasoningModelList = reasoningModelsStr
       .split(/[,，]/)
       .map(s => s.trim())
@@ -175,17 +283,13 @@ export async function initApi(key: KeyConfig, {
 
     const isReasoningModel = reasoningModelList.includes(model)
 
-    // reasoningEffort !== 'none' 时才真正传参数；'none' 表示显式不传，让 API 使用默认行为
     if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none') {
-      // 这里的类型在旧版 openai sdk 中可能未定义，故加 any 断言
-      // 如果使用了最新的 openai sdk，可能已经包含了该字段
       ; (options as any).reasoning_effort = reasoningEffort
       console.log(`[OpenAI] reasoning_effort enabled: model=${model}, value=${reasoningEffort}`)
     }
   } catch (e) {
     console.error('[OpenAI] set reasoning_effort failed:', e)
   }
-  // ==============================================
 
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
@@ -198,46 +302,6 @@ export async function initApi(key: KeyConfig, {
 
 const processThreads: { userId: string; abort: AbortController; messageId: string; roomId: number }[] = []
 
-async function getGeminiChatSession(
-  apiKey: string,
-  modelName: string,
-  baseUrl: string | undefined,
-  sessionKey: string,
-  systemInstruction?: string
-): Promise<ChatSession> {
-  let chatSession = geminiChats.get(sessionKey)
-
-  if (!chatSession) {
-    console.log(`[Gemini SDK] Creating new session for ${sessionKey}`)
-    const genAI = new GoogleGenerativeAI(apiKey)
-
-    const requestOptions: any = {}
-
-    // ★★★ 增加 Gemini 超时设置 ★★★
-    const config = await getCacheConfig()
-    // timeout 在 requestOptions 里，根据文档单位是毫秒
-    if (config.timeoutMs) {
-      requestOptions.timeout = config.timeoutMs
-    }
-
-    if (baseUrl) {
-      requestOptions.baseUrl = baseUrl.replace(/\/+$/, '')
-    }
-
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }], role: "system" } : undefined
-    }, requestOptions)
-
-    chatSession = model.startChat({
-      history: [],
-    })
-    geminiChats.set(sessionKey, chatSession)
-  }
-
-  return chatSession
-}
-
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const userId = options.user._id.toString()
   const messageId = options.messageId
@@ -245,7 +309,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const abort = new AbortController()
   const customMessageId = generateMessageId()
 
-  // ★★★ 核心逻辑：先清理旧的，再 Push 新的 ★★★
   const existingIdx = processThreads.findIndex(t => t.userId === userId)
   if (existingIdx > -1) {
     processThreads.splice(existingIdx, 1)
@@ -285,7 +348,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         try {
           const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
           await fs.access(filePath)
-          const fileContent = await fs.readFile(filePath, 'utf-8')
+          let fileContent = await fs.readFile(filePath, 'utf-8')
+
           fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n`
         } catch (e) {
           console.error(`Error reading text file ${fileKey}`, e)
@@ -312,23 +376,26 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ====== ① Gemini 图片模型 ======
+    // ====== ① Gemini 图片模型（按 DB 历史回溯构造 chat history，实现连续对话） ======
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
-      const sessionKey = `${userId}:${options.room.roomId}:${model}`
 
-      // ★★★ 调用处加 await ★★★
-      const chatSession = await getGeminiChatSession(key.key, model, baseUrl, sessionKey, systemMessage)
+      // 1) 构造历史
+      const history = await buildGeminiHistoryFromLastMessageId({
+        lastMessageId: lastContext.parentMessageId,
+        maxContextCount,
+        forGeminiImageModel: true,
+      })
 
+      // 2) 构造本轮输入
       const inputParts: Part[] = []
-
       let promptText = ''
       if (typeof content === 'string') {
-        promptText = content
+        promptText = truncateForGeminiImage(content, GEMINI_IMAGE_MAX_CHARS_PER_TEXT)
       } else if (Array.isArray(content)) {
         for (const part of content) {
           if ((part as any).type === 'text' && (part as any).text) {
-            promptText += `${(part as any).text}\n`
+            promptText += `${truncateForGeminiImage((part as any).text, GEMINI_IMAGE_MAX_CHARS_PER_TEXT)}\n`
           }
         }
       }
@@ -337,30 +404,32 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       if (Array.isArray(content)) {
         for (const part of content) {
           if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
-            const urlStr = (part as any).image_url.url as string
-
-            if (urlStr.startsWith('data:')) {
-              const [header, base64Data] = urlStr.split(',')
-              if (header && base64Data) {
-                const mimeMatch = header.match(/:(.*?);/)
-                const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
-                inputParts.push({ inlineData: { mimeType, data: base64Data } })
-              }
-            }
-            // 本地文件 /uploads/xxx
-            else if (urlStr.includes('/uploads/')) {
-              const filename = path.basename(urlStr)
-              const fileData = await getFileBase64(filename)
-              if (fileData) {
-                inputParts.push({ inlineData: { mimeType: fileData.mime, data: fileData.data } })
-              }
-            }
+            const imgPart = await imageUrlToGeminiInlinePart((part as any).image_url.url as string)
+            if (imgPart) inputParts.push(imgPart)
           }
         }
       }
 
+      // 3) 创建模型实例并行 startChat
+      const genAI = new GoogleGenerativeAI(key.key)
+      const requestOptions: any = {}
+      if (globalConfig.timeoutMs) requestOptions.timeout = globalConfig.timeoutMs
+      if (baseUrl) requestOptions.baseUrl = baseUrl.replace(/\/+$/, '')
+
+      const geminiModel = genAI.getGenerativeModel({
+        model,
+        systemInstruction: systemMessage ? { parts: [{ text: systemMessage }], role: "system" } : undefined
+      }, requestOptions)
+
+      const chatSession = geminiModel.startChat({ history })
+
       const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
+
+      // 如果返回空 candidates，直接抛错
+      if (!response.candidates || response.candidates.length === 0) {
+        throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify(response.usageMetadata ?? {})}`)
+      }
 
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
@@ -382,7 +451,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      if (!text) text = JSON.stringify(response)
+      if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
       const usageRes: any = response.usageMetadata
         ? {
@@ -422,7 +491,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ====== ② 其它模型 ======
+    // ====== ② 其它模型 (OpenAI / Dall-E / Normal Gemini) ======
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -470,11 +539,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
 
     } else {
-      let loopCount = 0;
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
-        loopCount++;
-        // if (loopCount % 5 === 0) console.log(`[DEBUG] 正在生成第 ${loopCount} 个片段... [${userId}]`);
-
         text += chunk.choices[0]?.delta.content ?? ''
         chatIdRes = customMessageId
         modelRes = chunk.model
@@ -508,7 +573,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       if (options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
-        // 重试前清理旧状态
         const index = processThreads.findIndex(d => d.userId === userId)
         if (index > -1) processThreads.splice(index, 1)
 
@@ -517,27 +581,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     globalThis.console.error(error)
 
-    if (isGeminiImageModel) {
-      const sessionKey = `${userId}:${options.room.roomId}:${model}`
-      geminiChats.delete(sessionKey)
-    }
-
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
-    // ★★★ 最后的兜底清理 ★★★
-    console.log(`[DEBUG] 任务彻底结束，清理线程状态。UserId: ${userId}`)
-    console.log(`[DEBUG] Before Splice Size: ${processThreads.length}`)
-
-    // 必须精确匹配 messageId，防止把重试后新 push 进去的给删了
-    // 如果没有 messageId，则按 userId 删第一个
-    // 但这里最稳妥的是按 userId 删，因为并发限制是 per user
     const index = processThreads.findIndex(d => d.userId === userId)
     if (index > -1) processThreads.splice(index, 1)
-
-    console.log(`[DEBUG] After Splice Size: ${processThreads.length}`)
   }
 }
 
@@ -630,6 +680,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       }
       else {
         let responseText = chatInfo.response || ''
+        // 去除冗余的base64 防止加载过慢
         if (responseText.includes('data:image') && responseText.includes('base64')) {
           responseText = responseText.replace(/!$$.*?$$$data:image\/.*?;base64,.*?$/g, '[Image History]')
         }
@@ -682,9 +733,6 @@ function getAccountId(accessToken: string): string {
 }
 
 export function getChatProcessState(userId: string) {
-  // ★★★ 加上详细日志，看列表变化 ★★★
-  console.log(`[DEBUG] Query status: ${userId}. List:`, processThreads.map(t => t.userId))
-
   const thread = processThreads.find(d => d.userId === userId)
   if (thread) {
     return {
