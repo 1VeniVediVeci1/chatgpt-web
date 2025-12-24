@@ -24,6 +24,8 @@ interface SessionResponse {
     key: string
     value: string
   }[]
+  geminiChatModels: string[]
+  nonStreamChatModels: string[]
   usageCountLimit: boolean
   showWatermark: boolean
   userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; config: UserConfig }
