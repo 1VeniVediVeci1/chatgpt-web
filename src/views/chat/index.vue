@@ -59,8 +59,36 @@ const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
 const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatHistory.value?.chatModel ?? userStore.userInfo.config.chatModel)
 
+// ===== 模型分组：Gemini / 非流式(图片) / 其它 =====
+const groupedChatModelOptions = computed(() => {
+  const session = authStore.session
+  const base = session?.chatModels ?? []
+  if (!base.length) return []
+
+  const geminiSet = new Set(session?.geminiChatModels ?? [])
+  const nonStreamSet = new Set(session?.nonStreamChatModels ?? [])
+
+  const gemini: any[] = []
+  const nonStream: any[] = []
+  const others: any[] = []
+
+  // NSelect option interface (label/value)
+  for (const opt of base) {
+    if (geminiSet.has(opt.value)) gemini.push(opt)
+    else if (nonStreamSet.has(opt.value)) nonStream.push(opt)
+    else others.push(opt)
+  }
+
+  const groups: any[] = []
+  if (gemini.length) groups.push({ type: 'group', label: 'Gemini', key: 'g_gemini', children: gemini })
+  if (nonStream.length) groups.push({ type: 'group', label: '非流式/图片模型', key: 'g_nonstream', children: nonStream })
+  if (others.length) groups.push({ type: 'group', label: '其它模型', key: 'g_others', children: others })
+  return groups
+})
+
 const currentNavIndexRef = ref<number>(-1)
 
+// 这里简单用全局配置判断即可，实际可动态判断
 const isVisionModel = ref(true)
 
 let loadingms: MessageReactive
@@ -79,14 +107,10 @@ const textUploadFileKeysRef = ref<string[]>([])
 
 let pollInterval: NodeJS.Timeout | null = null
 
-// Helper: 获取当前房间ID
 function getCurrentRoomId(): number {
   return chatStore.active ? chatStore.active : Number(uuid)
 }
 
-// ================== 核心修复逻辑 ==================
-
-// 1. 状态检查
 async function checkProcessStatus() {
   try {
     stopPolling()
@@ -99,13 +123,9 @@ async function checkProcessStatus() {
       messageId: string | null
     }>()
 
-    // [日志] 状态检查结果
-    // console.log('[Debug] Status Check:', data)
-
     if (data.isProcessing && Number(data.roomId) === roomId) {
       loading.value = true
       
-      // 恢复 lastChatInfo 供 Stop 使用
       lastChatInfo = {
         id: data.messageId,
         conversationId: null,
@@ -115,7 +135,6 @@ async function checkProcessStatus() {
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 如果当前没有任何回复气泡，或者最后是用户消息 -> 补一个 loading 气泡
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(
           roomId,
@@ -132,7 +151,6 @@ async function checkProcessStatus() {
         )
         scrollToBottom()
       } else if (lastItem) {
-        // 如果已有气泡，强制恢复转圈状态
         updateChatSome(roomId, lastIndex, { loading: true })
       }
 
@@ -143,63 +161,42 @@ async function checkProcessStatus() {
   }
 }
 
-// 2. 轮询逻辑
 function startPolling() {
-  stopPolling() // 确保只有一个定时器
+  stopPolling() 
   
-  // console.log('[Debug] Poll started.')
-
   pollInterval = setInterval(async () => {
     try {
       const roomId = getCurrentRoomId()
-      // 如果房间ID没了，停止轮询
       if (!roomId) {
         stopPolling()
         return
       }
 
-      // [重要] 加时间戳防止缓存
       const { data } = await fetchChatProcessStatus<{
         isProcessing: boolean
         roomId: number | null
         messageId: string | null
       }>()
 
-      // console.log('[Debug] Poll result:', data)
-
-      // 1. 如果已经切换房间，忽略旧结果
       if (Number(data.roomId) !== roomId && data.isProcessing) {
-        // 后端在生成别的房间的任务，前端当前房间不展示 loading
-        // 但不要 stopPolling，因为用户可能切回去
         return
       }
 
-      // 2. 仍在生成中
       if (data.isProcessing) {
         loading.value = true
-        // 持续强制设置 loading，防止被 syncChat 覆盖
         const lastIndex = dataSources.value.length - 1
         if (lastIndex > -1 && !dataSources.value[lastIndex].inversion) {
-           // 只有当 loading 不为 true 时才更新，减少渲染开销
            if (!dataSources.value[lastIndex].loading) {
              updateChatSome(roomId, lastIndex, { loading: true })
            }
         }
       } 
-      // 3. 任务结束
       else {
-        console.log('[Debug] Task finished (isProcessing=false). Stopping poll & reload.')
-        
-        // 只有当 loading 确实是 true 的时候才执行结束逻辑，防止重复刷新
         if (loading.value) {
           loading.value = false
           stopPolling()
 
-          // 延迟刷新，确保数据库落盘
-          setTimeout(async () => {
-            console.log('[Debug] Reloading chat history...')
-            
-            // ★★★ 强制清空本地数据，逼迫 UI 重绘 ★★★
+          setTimeout(async () => {            
             const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
             if (chatIndex > -1) {
                chatStore.chat[chatIndex].data = [] 
@@ -209,13 +206,11 @@ function startPolling() {
               { uuid: roomId } as Chat.History,
               undefined,
               () => { 
-                console.log('[Debug] History reloaded.');
                 scrollToBottom() 
               }
             )
-          }, 2000) // 延时 2 秒比较稳妥
+          }, 2000) 
         } else {
-          // 如果 loading 本来就是 false，说明已经处理过了，直接停轮询
           stopPolling()
         }
       }
@@ -233,12 +228,10 @@ function stopPolling() {
   }
 }
 
-// 3. 串行加载链
 const handleLoadingChain = async () => {
   const roomId = getCurrentRoomId()
   if (!roomId) return
 
-  // 在拉历史之前，先停掉旧轮询
   stopPolling()
 
   await chatStore.syncChat(
@@ -246,7 +239,6 @@ const handleLoadingChain = async () => {
     undefined,
     () => {
       firstLoading.value = false
-      
       nextTick(() => {
         const scrollRefDom = document.querySelector('#scrollRef')
         if (scrollRefDom) scrollRefDom.scrollTop = scrollRefDom.scrollHeight
@@ -254,7 +246,6 @@ const handleLoadingChain = async () => {
       if (inputRef.value && !isMobile.value)
         (inputRef.value as any)?.focus()
 
-      // 这里的关键：拉完历史后，再去查状态
       checkProcessStatus()
     }
   )
@@ -262,7 +253,6 @@ const handleLoadingChain = async () => {
 
 const debouncedLoad = debounce(handleLoadingChain, 200)
 
-// ================== 发送消息 ==================
 async function onConversation() {
   let message = prompt.value
 
@@ -288,7 +278,6 @@ async function onConversation() {
   controller = new AbortController()
 
   const chatUuid = Date.now()
-  // 用户消息
   addChat(
     roomId,
     {
@@ -313,7 +302,6 @@ async function onConversation() {
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // AI 占位
   addChat(
     roomId,
     {
@@ -1002,7 +990,7 @@ onUnmounted(() => {
             <NSelect
               style="width: 250px"
               :value="currentChatModel"
-              :options="authStore.session?.chatModels"
+              :options="groupedChatModelOptions"
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
               @update-value="(val) => handleSyncChatModel(val)"
             />
