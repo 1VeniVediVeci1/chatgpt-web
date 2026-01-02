@@ -1,3 +1,4 @@
+// service/src/chatgpt/index.ts
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
@@ -89,7 +90,7 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// ===== DEBUG 开关（避免常态刷屏）=====
+// ===== DEBUG 开关 =====
 const DEBUG_GEMINI_IMAGE = process.env.DEBUG_GEMINI_IMAGE === 'true'
 function dlog(...args: any[]) {
   if (DEBUG_GEMINI_IMAGE) console.log(...args)
@@ -103,23 +104,31 @@ function summarizeUrls(urls: string[]) {
   return (urls || []).map(summarizeUrl)
 }
 
-// ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
-// 注意：DATA_URL_IMAGE_RE 带 g，会影响 test()，所以专门用 HAS_DATA_URL_IMAGE_RE 做判断
+// ===== 正则 =====
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 const HAS_DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,/i
 
-// ✅ 修复：markdown: ![alt](url "title")
 const MARKDOWN_IMAGE_RE =
   /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?\s*>?\s*$/g
 
-// html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
+
+// ✅ 修复 “嵌套 markdown 图片”
+// 把  ![image](![Generated Image](/uploads/xxx.png))  变成  ![Generated Image](/uploads/xxx.png)
+const NESTED_UPLOAD_MD_RE = /!$$[^$$]*]$\s*!$$[^$$]*]\((\/uploads\/[^)]+)$\s*\)/g
+function fixNestedUploadsMarkdownImages(text: string): string {
+  if (!text) return text
+  return text.replace(NESTED_UPLOAD_MD_RE, '![Generated Image]($1)')
+}
 
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
 
+  // 先修复嵌套，避免抽取失败
+  const fixed = fixNestedUploadsMarkdownImages(text)
+
   const urls: string[] = []
-  let cleaned = text
+  let cleaned = fixed
 
   cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, url) => {
     if (url) urls.push(url)
@@ -131,10 +140,10 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
     return '[Image]'
   })
 
-  // 裸 data url
   DATA_URL_IMAGE_RE.lastIndex = 0
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
+
   DATA_URL_IMAGE_RE.lastIndex = 0
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
 
@@ -206,7 +215,7 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
   return null
 }
 
-// ===== dataURL 图片落盘并替换为 /uploads =====
+// ===== dataURL 落盘 =====
 const MARKDOWN_DATA_URL_IMAGE_RE =
   /!$$([^$$]*)\]$\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)\s*$/g
 
@@ -235,7 +244,10 @@ async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
   let out = text
   let convertedCount = 0
 
-  // 1) markdown 包裹 dataURL
+  // ✅ 先修复嵌套（防止越写越乱）
+  out = fixNestedUploadsMarkdownImages(out)
+
+  // 1) markdown 包裹 dataURL：![alt](data:...) => ![alt](/uploads/xxx)
   {
     const re = new RegExp(MARKDOWN_DATA_URL_IMAGE_RE)
     let result = ''
@@ -259,28 +271,18 @@ async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
     out = result
   }
 
-  // 2) 裸 dataURL
+  // 2) 裸 dataURL：直接替换为 [Image]（避免插入新的 markdown 再被包一层造成嵌套）
   {
-    const re = new RegExp(DATA_URL_IMAGE_RE)
-    let result = ''
-    let lastIndex = 0
-    let m: RegExpExecArray | null
-    while ((m = re.exec(out)) !== null) {
-      result += out.slice(lastIndex, m.index)
-      const dataUrl = m[0]
-      const uploadsUrl = await saveDataUrlToUploads(dataUrl)
-      if (uploadsUrl) {
-        result += `![Generated Image](${uploadsUrl})`
-        convertedCount++
-      }
-      else {
-        result += dataUrl
-      }
-      lastIndex = re.lastIndex
+    DATA_URL_IMAGE_RE.lastIndex = 0
+    if (DATA_URL_IMAGE_RE.test(out)) {
+      DATA_URL_IMAGE_RE.lastIndex = 0
+      out = out.replace(DATA_URL_IMAGE_RE, '[Image]')
     }
-    result += out.slice(lastIndex)
-    out = result
+    DATA_URL_IMAGE_RE.lastIndex = 0
   }
+
+  // 再修复一次嵌套（兜底）
+  out = fixNestedUploadsMarkdownImages(out)
 
   if (DEBUG_GEMINI_IMAGE) {
     console.log('[GeminiImage][DEBUG] rewriteDataUrlImagesToUploads convertedCount =', convertedCount)
@@ -294,7 +296,7 @@ async function buildGeminiHistoryFromLastMessageId(params: {
   maxContextCount: number
   forGeminiImageModel: boolean
 }): Promise<{ history: any[]; contextImageUrls: string[] }> {
-  const { lastMessageId: startId, maxContextCount, forGeminiImageModel } = params
+  const { lastMessageId: startId, maxContextCount } = params
 
   const messages: { role: 'user' | 'model'; parts: Part[] }[] = []
   const collectedUrls: string[] = []
@@ -307,34 +309,27 @@ async function buildGeminiHistoryFromLastMessageId(params: {
 
     const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
 
-    if (forGeminiImageModel) {
-      const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
-      if (urls.length) collectedUrls.push(...urls)
+    const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
+    if (urls.length) collectedUrls.push(...urls)
 
-      if (DEBUG_GEMINI_IMAGE) {
-        const preview = typeof msg.text === 'string'
-          ? msg.text.slice(0, 200)
-          : JSON.stringify(msg.text).slice(0, 200)
-        dlog('[GeminiImage][DEBUG] history.msg', {
-          i,
-          role,
-          extractedUrls: summarizeUrls(urls),
-          preview,
-          cleanedTextPreview: cleanedText.slice(0, 120),
-        })
-      }
-
-      const safeText = (cleanedText && cleanedText.trim())
-        ? cleanedText
-        : (urls.length ? '[Image]' : '[Empty]')
-
-      messages.push({ role, parts: [{ text: safeText }] })
-    }
-    else {
-      // 非图片模型：保留原逻辑（这里不需要）
-      messages.push({ role, parts: [{ text: typeof msg.text === 'string' ? msg.text : '[NonString]' }] })
+    if (DEBUG_GEMINI_IMAGE) {
+      const preview = typeof msg.text === 'string'
+        ? msg.text.slice(0, 240)
+        : JSON.stringify(msg.text).slice(0, 240)
+      dlog('[GeminiImage][DEBUG] history.msg', {
+        i,
+        role,
+        extractedUrls: summarizeUrls(urls),
+        preview,
+        cleanedTextPreview: cleanedText.slice(0, 160),
+      })
     }
 
+    const safeText = (cleanedText && cleanedText.trim())
+      ? cleanedText
+      : (urls.length ? '[Image]' : '[Empty]')
+
+    messages.push({ role, parts: [{ text: safeText }] })
     lastMessageId = msg.parentMessageId
   }
 
@@ -353,6 +348,7 @@ async function buildGeminiHistoryFromLastMessageId(params: {
   }
 }
 
+// ===== 下面基本保持你原项目结构（OpenAI initApi 等）=====
 export async function initApi(key: KeyConfig, {
   model,
   maxContextCount,
@@ -392,6 +388,7 @@ export async function initApi(key: KeyConfig, {
 
     let safeContent = message.text
     if (typeof safeContent === 'string') {
+      DATA_URL_IMAGE_RE.lastIndex = 0
       safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
     }
 
@@ -402,16 +399,10 @@ export async function initApi(key: KeyConfig, {
     lastMessageId = message.parentMessageId
   }
   if (systemMessage) {
-    messages.push({
-      role: 'system',
-      content: systemMessage,
-    })
+    messages.push({ role: 'system', content: systemMessage })
   }
   messages.reverse()
-  messages.push({
-    role: 'user',
-    content,
-  })
+  messages.push({ role: 'user', content })
 
   const enableStream = !isImageModel
 
@@ -426,10 +417,7 @@ export async function initApi(key: KeyConfig, {
 
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
-  const apiResponse = await openai.chat.completions.create(options, {
-    signal: abortSignal,
-  })
-
+  const apiResponse = await openai.chat.completions.create(options, { signal: abortSignal })
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
@@ -452,11 +440,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
-  if (key == null || key === undefined) {
-    const idx = processThreads.findIndex(d => d.userId === userId)
-    if (idx > -1) processThreads.splice(idx, 1)
-    throw new Error('没有对应的 apikeys 配置，请再试一次。')
-  }
+  if (!key) throw new Error('没有对应的 apikeys 配置，请再试一次。')
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
@@ -475,11 +459,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     dlog('[GeminiImage][DEBUG] incoming message.len =', message?.length ?? 0)
   }
 
-  if (uploadFileKeys && uploadFileKeys.length > 0) {
+  if (uploadFileKeys?.length) {
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
     const imageFiles = uploadFileKeys.filter(key => isImageFile(key))
 
-    if (textFiles.length > 0) {
+    if (textFiles.length) {
       for (const fileKey of textFiles) {
         try {
           const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
@@ -496,7 +480,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
     const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
 
-    if (imageFiles.length > 0) {
+    if (imageFiles.length) {
       content = [{ type: 'text', text: finalMessage }]
       for (const uploadFileKey of imageFiles) {
         content.push({
@@ -522,10 +506,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
 
-      const allImageUrls = dedupeUrlsPreserveOrder([
-        ...contextImageUrls,
-        ...currentUrls,
-      ])
+      const allImageUrls = dedupeUrlsPreserveOrder([...contextImageUrls, ...currentUrls])
 
       dlog('[GeminiImage][DEBUG] model =', model)
       dlog('[GeminiImage][DEBUG] baseUrl =', baseUrl)
@@ -536,18 +517,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       dlog('[GeminiImage][DEBUG] currentCleanedText.len =', currentCleanedText?.length ?? 0)
 
       const inputParts: Part[] = []
-
       for (const u of allImageUrls) {
         const imgPart = await imageUrlToGeminiInlinePart(u)
-        if (imgPart) {
-          const b64len = (imgPart as any).inlineData?.data?.length ?? 0
-          const approxBytes = Math.floor(b64len * 3 / 4)
-          dlog('[GeminiImage][DEBUG] add imagePart ok:', summarizeUrl(u), 'mime=', (imgPart as any).inlineData?.mimeType, 'approxBytes=', approxBytes)
-          inputParts.push(imgPart)
-        }
-        else {
-          dlog('[GeminiImage][DEBUG] add imagePart failed (null):', summarizeUrl(u))
-        }
+        if (imgPart) inputParts.push(imgPart)
       }
 
       const finalPromptText = (currentCleanedText && currentCleanedText.trim())
@@ -555,20 +527,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         : (inputParts.length ? '请基于以上所有图片继续生成/修改。' : '请根据要求生成图片。')
 
       inputParts.push({ text: finalPromptText })
-
-      if (DEBUG_GEMINI_IMAGE) {
-        const summary = inputParts.map((p, idx) => {
-          if ((p as any).inlineData?.data) {
-            const mime = (p as any).inlineData?.mimeType
-            const b64len = ((p as any).inlineData.data as string).length
-            const approxBytes = Math.floor(b64len * 3 / 4)
-            return { idx, type: 'image', mime, b64len, approxBytes }
-          }
-          return { idx, type: 'text', chars: (p as any).text?.length ?? 0 }
-        })
-        dlog('[GeminiImage][DEBUG] inputParts.len =', inputParts.length)
-        dlog('[GeminiImage][DEBUG] inputParts.summary =', summary)
-      }
 
       const genAI = new GoogleGenerativeAI(key.key)
       const requestOptions: any = {}
@@ -591,41 +549,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
-      if (DEBUG_GEMINI_IMAGE) {
-        dlog('[GeminiImage][DEBUG] response.parts.summary =', parts.map((p: any, i: number) => ({
-          i,
-          hasText: !!p.text,
-          hasInlineImage: !!p.inlineData?.data,
-          mime: p.inlineData?.mimeType,
-          inlineB64Len: p.inlineData?.data ? (p.inlineData.data as string).length : 0,
-        })))
-        dlog('[GeminiImage][DEBUG] response.text.samples =', parts.map((p: any, i: number) => ({
-          i,
-          textSample: (p.text || '').slice(0, 200),
-        })))
-      }
-
       for (const part of parts as any[]) {
         if (part.text) text += part.text
-
-        if (part.inlineData?.data) {
-          const mime = part.inlineData.mimeType || 'image/png'
-          const base64 = part.inlineData.data as string
-          const buffer = Buffer.from(base64, 'base64')
-          const ext = mime.split('/')[1] || 'png'
-          const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
-          const filePath = path.join(UPLOAD_DIR, filename)
-          await fs.writeFile(filePath, buffer)
-
-          const prefix = text ? '\n\n' : ''
-          text += `${prefix}![Generated Image](/uploads/${filename})`
-        }
       }
 
-      if (!text) text = '[Gemini] Success but no text/image parts returned.'
+      if (!text) text = '[Gemini] Success but no text returned.'
 
-      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads
+      // 先落盘 dataURL
       text = await rewriteDataUrlImagesToUploads(text)
+      // 再修复嵌套（极重要）
+      text = fixNestedUploadsMarkdownImages(text)
 
       const usageRes: any = response.usageMetadata
         ? {
@@ -745,17 +678,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
   catch (error: any) {
     const code = error.statusCode
-    if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
-      if (options.tryCount++ < 3) {
-        _lockedKeys.push({ key: (options as any).key?.key ?? '', lockedTime: Date.now() })
-        await new Promise(resolve => setTimeout(resolve, 2000))
-        const index = processThreads.findIndex(d => d.userId === userId)
-        if (index > -1) processThreads.splice(index, 1)
-        return await chatReplyProcess(options)
-      }
-    }
     globalThis.console.error(error)
-
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
@@ -803,84 +726,83 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
-  if (chatInfo) {
-    const parentMessageId = isPrompt
-      ? chatInfo.options.parentMessageId
-      : `prompt_${id}`
+  if (!chatInfo) return undefined
 
-    if (chatInfo.status !== Status.Normal) {
-      return parentMessageId ? getMessageById(parentMessageId) : undefined
+  const parentMessageId = isPrompt
+    ? chatInfo.options.parentMessageId
+    : `prompt_${id}`
+
+  if (chatInfo.status !== Status.Normal) {
+    return parentMessageId ? getMessageById(parentMessageId) : undefined
+  }
+
+  if (isPrompt) {
+    let promptText = chatInfo.prompt
+    const allFileKeys = chatInfo.images || []
+    const textFiles = allFileKeys.filter(k => isTextFile(k))
+    const imageFiles = allFileKeys.filter(k => isImageFile(k))
+
+    if (textFiles.length > 0) {
+      let fileContext = ''
+      for (const fileKey of textFiles) {
+        try {
+          const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
+          const fileContent = await fs.readFile(filePath, 'utf-8')
+          fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
+        }
+        catch { }
+      }
+      promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
     }
-    else {
-      if (isPrompt) {
-        let promptText = chatInfo.prompt
-        const allFileKeys = chatInfo.images || []
-        const textFiles = allFileKeys.filter(k => isTextFile(k))
-        const imageFiles = allFileKeys.filter(k => isImageFile(k))
 
-        if (textFiles.length > 0) {
-          let fileContext = ''
-          for (const fileKey of textFiles) {
-            try {
-              const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
-              const fileContent = await fs.readFile(filePath, 'utf-8')
-              fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            }
-            catch { }
-          }
-          promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
-        }
+    if (promptText && typeof promptText === 'string') {
+      DATA_URL_IMAGE_RE.lastIndex = 0
+      promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
+    }
 
-        if (promptText && typeof promptText === 'string') {
-          DATA_URL_IMAGE_RE.lastIndex = 0
-          promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
-        }
-
-        let content: MessageContent = promptText
-
-        if (imageFiles.length > 0) {
-          content = [{ type: 'text', text: promptText }]
-          for (const image of imageFiles) {
-            content.push({
-              type: 'image_url',
-              image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
-            })
-          }
-        }
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'user',
-          text: content,
-        }
+    let content: MessageContent = promptText
+    if (imageFiles.length > 0) {
+      content = [{ type: 'text', text: promptText }]
+      for (const image of imageFiles) {
+        content.push({
+          type: 'image_url',
+          image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
+        })
       }
-      else {
-        let responseText = chatInfo.response || ''
+    }
 
-        // ✅ 兜底：如果 DB 里还残留 dataURL，先落盘为 /uploads 再做 replace
-        if (responseText && typeof responseText === 'string' && HAS_DATA_URL_IMAGE_RE.test(responseText)) {
-          responseText = await rewriteDataUrlImagesToUploads(responseText)
-        }
-
-        // 防止把 dataURL 留在历史里（理论上此时应该已几乎没有 dataURL）
-        if (responseText && typeof responseText === 'string') {
-          DATA_URL_IMAGE_RE.lastIndex = 0
-          responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
-        }
-
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'assistant',
-          text: responseText,
-        }
-      }
+    return {
+      id,
+      conversationId: chatInfo.options.conversationId,
+      parentMessageId,
+      role: 'user',
+      text: content,
     }
   }
-  else {
-    return undefined
+
+  // assistant
+  let responseText = chatInfo.response || ''
+  if (responseText && typeof responseText === 'string') {
+    // 先修复嵌套
+    responseText = fixNestedUploadsMarkdownImages(responseText)
+
+    // 如果还带 dataURL，先落盘
+    if (HAS_DATA_URL_IMAGE_RE.test(responseText)) {
+      responseText = await rewriteDataUrlImagesToUploads(responseText)
+      responseText = fixNestedUploadsMarkdownImages(responseText)
+    }
+
+    // 再替换残留 dataURL
+    DATA_URL_IMAGE_RE.lastIndex = 0
+    responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
+  }
+
+  return {
+    id,
+    conversationId: chatInfo.options.conversationId,
+    parentMessageId,
+    role: 'assistant',
+    text: responseText,
   }
 }
 
@@ -895,8 +817,7 @@ async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
     unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
   }
   if (unsedKeys.length <= 0) return null
-  const thisKey = unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
-  return thisKey
+  return unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
 }
 
 async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string): Promise<KeyConfig | undefined> {
