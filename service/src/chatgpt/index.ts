@@ -199,9 +199,11 @@ const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 // 用于捕获 mime 与 base64，以便落盘
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
 
-// ✅ 修复：Markdown 图片正则（原先那条写坏了，导致无法从历史中抽取 /uploads/...）
-// 支持：![alt](url) 以及 ![alt](url "title")
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?\s*>?\s*$/g
+// 更宽松：先抓出括号内整体内容，再手动解析 URL（兼容 title、换行、额外参数）
+const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([\s\S]*?)\s*$/g
+
+// 兜底：直接抓 /uploads/...（防止某些奇怪 Markdown 没被上面捕获）
+const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
 
 // html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
@@ -260,22 +262,36 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
   const urls: string[] = []
   let cleaned = text
 
-  // markdown: ![alt](url)
-  cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, url) => {
-    if (url) urls.push(url)
+  // 1) markdown: ![alt](...anything...)
+  // 拿到括号内整体内容后：
+  // - 去掉首尾尖括号 <...>
+  // - 取第一个 token 作为 URL（避免 title/参数影响）
+  cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, inside) => {
+    const raw = String(inside ?? '').trim()
+    if (raw) {
+      // 例如：/uploads/a.png "title"  或  <...> "title"
+      const firstToken = raw.split(/\s+/)[0] || ''
+      const url = firstToken.replace(/^<|>$/g, '').trim()
+      if (url) urls.push(url)
+    }
     return '[Image]'
   })
 
-  // html: <img src="...">
+  // 2) html: <img src="...">
   cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => {
     if (url) urls.push(url)
     return '[Image]'
   })
 
-  // 裸 data url
+  // 3) 裸 data url
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
+
+  // 4) 兜底：直接匹配 /uploads/xxx.(png|jpg|...)
+  const uploadUrls = cleaned.match(UPLOADS_URL_RE)
+  if (uploadUrls?.length) urls.push(...uploadUrls)
+  cleaned = cleaned.replace(UPLOADS_URL_RE, '[Image]')
 
   return { cleanedText: cleaned, urls }
 }
