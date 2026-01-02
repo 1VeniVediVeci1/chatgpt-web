@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import { GoogleGenerativeAI, type ChatSession, type Part } from '@google/generative-ai'
+import { GoogleGenerativeAI, type Part } from '@google/generative-ai'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -94,9 +94,16 @@ const _lockedKeys: { key: string; lockedTime: number }[] = []
 
 // ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'])?\s*>?\s*$/g
+
+// markdown: ![alt](url)
+const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?\s*>?\s*$/g
+// html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 
+/**
+ * 从一段文本中抽取所有图片 URL，并把图片位置替换成占位符 [Image]
+ * - 支持 markdown 图片、HTML img、裸 data:image base64
+ */
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
 
@@ -115,12 +122,59 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
     return '[Image]'
   })
 
-  // 裸 data url（直接贴 data:image...）
+  // 裸 data url
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
 
   return { cleanedText: cleaned, urls }
+}
+
+/**
+ * 从 MessageContent(可能是 string 或 OpenAI 多模态数组) 中：
+ * 1) 抽取所有图片 url
+ * 2) 返回“清理后的文本”(图片位置替换成 [Image])
+ */
+async function extractImageUrlsFromMessageContent(content: MessageContent): Promise<{ cleanedText: string; urls: string[] }> {
+  const urls: string[] = []
+  let cleanedText = ''
+
+  if (typeof content === 'string') {
+    const r = extractImageUrlsFromText(content)
+    cleanedText = r.cleanedText
+    urls.push(...r.urls)
+    if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'
+    return { cleanedText, urls }
+  }
+
+  if (Array.isArray(content)) {
+    for (const p of content as any[]) {
+      if (p?.type === 'text' && p.text) {
+        const r = extractImageUrlsFromText(p.text)
+        if (r.cleanedText) cleanedText += (cleanedText ? '\n' : '') + r.cleanedText
+        if (r.urls.length) urls.push(...r.urls)
+      }
+      else if (p?.type === 'image_url' && p.image_url?.url) {
+        urls.push(p.image_url.url)
+      }
+    }
+    if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'
+    return { cleanedText, urls }
+  }
+
+  return { cleanedText: '', urls }
+}
+
+function dedupeUrlsPreserveOrder(urls: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const u of urls) {
+    if (!u) continue
+    if (seen.has(u)) continue
+    seen.add(u)
+    out.push(u)
+  }
+  return out
 }
 
 async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> {
@@ -197,9 +251,7 @@ async function messageContentToGeminiParts(content: MessageContent, forGeminiIma
  */
 function extractLastUploadsImageFromAssistantMarkdown(text: string): string | null {
   if (!text) return null
-
   const re = /!$$[^$$]*]$(\/uploads\/[^)]+)$/g
-
   let last: string | null = null
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) last = m[1]
@@ -208,14 +260,18 @@ function extractLastUploadsImageFromAssistantMarkdown(text: string): string | nu
 
 /**
  * 核心逻辑：按原有 DB 链条回溯，构造 Gemini 需要的 history
+ * 但：history 中不再放任何 inlineData 图片，只保留文本占位符；
+ * 同时把“上下文中出现过的所有图片 URL”收集出来，供最新一轮 inputParts 使用。
  */
 async function buildGeminiHistoryFromLastMessageId(params: {
   lastMessageId?: string
   maxContextCount: number
   forGeminiImageModel: boolean
-}): Promise<any[]> {
+}): Promise<{ history: any[]; contextImageUrls: string[] }> {
   const { lastMessageId: startId, maxContextCount, forGeminiImageModel } = params
-  const messages: { role: 'user' | 'model'; parts: Part[]; rawText?: string }[] = []
+
+  const messages: { role: 'user' | 'model'; parts: Part[] }[] = []
+  const collectedUrls: string[] = []
 
   let lastMessageId = startId
   for (let i = 0; i < maxContextCount; i++) {
@@ -225,37 +281,35 @@ async function buildGeminiHistoryFromLastMessageId(params: {
 
     // 系统内部 assistant 对应 Gemini model
     const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
-    const parts = await messageContentToGeminiParts(msg.text, forGeminiImageModel)
-    const rawText = typeof msg.text === 'string' ? msg.text : ''
 
-    messages.push({ role, parts, rawText })
+    if (forGeminiImageModel) {
+      // 1) 抽取图片 URL（包含 assistant 生成的 /uploads 与 user 上传 data url）
+      const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
+      if (urls.length) collectedUrls.push(...urls)
+
+      // 2) history 里只放文本（图片位置用 [Image] 占位符）
+      const safeText = (cleanedText && cleanedText.trim())
+        ? cleanedText
+        : (urls.length ? '[Image]' : '[Empty]')
+
+      messages.push({ role, parts: [{ text: safeText }] })
+    }
+    else {
+      // 非图片模型：保留原逻辑
+      const parts = await messageContentToGeminiParts(msg.text, false)
+      messages.push({ role, parts })
+    }
+
     lastMessageId = msg.parentMessageId
   }
 
-  // 数据库回溯是倒序的，需反转回正序
   messages.reverse()
+  collectedUrls.reverse()
 
-  // 保持与原代码一致：从最近的 assistant 消息中提取生成的图，作为 model part 传回去
-  // 但为了避免重复：若该条消息 parts 已经有 inlineData，则不再追加
-  if (forGeminiImageModel) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i]
-      if (m.role !== 'model') continue
-
-      const alreadyHasInline = (m.parts || []).some(p => !!(p as any)?.inlineData?.data)
-      if (!alreadyHasInline) {
-        const imgPath = extractLastUploadsImageFromAssistantMarkdown(m.rawText || '')
-        if (imgPath) {
-          const imgPart = await imageUrlToGeminiInlinePart(imgPath)
-          if (imgPart) m.parts.push(imgPart)
-        }
-      }
-      break // 只取最近的一张
-    }
+  return {
+    history: messages.map(m => ({ role: m.role, parts: m.parts })),
+    contextImageUrls: dedupeUrlsPreserveOrder(collectedUrls),
   }
-
-  // 转换为 Gemini SDK 需要的格式
-  return messages.map(m => ({ role: m.role, parts: m.parts }))
 }
 
 export async function initApi(key: KeyConfig, {
@@ -441,57 +495,42 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ====== ① Gemini 图片模型（按 DB 历史回溯构造 chat history，实现连续对话） ======
+    // ====== ① Gemini 图片模型（上下文所有图放进最新一轮 inputParts；history 只保留占位符） ======
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
 
-      // 1) 构造历史（与原逻辑一致：从 lastContext.parentMessageId 回溯）
-      const history = await buildGeminiHistoryFromLastMessageId({
+      // 1) 构造历史（history 仅文本，占位符保留；同时收集上下文图片 URLs）
+      const { history, contextImageUrls } = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
         forGeminiImageModel: true,
       })
 
-      // 2) 构造本轮输入（去除截断限制：不再 truncate）
+      // 2) 抽取本轮输入：文本(保留占位符) + 本轮图片 URLs
+      const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
+
+      // 3) 合并“上下文所有图 + 本轮所有图”，去重
+      const allImageUrls = dedupeUrlsPreserveOrder([
+        ...contextImageUrls,
+        ...currentUrls,
+      ])
+
+      // 4) 构造 inputParts：把所有图都塞进最新一轮，再塞文本指令
       const inputParts: Part[] = []
-      let promptText = ''
 
-      if (typeof content === 'string') {
-        // 同样把文本里的 dataURL/markdown 图转换为 inline part
-        const { cleanedText, urls } = extractImageUrlsFromText(content)
-        if (cleanedText) promptText += cleanedText
-        if (promptText) inputParts.push({ text: promptText })
-
-        for (const u of urls) {
-          const imgPart = await imageUrlToGeminiInlinePart(u)
-          if (imgPart) inputParts.push(imgPart)
-        }
-      }
-      else if (Array.isArray(content)) {
-        // 聚合 text + image_url
-        let combinedText = ''
-        const extraImageUrls: string[] = []
-
-        for (const part of content) {
-          if ((part as any).type === 'text' && (part as any).text) {
-            const { cleanedText, urls } = extractImageUrlsFromText((part as any).text)
-            if (cleanedText) combinedText += `${cleanedText}\n`
-            if (urls.length) extraImageUrls.push(...urls)
-          }
-          else if ((part as any).type === 'image_url' && (part as any).image_url?.url) {
-            extraImageUrls.push((part as any).image_url.url as string)
-          }
-        }
-
-        if (combinedText.trim()) inputParts.push({ text: combinedText.trim() })
-
-        for (const u of extraImageUrls) {
-          const imgPart = await imageUrlToGeminiInlinePart(u)
-          if (imgPart) inputParts.push(imgPart)
-        }
+      for (const u of allImageUrls) {
+        const imgPart = await imageUrlToGeminiInlinePart(u)
+        if (imgPart) inputParts.push(imgPart)
       }
 
-      // 3) 创建模型实例并行 startChat
+      // 文字必须有
+      const finalPromptText = (currentCleanedText && currentCleanedText.trim())
+        ? currentCleanedText.trim()
+        : (inputParts.length ? '请基于以上所有图片继续生成/修改。' : '请根据要求生成图片。')
+
+      inputParts.push({ text: finalPromptText })
+
+      // 5) 创建模型实例并 startChat
       const genAI = new GoogleGenerativeAI(key.key)
       const requestOptions: any = {}
       if (globalConfig.timeoutMs) requestOptions.timeout = globalConfig.timeoutMs
@@ -503,11 +542,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }, requestOptions)
 
       const chatSession = geminiModel.startChat({ history })
-
       const result = await chatSession.sendMessage(inputParts)
       const response = await result.response
 
-      // 如果返回空 candidates，直接抛错
       if (!response.candidates || response.candidates.length === 0) {
         throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify(response.usageMetadata ?? {})}`)
       }
