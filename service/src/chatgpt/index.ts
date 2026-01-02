@@ -90,7 +90,7 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// ===== DEBUG 开关 =====
+// ===== DEBUG 开关（避免常态刷屏）=====
 const DEBUG_GEMINI_IMAGE = process.env.DEBUG_GEMINI_IMAGE === 'true'
 function dlog(...args: any[]) {
   if (DEBUG_GEMINI_IMAGE) console.log(...args)
@@ -277,6 +277,94 @@ function extractLastUploadsImageFromAssistantMarkdown(text: string): string | nu
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) last = m[1]
   return last
+}
+
+// ===== 把 Gemini 返回的 dataURL 图片（在 text 里）落盘成 /uploads，并替换成 /uploads 链接 =====
+const MARKDOWN_DATA_URL_IMAGE_RE =
+  /!$$([^$$]*)\]$\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)\s*$/g
+
+async function saveDataUrlToUploads(dataUrl: string): Promise<string | null> {
+  try {
+    const [header, base64Data] = dataUrl.split(',')
+    if (!header || !base64Data) return null
+    const mimeMatch = header.match(/data:([^;]+);base64/i)
+    const mime = mimeMatch?.[1] || 'image/png'
+    const buffer = Buffer.from(base64Data, 'base64')
+    const ext = mime.split('/')[1] || 'png'
+    const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
+    await ensureUploadDir()
+    await fs.writeFile(path.join(UPLOAD_DIR, filename), buffer)
+    return `/uploads/${filename}`
+  }
+  catch (e) {
+    console.error('[GeminiImage] saveDataUrlToUploads failed:', e)
+    return null
+  }
+}
+
+/**
+ * 把文本里所有 dataURL 图片：
+ * 1) markdown: ![alt](data:image...base64,xxx) => ![alt](/uploads/xxx.png)
+ * 2) 裸 data:image...base64,xxx => ![Generated Image](/uploads/xxx.png)
+ */
+async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
+  if (!text) return text
+
+  let out = text
+  let convertedCount = 0
+
+  // 1) 先处理 markdown 包裹的 dataURL
+  {
+    const re = new RegExp(MARKDOWN_DATA_URL_IMAGE_RE)
+    let result = ''
+    let lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = re.exec(out)) !== null) {
+      result += out.slice(lastIndex, m.index)
+      const alt = m[1] || 'image'
+      const dataUrl = m[2]
+      const uploadsUrl = await saveDataUrlToUploads(dataUrl)
+      if (uploadsUrl) {
+        result += `![${alt}](${uploadsUrl})`
+        convertedCount++
+      }
+      else {
+        result += m[0]
+      }
+      lastIndex = re.lastIndex
+    }
+    result += out.slice(lastIndex)
+    out = result
+  }
+
+  // 2) 再处理“裸 dataURL”（不在 markdown 里）
+  {
+    const re = new RegExp(DATA_URL_IMAGE_RE)
+    let result = ''
+    let lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = re.exec(out)) !== null) {
+      result += out.slice(lastIndex, m.index)
+      const dataUrl = m[0]
+      const uploadsUrl = await saveDataUrlToUploads(dataUrl)
+      if (uploadsUrl) {
+        result += `![Generated Image](${uploadsUrl})`
+        convertedCount++
+      }
+      else {
+        result += dataUrl
+      }
+      lastIndex = re.lastIndex
+    }
+    result += out.slice(lastIndex)
+    out = result
+  }
+
+  if (DEBUG_GEMINI_IMAGE) {
+    console.log('[GeminiImage][DEBUG] rewriteDataUrlImagesToUploads convertedCount =', convertedCount)
+  }
+
+  return out
 }
 
 /**
@@ -624,20 +712,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           mime: p.inlineData?.mimeType,
           inlineB64Len: p.inlineData?.data ? (p.inlineData.data as string).length : 0,
         })))
-      }
-      if (DEBUG_GEMINI_IMAGE) {
-        const textSamples = parts.map((p: any, i: number) => ({
+        dlog('[GeminiImage][DEBUG] response.text.samples =', parts.map((p: any, i: number) => ({
           i,
           textSample: (p.text || '').slice(0, 300),
-        }))
-        console.log('[GeminiImage][DEBUG] response.text.samples =', textSamples)
+        })))
       }
-      for (const part of parts) {
-        if ((part as any).text) text += (part as any).text
 
-        if ((part as any).inlineData?.data) {
-          const mime = (part as any).inlineData.mimeType || 'image/png'
-          const base64 = (part as any).inlineData.data as string
+      for (const part of parts as any[]) {
+        if (part.text) text += part.text
+
+        // 只有 SDK 的 inlineData 才会走这里
+        if (part.inlineData?.data) {
+          const mime = part.inlineData.mimeType || 'image/png'
+          const base64 = part.inlineData.data as string
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
@@ -650,6 +737,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
+
+      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads，避免下一轮丢失图片上下文
+      text = await rewriteDataUrlImagesToUploads(text)
 
       const usageRes: any = response.usageMetadata
         ? {
