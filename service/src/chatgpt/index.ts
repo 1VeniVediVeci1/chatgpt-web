@@ -193,11 +193,11 @@ function debugGeminiHistory(history: any[]) {
 }
 // ====================================================================
 
-// ====== Gemini 图片模型防爆 & 工具函数 ======
-// 你的要求：去除 GEMINI_IMAGE_MAX_CHARS_PER_TEXT 截断限制，所以不再截断文本。
-
 // ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
+
+// 用于捕获 mime 与 base64，以便落盘
+const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
 
 // ✅ 修复：Markdown 图片正则（原先那条写坏了，导致无法从历史中抽取 /uploads/...）
 // 支持：![alt](url) 以及 ![alt](url "title")
@@ -205,6 +205,50 @@ const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?
 
 // html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
+
+/**
+ * 把 text 里出现的 data:image/...;base64,... 全部落盘到 /uploads
+ * 并把 dataURL 替换为 /uploads/xxx.ext
+ *
+ * 这样 DB 里会存 ![image](/uploads/xxx.png) 而不是超长 base64
+ */
+async function replaceDataUrlImagesWithUploads(text: string): Promise<{
+  text: string
+  saved: Array<{ mime: string; filename: string; bytes: number }>
+}> {
+  if (!text) return { text: '', saved: [] }
+
+  const saved: Array<{ mime: string; filename: string; bytes: number }> = []
+  let out = ''
+  let lastIndex = 0
+
+  const matches = text.matchAll(DATA_URL_IMAGE_CAPTURE_RE)
+  for (const m of matches) {
+    const full = m[0]
+    const mime = m[1]
+    const base64 = m[2]
+    const idx = m.index ?? -1
+    if (idx < 0) continue
+
+    out += text.slice(lastIndex, idx)
+
+    const buffer = Buffer.from(base64, 'base64')
+    const ext = mime.split('/')[1] || 'png'
+    const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
+    const filePath = path.join(UPLOAD_DIR, filename)
+    await fs.writeFile(filePath, buffer)
+
+    saved.push({ mime, filename, bytes: buffer.length })
+
+    // 仅替换 dataURL 本体，Markdown 的 ![](...) 结构会保持
+    out += `/uploads/${filename}`
+
+    lastIndex = idx + full.length
+  }
+
+  out += text.slice(lastIndex)
+  return { text: out, saved }
+}
 
 /**
  * 从一段文本中抽取所有图片 URL，并把图片位置替换成占位符 [Image]
@@ -661,12 +705,27 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
-      for (const part of parts) {
-        if (part.text) text += part.text
+      for (const part of parts as any[]) {
+        // ① 先处理 text：Gemini 有时把图片用 Markdown(dataURL) 塞进 text
+        if (part?.text) {
+          const rawText = part.text as string
+          const replaced = await replaceDataUrlImagesWithUploads(rawText)
 
-        if ((part as any).inlineData?.data) {
-          const mime = (part as any).inlineData.mimeType || 'image/png'
-          const base64 = (part as any).inlineData.data as string
+          if (isGeminiImageDebugEnabled() && replaced.saved.length) {
+            console.log('[GeminiImage DEBUG] extractedDataUrlImagesFromText=', replaced.saved.map(s => ({
+              mime: s.mime,
+              filename: s.filename,
+              bytes: s.bytes,
+            })))
+          }
+
+          text += replaced.text
+        }
+
+        // ② 再处理 inlineData：兼容某些模型确实会用 inlineData 返回图片
+        if (part?.inlineData?.data) {
+          const mime = part.inlineData.mimeType || 'image/png'
+          const base64 = part.inlineData.data as string
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
@@ -674,12 +733,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           await fs.writeFile(filePath, buffer)
 
           if (isGeminiImageDebugEnabled()) {
-            console.log('[GeminiImage DEBUG] savedImage=', {
+            console.log('[GeminiImage DEBUG] savedImageFromInlineData=', {
               mime,
-              base64: safeBase64Preview(base64),
               bytes: buffer.length,
               filename,
               filePath,
+              base64: safeBase64Preview(base64),
             })
           }
 
@@ -923,6 +982,8 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       else {
         let responseText = chatInfo.response || ''
         // 去除冗余的base64 防止加载过慢/上下文爆炸
+        // 注意：我们在生成阶段已经会把 dataURL 落盘成 /uploads，
+        // 所以这里替换主要是兜底处理旧数据/异常数据。
         if (responseText && typeof responseText === 'string') {
           responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
         }
