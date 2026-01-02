@@ -192,12 +192,13 @@ function debugGeminiHistory(history: any[]) {
 }
 // ====================================================================
 
-// ====== 图片正则 / 占位符体系（Image#n）+ 映射表 ======
+// ====== Image#n 占位符体系 + 映射表 ======
 type ImageRef = {
   tag: string // Image#1
   placeholder: string // [Image#1]
   url: string // /uploads/... or data:image...
 }
+
 type ImageMapItem = ImageRef & {
   role: 'user' | 'model'
   sourceMessageId: string
@@ -220,7 +221,7 @@ function isLikelyImageUrl(u: string) {
   return false
 }
 
-// ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
+// ====== 解析文本中的图片引用 ======
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
 
@@ -275,7 +276,7 @@ async function replaceDataUrlImagesWithUploads(text: string): Promise<{
 }
 
 /**
- * 从文本中抽取图片，并替换为 [Image#n] 占位符，同时返回映射
+ * 从文本中抽取图片，并替换为 [Image#n] 占位符，同时返回映射（只负责抽取）
  */
 function extractImageRefsFromTextWithNumbering(text: string, nextIndexRef: { value: number }): { cleanedText: string; images: ImageRef[] } {
   if (!text) return { cleanedText: '', images: [] }
@@ -288,7 +289,7 @@ function extractImageRefsFromTextWithNumbering(text: string, nextIndexRef: { val
     const raw = String(inside ?? '').trim()
     const firstToken = raw.split(/\s+/)[0] || ''
     const url = firstToken.replace(/^<|>$/g, '').trim()
-    // 只有像图片 URL 才入表；否则只是占位符/垃圾内容就不入表，但仍替换掉
+
     nextIndexRef.value += 1
     const tag = makeImageTag(nextIndexRef.value)
     const placeholder = makePlaceholder(tag)
@@ -400,7 +401,7 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
   return null
 }
 
-async function messageContentToGeminiParts(content: MessageContent, forGeminiImageModel: boolean): Promise<Part[]> {
+async function messageContentToGeminiParts(content: MessageContent): Promise<Part[]> {
   const parts: Part[] = []
 
   if (typeof content === 'string') {
@@ -446,7 +447,6 @@ async function buildGeminiHistoryFromLastMessageId(params: {
 
     const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
     rawMsgs.push({ id: msg.id, role, content: msg.text })
-
     lastMessageId = msg.parentMessageId
   }
 
@@ -462,7 +462,6 @@ async function buildGeminiHistoryFromLastMessageId(params: {
     if (forGeminiImageModel) {
       const { cleanedText, images } = await extractImageRefsFromMessageContentWithNumbering(m.content, nextIndexRef)
 
-      // 记录映射表（只记录像图片 URL 的项）
       for (const img of images) {
         if (!isLikelyImageUrl(img.url)) continue
         imageMap.push({
@@ -480,7 +479,7 @@ async function buildGeminiHistoryFromLastMessageId(params: {
       history.push({ role: m.role, parts: [{ text: safeText }] })
     }
     else {
-      const parts = await messageContentToGeminiParts(m.content, false)
+      const parts = await messageContentToGeminiParts(m.content)
       history.push({ role: m.role, parts })
     }
   }
@@ -536,14 +535,11 @@ export async function initApi(key: KeyConfig, {
     })
     lastMessageId = message.parentMessageId
   }
-  if (systemMessage) {
-    messages.push({ role: 'system', content: systemMessage })
-  }
+  if (systemMessage) messages.push({ role: 'system', content: systemMessage })
   messages.reverse()
   messages.push({ role: 'user', content })
 
   const enableStream = !isImageModel
-
   const options: OpenAI.ChatCompletionCreateParams = {
     model,
     stream: enableStream,
@@ -575,7 +571,6 @@ export async function initApi(key: KeyConfig, {
   }
 
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
-
   const apiResponse = await openai.chat.completions.create(options, { signal: abortSignal })
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
@@ -657,7 +652,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
 
-      // 1) 生成 history + imageMap（历史中的图片变成 [Image#n]）
+      // 1) history + imageMap
       const hist = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
@@ -666,28 +661,22 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const history = hist.history
       const historyImageMap = hist.imageMap
 
-      // 2) 当前轮：继续编号（从 nextImageIndex 开始）
+      // 2) 当前轮编号继续
       const nextIndexRef = { value: hist.nextImageIndex }
       const currentExtract = await extractImageRefsFromMessageContentWithNumbering(content, nextIndexRef)
 
-      // 当前轮图片也纳入映射表（这里 role 固定为 user；sourceMessageId 用本轮 messageId/自定义）
       const currentImageMap: ImageMapItem[] = currentExtract.images
         .filter(i => isLikelyImageUrl(i.url))
-        .map((img) => ({
+        .map(img => ({
           ...img,
           role: 'user',
           sourceMessageId: `current_${customMessageId}`,
-          turnIndex: history.length, // 当前轮在 history 之后
+          turnIndex: history.length,
         }))
 
       const allImageMap: ImageMapItem[] = [...historyImageMap, ...currentImageMap]
 
-      const latest = allImageMap.length ? allImageMap[allImageMap.length - 1] : null
-
-      // 3) 构造 inputParts：
-      //    - 先发一段映射表说明文本
-      //    - 然后每张图：文本标签（含 Image#n） + inlineData
-      //    - 最后：指令文本（尽量引用最新 Image#n）
+      // 3) inputParts：映射表说明 + (label+image)* + 用户指令（不自动指定哪张图）
       const inputParts: Part[] = []
 
       if (allImageMap.length) {
@@ -710,17 +699,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      // 4) 最终指令：如果用户没写 Image#，默认基于最新图
+      // 4) 用户指令：完全尊重用户，不自动加“基于哪张图”
       let userInstruction = (currentExtract.cleanedText || '').trim()
       if (!userInstruction) {
+        // 用户没写任何文字但有图片时，给一个不指定对象的通用指令
         userInstruction = allImageMap.length
-          ? `请基于最新图片 ${latest?.placeholder} 继续生成/修改。`
+          ? '请根据以上图片与映射表继续生成/修改。'
           : '请根据要求生成图片。'
-      }
-
-      const hasExplicitRef = /Image#\d+/.test(userInstruction)
-      if (!hasExplicitRef && latest) {
-        userInstruction = `请基于【${latest.tag}】(${latest.placeholder})进行修改：${userInstruction}`
       }
 
       inputParts.push({ text: `【当前指令】${userInstruction}` })
@@ -738,7 +723,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const chatSession = geminiModel.startChat({ history })
 
-      // DEBUG：请求前输出
       if (isGeminiImageDebugEnabled()) {
         console.log('[GeminiImage DEBUG] model=', model)
         console.log('[GeminiImage DEBUG] history=', JSON.stringify(debugGeminiHistory(history), null, 2))
@@ -764,7 +748,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify(response.usageMetadata ?? {})}`)
       }
 
-      // 6) 解析返回：Gemini-3-pro-image 常把图片塞在 part.text 的 dataURL
+      // 6) 解析返回（dataURL in text -> /uploads）
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
@@ -1016,7 +1000,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
 
-        // 防止把 data:image;base64 巨长字符串塞回上下文
         if (promptText && typeof promptText === 'string') {
           promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
         }
