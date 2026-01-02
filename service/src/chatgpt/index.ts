@@ -104,9 +104,6 @@ function summarizeUrls(urls: string[]) {
   return (urls || []).map(summarizeUrl)
 }
 
-// ====== Gemini 图片模型防爆 & 工具函数 ======
-// 你的要求：去除 GEMINI_IMAGE_MAX_CHARS_PER_TEXT 截断限制，所以不再截断文本。
-
 // ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 
@@ -117,29 +114,22 @@ const MARKDOWN_IMAGE_RE =
 // html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 
-/**
- * 从一段文本中抽取所有图片 URL，并把图片位置替换成占位符 [Image]
- * - 支持 markdown 图片、HTML img、裸 data:image base64
- */
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
 
   const urls: string[] = []
   let cleaned = text
 
-  // markdown: ![alt](url)
   cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, url) => {
     if (url) urls.push(url)
     return '[Image]'
   })
 
-  // html: <img src="...">
   cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => {
     if (url) urls.push(url)
     return '[Image]'
   })
 
-  // 裸 data url
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
@@ -147,11 +137,6 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
   return { cleanedText: cleaned, urls }
 }
 
-/**
- * 从 MessageContent(可能是 string 或 OpenAI 多模态数组) 中：
- * 1) 抽取所有图片 url
- * 2) 返回“清理后的文本”(图片位置替换成 [Image])
- */
 async function extractImageUrlsFromMessageContent(content: MessageContent): Promise<{ cleanedText: string; urls: string[] }> {
   const urls: string[] = []
   let cleanedText = ''
@@ -195,7 +180,6 @@ function dedupeUrlsPreserveOrder(urls: string[]): string[] {
 }
 
 async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> {
-  // data url
   if (urlStr.startsWith('data:')) {
     const [header, base64Data] = urlStr.split(',')
     if (!header || !base64Data) return null
@@ -204,7 +188,6 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
     return { inlineData: { mimeType, data: base64Data } }
   }
 
-  // /uploads/xxx
   if (urlStr.includes('/uploads/')) {
     const filename = path.basename(urlStr)
     const fileData = await getFileBase64(filename)
@@ -222,7 +205,6 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
 async function messageContentToGeminiParts(content: MessageContent, forGeminiImageModel: boolean): Promise<Part[]> {
   const parts: Part[] = []
 
-  // 1) 纯字符串（assistant 常见：markdown + 可能夹 dataURL）
   if (typeof content === 'string') {
     if (forGeminiImageModel) {
       const { cleanedText, urls } = extractImageUrlsFromText(content)
@@ -239,7 +221,6 @@ async function messageContentToGeminiParts(content: MessageContent, forGeminiIma
     return parts
   }
 
-  // 2) OpenAI 多模态数组（user 常见：[{type:'text'}, {type:'image_url'}]）
   if (Array.isArray(content)) {
     for (const p of content as any[]) {
       if (p?.type === 'text' && p.text) {
@@ -266,20 +247,7 @@ async function messageContentToGeminiParts(content: MessageContent, forGeminiIma
   return parts
 }
 
-/**
- * ✅ 修复：从 assistant 的 markdown 文本中提取最近一张 /uploads/... 图片路径
- * 例如：![Generated Image](/uploads/xxx.png)
- */
-function extractLastUploadsImageFromAssistantMarkdown(text: string): string | null {
-  if (!text) return null
-  const re = /!$$[^$$]*]$(\/uploads\/[^)]+)$/g
-  let last: string | null = null
-  let m: RegExpExecArray | null
-  while ((m = re.exec(text)) !== null) last = m[1]
-  return last
-}
-
-// ===== 把 Gemini 返回的 dataURL 图片（在 text 里）落盘成 /uploads，并替换成 /uploads 链接 =====
+// ===== dataURL 图片落盘并替换为 /uploads =====
 const MARKDOWN_DATA_URL_IMAGE_RE =
   /!$$([^$$]*)\]$\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)\s*$/g
 
@@ -302,18 +270,13 @@ async function saveDataUrlToUploads(dataUrl: string): Promise<string | null> {
   }
 }
 
-/**
- * 把文本里所有 dataURL 图片：
- * 1) markdown: ![alt](data:image...base64,xxx) => ![alt](/uploads/xxx.png)
- * 2) 裸 data:image...base64,xxx => ![Generated Image](/uploads/xxx.png)
- */
 async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
   if (!text) return text
 
   let out = text
   let convertedCount = 0
 
-  // 1) 先处理 markdown 包裹的 dataURL
+  // 1) markdown 包裹 dataURL
   {
     const re = new RegExp(MARKDOWN_DATA_URL_IMAGE_RE)
     let result = ''
@@ -337,7 +300,7 @@ async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
     out = result
   }
 
-  // 2) 再处理“裸 dataURL”（不在 markdown 里）
+  // 2) 裸 dataURL
   {
     const re = new RegExp(DATA_URL_IMAGE_RE)
     let result = ''
@@ -367,11 +330,6 @@ async function rewriteDataUrlImagesToUploads(text: string): Promise<string> {
   return out
 }
 
-/**
- * 核心逻辑：按原有 DB 链条回溯，构造 Gemini 需要的 history
- * 但：history 中不再放任何 inlineData 图片，只保留文本占位符；
- * 同时把“上下文中出现过的所有图片 URL”收集出来，供最新一轮 inputParts 使用。
- */
 async function buildGeminiHistoryFromLastMessageId(params: {
   lastMessageId?: string
   maxContextCount: number
@@ -388,15 +346,12 @@ async function buildGeminiHistoryFromLastMessageId(params: {
     const msg = await getMessageById(lastMessageId)
     if (!msg) break
 
-    // 系统内部 assistant 对应 Gemini model
     const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
 
     if (forGeminiImageModel) {
-      // 1) 抽取图片 URL（包含 assistant 生成的 /uploads 与 user 上传 data url）
       const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
       if (urls.length) collectedUrls.push(...urls)
 
-      // 2) history 里只放文本（图片位置用 [Image] 占位符）
       const safeText = (cleanedText && cleanedText.trim())
         ? cleanedText
         : (urls.length ? '[Image]' : '[Empty]')
@@ -404,7 +359,6 @@ async function buildGeminiHistoryFromLastMessageId(params: {
       messages.push({ role, parts: [{ text: safeText }] })
     }
     else {
-      // 非图片模型：保留原逻辑
       const parts = await messageContentToGeminiParts(msg.text, false)
       messages.push({ role, parts })
     }
@@ -465,7 +419,6 @@ export async function initApi(key: KeyConfig, {
     if (!message) break
 
     let safeContent = message.text
-    // 防止把 data:image;base64 巨长字符串塞回上下文
     if (typeof safeContent === 'string') {
       safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
     }
@@ -488,7 +441,6 @@ export async function initApi(key: KeyConfig, {
     content,
   })
 
-  // Gemini 图片模型直接走下方特殊逻辑，这里主要是 Other/Image(DallE)
   const enableStream = !isImageModel
 
   const options: OpenAI.ChatCompletionCreateParams = {
@@ -615,21 +567,17 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ====== ① Gemini 图片模型（上下文所有图放进最新一轮 inputParts；history 只保留占位符） ======
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
 
-      // 1) 构造历史（history 仅文本，占位符保留；同时收集上下文图片 URLs）
       const { history, contextImageUrls } = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
         forGeminiImageModel: true,
       })
 
-      // 2) 抽取本轮输入：文本(保留占位符) + 本轮图片 URLs
       const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
 
-      // 3) 合并“上下文所有图 + 本轮所有图”，去重
       const allImageUrls = dedupeUrlsPreserveOrder([
         ...contextImageUrls,
         ...currentUrls,
@@ -643,7 +591,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       dlog('[GeminiImage][DEBUG] allImageUrls =', summarizeUrls(allImageUrls))
       dlog('[GeminiImage][DEBUG] currentCleanedText.len =', currentCleanedText?.length ?? 0)
 
-      // 4) 构造 inputParts：把所有图都塞进最新一轮，再塞文本指令
       const inputParts: Part[] = []
 
       for (const u of allImageUrls) {
@@ -659,14 +606,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      // 文字必须有
       const finalPromptText = (currentCleanedText && currentCleanedText.trim())
         ? currentCleanedText.trim()
         : (inputParts.length ? '请基于以上所有图片继续生成/修改。' : '请根据要求生成图片。')
 
       inputParts.push({ text: finalPromptText })
 
-      // ✅ Debug: 确认最终 inputParts 是否真的包含图片
       if (DEBUG_GEMINI_IMAGE) {
         const summary = inputParts.map((p, idx) => {
           if ((p as any).inlineData?.data) {
@@ -681,7 +626,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         dlog('[GeminiImage][DEBUG] inputParts.summary =', summary)
       }
 
-      // 5) 创建模型实例并 startChat
       const genAI = new GoogleGenerativeAI(key.key)
       const requestOptions: any = {}
       if (globalConfig.timeoutMs) requestOptions.timeout = globalConfig.timeoutMs
@@ -703,7 +647,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
-      // ✅ Debug: 看 Gemini 返回里有没有 inlineData（图片）
       if (DEBUG_GEMINI_IMAGE) {
         dlog('[GeminiImage][DEBUG] response.parts.summary =', parts.map((p: any, i: number) => ({
           i,
@@ -721,7 +664,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       for (const part of parts as any[]) {
         if (part.text) text += part.text
 
-        // 只有 SDK 的 inlineData 才会走这里
         if (part.inlineData?.data) {
           const mime = part.inlineData.mimeType || 'image/png'
           const base64 = part.inlineData.data as string
@@ -738,7 +680,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
-      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads，避免下一轮丢失图片上下文
+      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads（避免下一轮丢失上下文）
       text = await rewriteDataUrlImagesToUploads(text)
 
       const usageRes: any = response.usageMetadata
@@ -779,7 +721,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ====== ② 其它模型 (OpenAI / Dall-E / Normal Gemini) ======
+    // ====== 其它模型 (OpenAI / Dall-E / Normal Gemini) ======
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -947,7 +889,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
 
-        // 防止把 data:image;base64 巨长字符串塞回上下文
         if (promptText && typeof promptText === 'string') {
           promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
         }
@@ -973,7 +914,13 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       }
       else {
         let responseText = chatInfo.response || ''
-        // 去除冗余的base64 防止加载过慢/上下文爆炸
+
+        // ✅ 兜底关键：如果历史 response 里仍有 dataURL，先落盘为 /uploads 再做 replace
+        if (responseText && typeof responseText === 'string' && DATA_URL_IMAGE_RE.test(responseText)) {
+          responseText = await rewriteDataUrlImagesToUploads(responseText)
+        }
+
+        // 去除冗余的base64 防止加载过慢/上下文爆炸（理论上此时应几乎没有 dataURL 了）
         if (responseText && typeof responseText === 'string') {
           responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
         }
