@@ -1,3 +1,4 @@
+// service/src/chatgpt/index.ts
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
@@ -89,14 +90,30 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
+// ===== DEBUG 开关 =====
+const DEBUG_GEMINI_IMAGE = process.env.DEBUG_GEMINI_IMAGE === 'true'
+function dlog(...args: any[]) {
+  if (DEBUG_GEMINI_IMAGE) console.log(...args)
+}
+function summarizeUrl(u: string) {
+  if (!u) return u
+  if (u.startsWith('data:image/')) return `data:image(base64,len=${u.length})`
+  return u
+}
+function summarizeUrls(urls: string[]) {
+  return (urls || []).map(summarizeUrl)
+}
+
 // ====== Gemini 图片模型防爆 & 工具函数 ======
 // 你的要求：去除 GEMINI_IMAGE_MAX_CHARS_PER_TEXT 截断限制，所以不再截断文本。
 
 // ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 
-// markdown: ![alt](url)
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?\s*>?\s*$/g
+// ✅ 修复：markdown: ![alt](url "title")
+const MARKDOWN_IMAGE_RE =
+  /!$$[^$$]*]$\s*<?([^)\s>]+)(?:\s+["'][^"']*["'][^)]*)?\s*>?\s*$/g
+
 // html: <img src="...">
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 
@@ -162,7 +179,7 @@ async function extractImageUrlsFromMessageContent(content: MessageContent): Prom
     return { cleanedText, urls }
   }
 
-  return { cleanedText: '', urls }
+  return { cleanedText: '', urls: [] }
 }
 
 function dedupeUrlsPreserveOrder(urls: string[]): string[] {
@@ -191,10 +208,14 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
   if (urlStr.includes('/uploads/')) {
     const filename = path.basename(urlStr)
     const fileData = await getFileBase64(filename)
-    if (!fileData) return null
+    if (!fileData) {
+      dlog('[GeminiImage][DEBUG] getFileBase64 failed for uploads url:', urlStr, '-> filename:', filename)
+      return null
+    }
     return { inlineData: { mimeType: fileData.mime, data: fileData.data } }
   }
 
+  dlog('[GeminiImage][DEBUG] imageUrlToGeminiInlinePart: unsupported url:', summarizeUrl(urlStr))
   return null
 }
 
@@ -246,7 +267,7 @@ async function messageContentToGeminiParts(content: MessageContent, forGeminiIma
 }
 
 /**
- * 从 assistant 的 markdown 文本中提取最近一张 /uploads/... 图片路径
+ * ✅ 修复：从 assistant 的 markdown 文本中提取最近一张 /uploads/... 图片路径
  * 例如：![Generated Image](/uploads/xxx.png)
  */
 function extractLastUploadsImageFromAssistantMarkdown(text: string): string | null {
@@ -306,9 +327,15 @@ async function buildGeminiHistoryFromLastMessageId(params: {
   messages.reverse()
   collectedUrls.reverse()
 
+  const deduped = dedupeUrlsPreserveOrder(collectedUrls)
+
+  dlog('[GeminiImage][DEBUG] buildGeminiHistoryFromLastMessageId collectedUrls =', summarizeUrls(collectedUrls))
+  dlog('[GeminiImage][DEBUG] buildGeminiHistoryFromLastMessageId deduped =', summarizeUrls(deduped))
+  dlog('[GeminiImage][DEBUG] buildGeminiHistoryFromLastMessageId history.len =', messages.length)
+
   return {
     history: messages.map(m => ({ role: m.role, parts: m.parts })),
-    contextImageUrls: dedupeUrlsPreserveOrder(collectedUrls),
+    contextImageUrls: deduped,
   }
 }
 
@@ -456,6 +483,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const isImage = imageModelList.some(m => model.includes(m))
   const isGeminiImageModel = isImage && model.includes('gemini')
 
+  if (DEBUG_GEMINI_IMAGE) {
+    dlog('[GeminiImage][DEBUG] incoming uploadFileKeys =', uploadFileKeys)
+    dlog('[GeminiImage][DEBUG] incoming message.len =', message?.length ?? 0)
+  }
+
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(key => isTextFile(key))
     const imageFiles = uploadFileKeys.filter(key => isImageFile(key))
@@ -515,12 +547,28 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         ...currentUrls,
       ])
 
+      dlog('[GeminiImage][DEBUG] model =', model)
+      dlog('[GeminiImage][DEBUG] baseUrl =', baseUrl)
+      dlog('[GeminiImage][DEBUG] history.len =', history.length)
+      dlog('[GeminiImage][DEBUG] contextImageUrls =', summarizeUrls(contextImageUrls))
+      dlog('[GeminiImage][DEBUG] currentUrls =', summarizeUrls(currentUrls))
+      dlog('[GeminiImage][DEBUG] allImageUrls =', summarizeUrls(allImageUrls))
+      dlog('[GeminiImage][DEBUG] currentCleanedText.len =', currentCleanedText?.length ?? 0)
+
       // 4) 构造 inputParts：把所有图都塞进最新一轮，再塞文本指令
       const inputParts: Part[] = []
 
       for (const u of allImageUrls) {
         const imgPart = await imageUrlToGeminiInlinePart(u)
-        if (imgPart) inputParts.push(imgPart)
+        if (imgPart) {
+          const b64len = (imgPart as any).inlineData?.data?.length ?? 0
+          const approxBytes = Math.floor(b64len * 3 / 4)
+          dlog('[GeminiImage][DEBUG] add imagePart ok:', summarizeUrl(u), 'mime=', (imgPart as any).inlineData?.mimeType, 'approxBytes=', approxBytes)
+          inputParts.push(imgPart)
+        }
+        else {
+          dlog('[GeminiImage][DEBUG] add imagePart failed (null):', summarizeUrl(u))
+        }
       }
 
       // 文字必须有
@@ -529,6 +577,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         : (inputParts.length ? '请基于以上所有图片继续生成/修改。' : '请根据要求生成图片。')
 
       inputParts.push({ text: finalPromptText })
+
+      // ✅ Debug: 确认最终 inputParts 是否真的包含图片
+      if (DEBUG_GEMINI_IMAGE) {
+        const summary = inputParts.map((p, idx) => {
+          if ((p as any).inlineData?.data) {
+            const mime = (p as any).inlineData?.mimeType
+            const b64len = ((p as any).inlineData.data as string).length
+            const approxBytes = Math.floor(b64len * 3 / 4)
+            return { idx, type: 'image', mime, b64len, approxBytes }
+          }
+          return { idx, type: 'text', chars: (p as any).text?.length ?? 0 }
+        })
+        dlog('[GeminiImage][DEBUG] inputParts.len =', inputParts.length)
+        dlog('[GeminiImage][DEBUG] inputParts.summary =', summary)
+      }
 
       // 5) 创建模型实例并 startChat
       const genAI = new GoogleGenerativeAI(key.key)
@@ -552,12 +615,23 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
-      for (const part of parts) {
-        if (part.text) text += part.text
+      // ✅ Debug: 看 Gemini 返回里有没有 inlineData（图片）
+      if (DEBUG_GEMINI_IMAGE) {
+        dlog('[GeminiImage][DEBUG] response.parts.summary =', parts.map((p: any, i: number) => ({
+          i,
+          hasText: !!p.text,
+          hasInlineImage: !!p.inlineData?.data,
+          mime: p.inlineData?.mimeType,
+          inlineB64Len: p.inlineData?.data ? (p.inlineData.data as string).length : 0,
+        })))
+      }
 
-        if (part.inlineData?.data) {
-          const mime = part.inlineData.mimeType || 'image/png'
-          const base64 = part.inlineData.data as string
+      for (const part of parts) {
+        if ((part as any).text) text += (part as any).text
+
+        if ((part as any).inlineData?.data) {
+          const mime = (part as any).inlineData.mimeType || 'image/png'
+          const base64 = (part as any).inlineData.data as string
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
