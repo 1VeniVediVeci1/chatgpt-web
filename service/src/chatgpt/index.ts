@@ -1,4 +1,3 @@
-// service/src/chatgpt/index.ts
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
@@ -105,7 +104,9 @@ function summarizeUrls(urls: string[]) {
 }
 
 // ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
+// 注意：DATA_URL_IMAGE_RE 带 g，会影响 test()，所以专门用 HAS_DATA_URL_IMAGE_RE 做判断
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
+const HAS_DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,/i
 
 // ✅ 修复：markdown: ![alt](url "title")
 const MARKDOWN_IMAGE_RE =
@@ -130,8 +131,11 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
     return '[Image]'
   })
 
+  // 裸 data url
+  DATA_URL_IMAGE_RE.lastIndex = 0
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
+  DATA_URL_IMAGE_RE.lastIndex = 0
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
 
   return { cleanedText: cleaned, urls }
@@ -200,51 +204,6 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> 
 
   dlog('[GeminiImage][DEBUG] imageUrlToGeminiInlinePart: unsupported url:', summarizeUrl(urlStr))
   return null
-}
-
-async function messageContentToGeminiParts(content: MessageContent, forGeminiImageModel: boolean): Promise<Part[]> {
-  const parts: Part[] = []
-
-  if (typeof content === 'string') {
-    if (forGeminiImageModel) {
-      const { cleanedText, urls } = extractImageUrlsFromText(content)
-      if (cleanedText) parts.push({ text: cleanedText })
-
-      for (const url of urls) {
-        const imgPart = await imageUrlToGeminiInlinePart(url)
-        if (imgPart) parts.push(imgPart)
-      }
-      return parts
-    }
-
-    parts.push({ text: content })
-    return parts
-  }
-
-  if (Array.isArray(content)) {
-    for (const p of content as any[]) {
-      if (p?.type === 'text' && p.text) {
-        if (forGeminiImageModel) {
-          const { cleanedText, urls } = extractImageUrlsFromText(p.text)
-          if (cleanedText) parts.push({ text: cleanedText })
-
-          for (const url of urls) {
-            const imgPart = await imageUrlToGeminiInlinePart(url)
-            if (imgPart) parts.push(imgPart)
-          }
-        }
-        else {
-          parts.push({ text: p.text })
-        }
-      }
-      else if (p?.type === 'image_url' && p.image_url?.url) {
-        const imgPart = await imageUrlToGeminiInlinePart(p.image_url.url)
-        if (imgPart) parts.push(imgPart)
-      }
-    }
-  }
-
-  return parts
 }
 
 // ===== dataURL 图片落盘并替换为 /uploads =====
@@ -352,6 +311,19 @@ async function buildGeminiHistoryFromLastMessageId(params: {
       const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
       if (urls.length) collectedUrls.push(...urls)
 
+      if (DEBUG_GEMINI_IMAGE) {
+        const preview = typeof msg.text === 'string'
+          ? msg.text.slice(0, 200)
+          : JSON.stringify(msg.text).slice(0, 200)
+        dlog('[GeminiImage][DEBUG] history.msg', {
+          i,
+          role,
+          extractedUrls: summarizeUrls(urls),
+          preview,
+          cleanedTextPreview: cleanedText.slice(0, 120),
+        })
+      }
+
       const safeText = (cleanedText && cleanedText.trim())
         ? cleanedText
         : (urls.length ? '[Image]' : '[Empty]')
@@ -359,8 +331,8 @@ async function buildGeminiHistoryFromLastMessageId(params: {
       messages.push({ role, parts: [{ text: safeText }] })
     }
     else {
-      const parts = await messageContentToGeminiParts(msg.text, false)
-      messages.push({ role, parts })
+      // 非图片模型：保留原逻辑（这里不需要）
+      messages.push({ role, parts: [{ text: typeof msg.text === 'string' ? msg.text : '[NonString]' }] })
     }
 
     lastMessageId = msg.parentMessageId
@@ -450,30 +422,7 @@ export async function initApi(key: KeyConfig, {
     messages,
   }
   options.temperature = finalTemperature
-  if (shouldUseTopP) {
-    options.top_p = top_p
-  }
-
-  try {
-    const siteCfg = config.siteConfig
-    const reasoningModelsStr = siteCfg?.reasoningModels || ''
-    const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
-
-    const reasoningModelList = reasoningModelsStr
-      .split(/[,，]/)
-      .map(s => s.trim())
-      .filter(Boolean)
-
-    const isReasoningModel = reasoningModelList.includes(model)
-
-    if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none') {
-      ; (options as any).reasoning_effort = reasoningEffort
-      console.log(`[OpenAI] reasoning_effort enabled: model=${model}, value=${reasoningEffort}`)
-    }
-  }
-  catch (e) {
-    console.error('[OpenAI] set reasoning_effort failed:', e)
-  }
+  if (shouldUseTopP) options.top_p = top_p
 
   console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
 
@@ -494,9 +443,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const customMessageId = generateMessageId()
 
   const existingIdx = processThreads.findIndex(t => t.userId === userId)
-  if (existingIdx > -1) {
-    processThreads.splice(existingIdx, 1)
-  }
+  if (existingIdx > -1) processThreads.splice(existingIdx, 1)
 
   console.log(`[DEBUG] Pushing thread for userId: ${userId}, roomId: ${roomId}`)
   processThreads.push({ userId, abort, messageId, roomId })
@@ -538,7 +485,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
           await fs.access(filePath)
           const fileContent = await fs.readFile(filePath, 'utf-8')
-
           fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n`
         }
         catch (e) {
@@ -551,9 +497,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
 
     if (imageFiles.length > 0) {
-      content = [
-        { type: 'text', text: finalMessage },
-      ]
+      content = [{ type: 'text', text: finalMessage }]
       for (const uploadFileKey of imageFiles) {
         content.push({
           type: 'image_url',
@@ -657,7 +601,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         })))
         dlog('[GeminiImage][DEBUG] response.text.samples =', parts.map((p: any, i: number) => ({
           i,
-          textSample: (p.text || '').slice(0, 300),
+          textSample: (p.text || '').slice(0, 200),
         })))
       }
 
@@ -680,7 +624,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
-      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads（避免下一轮丢失上下文）
+      // ✅ 关键：把 text 里 dataURL 图片落盘成 /uploads
       text = await rewriteDataUrlImagesToUploads(text)
 
       const usageRes: any = response.usageMetadata
@@ -721,7 +665,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ====== 其它模型 (OpenAI / Dall-E / Normal Gemini) ======
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -804,11 +747,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
       if (options.tryCount++ < 3) {
-        _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
+        _lockedKeys.push({ key: (options as any).key?.key ?? '', lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
         const index = processThreads.findIndex(d => d.userId === userId)
         if (index > -1) processThreads.splice(index, 1)
-
         return await chatReplyProcess(options)
       }
     }
@@ -884,12 +826,13 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
               const fileContent = await fs.readFile(filePath, 'utf-8')
               fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
             }
-            catch (e) { }
+            catch { }
           }
           promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
         }
 
         if (promptText && typeof promptText === 'string') {
+          DATA_URL_IMAGE_RE.lastIndex = 0
           promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
         }
 
@@ -915,13 +858,14 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       else {
         let responseText = chatInfo.response || ''
 
-        // ✅ 兜底关键：如果历史 response 里仍有 dataURL，先落盘为 /uploads 再做 replace
-        if (responseText && typeof responseText === 'string' && DATA_URL_IMAGE_RE.test(responseText)) {
+        // ✅ 兜底：如果 DB 里还残留 dataURL，先落盘为 /uploads 再做 replace
+        if (responseText && typeof responseText === 'string' && HAS_DATA_URL_IMAGE_RE.test(responseText)) {
           responseText = await rewriteDataUrlImagesToUploads(responseText)
         }
 
-        // 去除冗余的base64 防止加载过慢/上下文爆炸（理论上此时应几乎没有 dataURL 了）
+        // 防止把 dataURL 留在历史里（理论上此时应该已几乎没有 dataURL）
         if (responseText && typeof responseText === 'string') {
+          DATA_URL_IMAGE_RE.lastIndex = 0
           responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
         }
 
@@ -935,7 +879,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       }
     }
   }
-  else { return undefined }
+  else {
+    return undefined
+  }
 }
 
 async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
@@ -967,7 +913,7 @@ function getAccountId(accessToken: string): string {
     const jwt = jwt_decode(accessToken) as JWT
     return jwt['https://api.openai.com/auth'].user_id
   }
-  catch (error) {
+  catch {
     return ''
   }
 }
