@@ -625,7 +625,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           inlineB64Len: p.inlineData?.data ? (p.inlineData.data as string).length : 0,
         })))
       }
-
+      if (DEBUG_GEMINI_IMAGE) {
+        const textSamples = parts.map((p: any, i: number) => ({
+          i,
+          textSample: (p.text || '').slice(0, 300),
+        }))
+        console.log('[GeminiImage][DEBUG] response.text.samples =', textSamples)
+      }
       for (const part of parts) {
         if ((part as any).text) text += (part as any).text
 
