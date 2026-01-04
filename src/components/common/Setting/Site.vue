@@ -165,6 +165,7 @@ onMounted(() => {
                 { label: 'low', key: 'low', value: 'low' },
                 { label: 'medium', key: 'medium', value: 'medium' },
                 { label: 'high', key: 'high', value: 'high' },
+                { label: 'xhigh', key: 'xhigh', value: 'xhigh' },
               ]"
               @update-value="(val) => { if (config) config.reasoningEffort = val as any }"
             />
