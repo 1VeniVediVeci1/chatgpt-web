@@ -36,7 +36,7 @@ export class SiteConfig {
   imageModels?: string
   // ===== 新增: 推理模型配置 =====
   reasoningModels?: string
-  reasoningEffort?: 'none' | 'low' | 'medium' | 'high'
+  reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh'
 }
 
 export class MailConfig {
