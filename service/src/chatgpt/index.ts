@@ -750,7 +750,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           // 需要同时返回文本和图片
           responseModalities: ['TEXT', 'IMAGE'],
           // 指定 4K
-          imageConfig: {,
+          imageConfig: {
             image_size="4K",
             output_compression_quality=100,
           },
