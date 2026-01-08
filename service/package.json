@@ -28,6 +28,7 @@
     "common:cleanup": "rimraf node_modules && rimraf pnpm-lock.yaml"
   },
   "dependencies": {
+    "@google/genai": "^0.4.0",
     "axios": "^1.6.7",
     "dayjs": "^1.11.7",
     "dotenv": "^16.0.3",
