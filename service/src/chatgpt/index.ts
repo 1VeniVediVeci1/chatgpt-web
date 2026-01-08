@@ -716,13 +716,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         else inputParts.push({ text: `（警告：${b.tag} 加载失败：${safeUrlPreview(b.url)}）` })
       }
 
-      // 最终指令：明确指定基于哪张图编辑（优先 Image#2，否则 Image#1）
       const targetTag = bindings.find(b => b.tag === 'Image#2') ? 'Image#2' : (bindings[0]?.tag ?? 'Image#1')
       const userInstruction = (currentCleanedText && currentCleanedText.trim())
         ? currentCleanedText.trim()
         : '请继续生成/修改图片。'
 
-      inputParts.push({ text: `【编辑指令】请基于 ${targetTag} 进行修改，并在需要时参考 Image#1：${userInstruction}` })
+      inputParts.push({ text: `【编辑指令】${userInstruction}` })
 
       if (isGeminiImageDebugEnabled()) {
         console.log('[GeminiImage DEBUG] model=', model)
@@ -752,7 +751,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           // 指定 4K
           imageConfig: {
               imageSize: '4K',
-              outputCompressionQuality: 100,
           },
           // 尽量保留你的 systemMessage 语义（不同版本 SDK 可能忽略未知字段，但不会报错）
           ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
