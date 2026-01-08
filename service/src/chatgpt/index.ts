@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
-import { GoogleGenerativeAI, type Part } from '@google/generative-ai'
+import { GoogleGenAI } from '@google/genai'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -17,6 +17,19 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
 import * as fsData from 'fs'
+
+/**
+ * 兼容你现有逻辑里构造的 parts：
+ * - { text: string }
+ * - { inlineData: { mimeType, data(base64) } }
+ */
+type GeminiPart = {
+  text?: string
+  inlineData?: {
+    mimeType: string
+    data: string
+  }
+}
 
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
@@ -317,7 +330,7 @@ async function extractImageUrlsFromMessageContent(content: MessageContent): Prom
     return { cleanedText, urls }
   }
 
-  return { cleanedText: '', urls }
+  return { cleanedText: '', urls: [] }
 }
 
 function dedupeUrlsPreserveOrder(urls: string[]): string[] {
@@ -332,7 +345,7 @@ function dedupeUrlsPreserveOrder(urls: string[]): string[] {
   return out
 }
 
-async function imageUrlToGeminiInlinePart(urlStr: string): Promise<Part | null> {
+async function imageUrlToGeminiInlinePart(urlStr: string): Promise<GeminiPart | null> {
   if (urlStr.startsWith('data:')) {
     const [header, base64Data] = urlStr.split(',')
     if (!header || !base64Data) return null
@@ -655,7 +668,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   try {
     // ====== ① Gemini 图片模型：只上传 Image#1(最初参考) + Image#2(上一轮结果) ======
     if (isGeminiImageModel) {
-      const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl : undefined
+      const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
 
       // A) 历史提取（仅文本 + urls 元数据）
       const { metas, allUrls } = await buildGeminiHistoryFromLastMessageId({
@@ -687,7 +700,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      const inputParts: Part[] = []
+      const inputParts: GeminiPart[] = []
 
       // 先给一段映射说明（让模型知道 Image#1/2 分别是谁）
       if (bindings.length) {
@@ -711,19 +724,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       inputParts.push({ text: `【编辑指令】请基于 ${targetTag} 进行修改，并在需要时参考 Image#1：${userInstruction}` })
 
-      // 创建模型实例并 startChat
-      const genAI = new GoogleGenerativeAI(key.key)
-      const requestOptions: any = {}
-      if (globalConfig.timeoutMs) requestOptions.timeout = globalConfig.timeoutMs
-      if (baseUrl) requestOptions.baseUrl = baseUrl.replace(/\/+$/, '')
-
-      const geminiModel = genAI.getGenerativeModel({
-        model,
-        systemInstruction: systemMessage ? { parts: [{ text: systemMessage }], role: 'system' } : undefined,
-      }, requestOptions)
-
-      const chatSession = geminiModel.startChat({ history })
-
       if (isGeminiImageDebugEnabled()) {
         console.log('[GeminiImage DEBUG] model=', model)
         console.log('[GeminiImage DEBUG] bindings=', bindings.map(b => ({ tag: b.tag, kind: b.kind, url: safeUrlPreview(b.url) })))
@@ -732,15 +732,41 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         console.log('[GeminiImage DEBUG] inputParts=', JSON.stringify(debugGeminiInputParts(inputParts as any), null, 2))
       }
 
-      const result = await chatSession.sendMessage(inputParts)
-      const response = await result.response
+      // ========= 关键修改：使用 @google/genai，并支持第三方代理 baseUrl + 4K =========
+      const ai = new GoogleGenAI({
+        apiKey: key.key,
+        ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
+      })
+
+      const contents = [
+        ...history,
+        { role: 'user', parts: inputParts },
+      ]
+
+      const response = await ai.models.generateContent({
+        model,
+        contents,
+        config: {
+          // 需要同时返回文本和图片
+          responseModalities: ['TEXT', 'IMAGE'],
+          // 指定 4K
+          imageConfig: {
+            aspectRatio: '16:9',
+            imageSize: '4K',
+          },
+          // 尽量保留你的 systemMessage 语义（不同版本 SDK 可能忽略未知字段，但不会报错）
+          ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
+          // 如果你想把代理 header 也一并放在单次请求里，可以在这里追加：
+          // ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
+        } as any,
+      } as any)
 
       if (isGeminiImageDebugEnabled()) {
-        console.log('[GeminiImage DEBUG] responseShape=', JSON.stringify(debugGeminiResponseShape(response), null, 2))
+        console.log('[GeminiImage DEBUG] responseShape=', JSON.stringify(debugGeminiResponseShape(response as any), null, 2))
       }
 
       if (!response.candidates || response.candidates.length === 0) {
-        throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify(response.usageMetadata ?? {})}`)
+        throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify((response as any).usageMetadata ?? {})}`)
       }
 
       let text = ''
@@ -764,9 +790,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
 
         // 兼容 inlineData 输出
-        if (part?.inlineData?.data) {
-          const mime = part.inlineData.mimeType || 'image/png'
-          const base64 = part.inlineData.data as string
+        const inline = part?.inlineData
+        const inlineB64 = inline?.data
+        if (inlineB64) {
+          const mime = inline.mimeType || 'image/png'
+          const base64 = inlineB64 as string
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
@@ -790,11 +818,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
-      const usageRes: any = response.usageMetadata
+      const usageRes: any = (response as any).usageMetadata
         ? {
-            prompt_tokens: response.usageMetadata.promptTokenCount ?? 0,
-            completion_tokens: response.usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: response.usageMetadata.totalTokenCount ?? 0,
+            prompt_tokens: (response as any).usageMetadata.promptTokenCount ?? 0,
+            completion_tokens: (response as any).usageMetadata.candidatesTokenCount ?? 0,
+            total_tokens: (response as any).usageMetadata.totalTokenCount ?? 0,
             estimated: true,
           }
         : undefined
