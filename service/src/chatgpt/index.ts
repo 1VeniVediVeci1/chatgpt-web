@@ -750,9 +750,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           // 需要同时返回文本和图片
           responseModalities: ['TEXT', 'IMAGE'],
           // 指定 4K
-          imageConfig: {
-            aspectRatio: '16:9',
-            imageSize: '4K',
+          imageConfig: {,
+            image_size="4K",
+            output_compression_quality=100,
           },
           // 尽量保留你的 systemMessage 语义（不同版本 SDK 可能忽略未知字段，但不会报错）
           ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
