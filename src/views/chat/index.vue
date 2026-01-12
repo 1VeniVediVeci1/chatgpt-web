@@ -125,7 +125,7 @@ async function checkProcessStatus() {
 
     if (data.isProcessing && Number(data.roomId) === roomId) {
       loading.value = true
-      
+
       lastChatInfo = {
         id: data.messageId,
         conversationId: null,
@@ -150,20 +150,22 @@ async function checkProcessStatus() {
           },
         )
         scrollToBottom()
-      } else if (lastItem) {
+      }
+      else if (lastItem) {
         updateChatSome(roomId, lastIndex, { loading: true })
       }
 
       startPolling()
     }
-  } catch (error) {
+  }
+  catch (error) {
     console.error('Check process status failed:', error)
   }
 }
 
 function startPolling() {
-  stopPolling() 
-  
+  stopPolling()
+
   pollInterval = setInterval(async () => {
     try {
       const roomId = getCurrentRoomId()
@@ -186,35 +188,37 @@ function startPolling() {
         loading.value = true
         const lastIndex = dataSources.value.length - 1
         if (lastIndex > -1 && !dataSources.value[lastIndex].inversion) {
-           if (!dataSources.value[lastIndex].loading) {
-             updateChatSome(roomId, lastIndex, { loading: true })
-           }
+          if (!dataSources.value[lastIndex].loading) {
+            updateChatSome(roomId, lastIndex, { loading: true })
+          }
         }
-      } 
+      }
       else {
         if (loading.value) {
           loading.value = false
           stopPolling()
 
-          setTimeout(async () => {            
+          setTimeout(async () => {
             const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
             if (chatIndex > -1) {
-               chatStore.chat[chatIndex].data = [] 
+              chatStore.chat[chatIndex].data = []
             }
 
             await chatStore.syncChat(
               { uuid: roomId } as Chat.History,
               undefined,
-              () => { 
-                scrollToBottom() 
-              }
+              () => {
+                scrollToBottom()
+              },
             )
-          }, 2000) 
-        } else {
+          }, 2000)
+        }
+        else {
           stopPolling()
         }
       }
-    } catch (error) {
+    }
+    catch (error) {
       console.error('Poll error', error)
       stopPolling()
     }
@@ -247,7 +251,7 @@ const handleLoadingChain = async () => {
         (inputRef.value as any)?.focus()
 
       checkProcessStatus()
-    }
+    },
   )
 }
 
@@ -265,13 +269,13 @@ async function onConversation() {
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
-  const uploadFileKeys = isVisionModel.value 
+  const uploadFileKeys = isVisionModel.value
     ? [
         ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
         ...textUploadFileKeysRef.value.map(k => `txt:${k}`),
       ]
     : []
-  
+
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
@@ -378,21 +382,21 @@ async function onConversation() {
     const errorMessage = error?.message ?? t('common.wrong')
     const currentChat = getChatByUuidAndIndex(roomId, dataSources.value.length - 1)
     const iso1model = currentChatModel.value?.includes('o1')
-    
+
     if (currentChat?.text && currentChat.text !== '' && !iso1model) {
       updateChatSome(roomId, dataSources.value.length - 1, {
-          text: `${currentChat.text}\n[${errorMessage}]`,
-          error: false,
-          loading: false,
-        })
+        text: `${currentChat.text}\n[${errorMessage}]`,
+        error: false,
+        loading: false,
+      })
       return
     }
     if (currentChat?.text && currentChat.text !== '' && iso1model) {
       updateChatSome(roomId, dataSources.value.length - 1, {
-          text: `${currentChat.text}`,
-          error: false,
-          loading: false,
-        })
+        text: `${currentChat.text}`,
+        error: false,
+        loading: false,
+      })
       return
     }
 
@@ -421,7 +425,7 @@ async function handleStop() {
     controller.abort()
     loading.value = false
     stopPolling()
-    
+
     if (lastChatInfo.id) {
       await fetchChatStopResponding(
         lastChatInfo.text || 'Stopped',
@@ -456,7 +460,7 @@ async function onRegenerate(index: number) {
 
   loading.value = true
   const chatUuid = dataSources.value[index].uuid
-  
+
   updateChat(
     roomId,
     index,
@@ -514,13 +518,15 @@ async function onRegenerate(index: number) {
               message = ''
               return fetchChatAPIOnce()
             }
-          } catch (error) {}
+          }
+          catch (error) {}
         },
       })
       updateChatSome(roomId, index, { loading: false })
     }
     await fetchChatAPIOnce()
-  } catch (error: any) {
+  }
+  catch (error: any) {
     if (error.message === 'canceled') {
       updateChatSome(roomId, index, { loading: false })
       return
@@ -540,7 +546,8 @@ async function onRegenerate(index: number) {
         requestOptions: { prompt: message, options: { ...options } },
       },
     )
-  } finally {
+  }
+  finally {
     loading.value = false
   }
 }
@@ -591,9 +598,11 @@ function handleExport() {
         d.loading = false
         ms.success(t('chat.exportSuccess'))
         Promise.resolve()
-      } catch (error: any) {
+      }
+      catch (error: any) {
         ms.error(t('chat.exportFailed'))
-      } finally {
+      }
+      finally {
         d.loading = false
       }
     },
@@ -607,7 +616,8 @@ function handleDelete(index: number, fast: boolean) {
 
   if (fast === true) {
     chatStore.deleteChatByUuid(roomId, index)
-  } else {
+  }
+  else {
     dialog.warning({
       title: t('chat.deleteMessage'),
       content: t('chat.deleteMessageConfirm'),
@@ -646,7 +656,8 @@ function handleEnter(event: KeyboardEvent) {
       event.preventDefault()
       handleSubmit()
     }
-  } else {
+  }
+  else {
     if (event.key === 'Enter' && event.ctrlKey) {
       event.preventDefault()
       handleSubmit()
@@ -695,9 +706,11 @@ async function handleToggleUsingContext() {
 
 const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
-    return promptTemplate.value.filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase())).map((obj: { value: any }) => {
-      return { label: obj.value, value: obj.value }
-    })
+    return promptTemplate.value
+      .filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase()))
+      .map((obj: { value: any }) => {
+        return { label: obj.value, value: obj.value }
+      })
   }
   return []
 })
@@ -775,7 +788,7 @@ const uploadHeaders = computed(() => {
 })
 
 onMounted(async () => {
-  firstLoading.value = true  
+  firstLoading.value = true
   debouncedLoad()
 
   if (authStore.token) {
@@ -868,6 +881,7 @@ onUnmounted(() => {
         </div>
       </div>
     </main>
+
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
@@ -910,11 +924,14 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-    
+
           <div class="flex items-center space-x-2">
+            <!-- 图片上传：方案A，开启 multiple -->
             <div>
               <NUpload
                 action="/api/upload-image"
+                multiple
+                :max="20"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -932,9 +949,12 @@ onUnmounted(() => {
               </NUpload>
             </div>
 
+            <!-- 文本/附件上传：方案A，开启 multiple -->
             <div>
               <NUpload
                 action="/api/upload-image"
+                multiple
+                :max="20"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
