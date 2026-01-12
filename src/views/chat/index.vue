@@ -931,7 +931,7 @@ onUnmounted(() => {
               <NUpload
                 action="/api/upload-image"
                 multiple
-                :max="20"
+                :max="100"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
@@ -954,7 +954,7 @@ onUnmounted(() => {
               <NUpload
                 action="/api/upload-image"
                 multiple
-                :max="20"
+                :max="100"
                 :headers="uploadHeaders"
                 :show-file-list="false"
                 response-type="json"
