@@ -28,8 +28,6 @@ const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Pr
 let controller = new AbortController()
 let lastChatInfo: any = { text: 'Stopped', id: null, conversationId: null }
 
-const openLongReply = import.meta.env.VITE_GLOB_OPEN_LONG_REPLY === 'true'
-
 const route = useRoute()
 const dialog = useDialog()
 const ms = useMessage()
@@ -72,7 +70,6 @@ const groupedChatModelOptions = computed(() => {
   const nonStream: any[] = []
   const others: any[] = []
 
-  // NSelect option interface (label/value)
   for (const opt of base) {
     if (geminiSet.has(opt.value)) gemini.push(opt)
     else if (nonStreamSet.has(opt.value)) nonStream.push(opt)
@@ -127,7 +124,7 @@ async function checkProcessStatus() {
       loading.value = true
 
       lastChatInfo = {
-        id: data.messageId,
+        id: null,
         conversationId: null,
         text: '...',
       }
@@ -180,6 +177,7 @@ function startPolling() {
         messageId: string | null
       }>()
 
+      // 其他房间还在跑，不影响本房间轮询
       if (Number(data.roomId) !== roomId && data.isProcessing) {
         return
       }
@@ -198,6 +196,7 @@ function startPolling() {
           loading.value = false
           stopPolling()
 
+          // 生成结束：刷新历史
           setTimeout(async () => {
             const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
             if (chatIndex > -1) {
@@ -211,7 +210,7 @@ function startPolling() {
                 scrollToBottom()
               },
             )
-          }, 2000)
+          }, 800)
         }
         else {
           stopPolling()
@@ -279,9 +278,12 @@ async function onConversation() {
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
+  // 仅用于取消“提交请求”，后台任务不受影响
   controller = new AbortController()
 
   const chatUuid = Date.now()
+
+  // 1) 先把用户消息写入本地
   addChat(
     roomId,
     {
@@ -300,18 +302,19 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
+  // 2) 计算上下文（用于后端生成）
   let options: Chat.ConversationRequest = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
-
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
+  // 3) 本地插入一条“助手占位消息”
   addChat(
     roomId,
     {
       uuid: chatUuid,
       dateTime: new Date().toLocaleString(),
-      text: '',
+      text: '生成中，请稍候…',
       loading: true,
       inversion: false,
       error: false,
@@ -322,84 +325,27 @@ async function onConversation() {
   scrollToBottom()
 
   try {
-    let lastText = ''
-    const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId: roomId,
-        uuid: chatUuid,
-        prompt: message,
-        uploadFileKeys,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target as XMLHttpRequest
-          const { responseText } = xhr
-          const lastIndex = responseText.lastIndexOf('\n', responseText.length - 2)
-          let chunk = responseText
-          if (lastIndex !== -1) chunk = responseText.substring(lastIndex)
-          try {
-            const data = JSON.parse(chunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage) ? data.detail.usage : undefined
-            updateChat(
-              roomId,
-              dataSources.value.length - 1,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
+    // 4) ✅ 提交后台任务（立即返回 Accepted）
+    await fetchChatAPIProcess<{ jobId: string }>({
+      roomId,
+      uuid: chatUuid,
+      regenerate: false,
+      prompt: message,
+      uploadFileKeys,
+      options,
+    })
 
-            if (openLongReply && data.detail?.choices?.[0]?.finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
-            }
-            scrollToBottomIfAtBottom()
-          }
-          catch (error) {}
-        },
-      })
-      updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
-    }
-
-    await fetchChatAPIOnce()
+    // 5) ✅ 开始轮询任务状态，结束后自动刷新 chat-history
+    startPolling()
   }
   catch (error: any) {
     if (error.message === 'canceled') {
       updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
-      scrollToBottomIfAtBottom()
+      loading.value = false
       return
     }
 
     const errorMessage = error?.message ?? t('common.wrong')
-    const currentChat = getChatByUuidAndIndex(roomId, dataSources.value.length - 1)
-    const iso1model = currentChatModel.value?.includes('o1')
-
-    if (currentChat?.text && currentChat.text !== '' && !iso1model) {
-      updateChatSome(roomId, dataSources.value.length - 1, {
-        text: `${currentChat.text}\n[${errorMessage}]`,
-        error: false,
-        loading: false,
-      })
-      return
-    }
-    if (currentChat?.text && currentChat.text !== '' && iso1model) {
-      updateChatSome(roomId, dataSources.value.length - 1, {
-        text: `${currentChat.text}`,
-        error: false,
-        loading: false,
-      })
-      return
-    }
-
     updateChat(
       roomId,
       dataSources.value.length - 1,
@@ -413,26 +359,37 @@ async function onConversation() {
         requestOptions: { prompt: message, options: { ...options } },
       },
     )
-    scrollToBottomIfAtBottom()
-  }
-  finally {
     loading.value = false
+    stopPolling()
   }
 }
 
 async function handleStop() {
-  if (loading.value) {
-    controller.abort()
+  if (!loading.value)
+    return
+
+  // 仅取消“提交请求”的 controller（后台任务需要调用后端 abort）
+  controller.abort()
+
+  try {
+    // 后端会根据 userId abort 当前任务
+    await fetchChatStopResponding(
+      'Stopped',
+      lastChatInfo.id || '',
+      lastChatInfo.conversationId || '',
+    )
+  }
+  catch (e) {
+    // ignore
+  }
+  finally {
     loading.value = false
     stopPolling()
 
-    if (lastChatInfo.id) {
-      await fetchChatStopResponding(
-        lastChatInfo.text || 'Stopped',
-        lastChatInfo.id,
-        lastChatInfo.conversationId,
-      )
-    }
+    // 触发一次刷新，拿到被停止后的落库结果
+    setTimeout(() => {
+      handleLoadingChain()
+    }, 500)
   }
 }
 
@@ -447,7 +404,7 @@ async function onRegenerate(index: number) {
   let responseCount = dataSources.value[index].responseCount || 1
   responseCount++
 
-  let message = requestOptions?.prompt ?? ''
+  const message = requestOptions?.prompt ?? ''
   let options: Chat.ConversationRequest = {}
   if (requestOptions.options) options = { ...requestOptions.options }
 
@@ -466,7 +423,7 @@ async function onRegenerate(index: number) {
     index,
     {
       dateTime: new Date().toLocaleString(),
-      text: '',
+      text: '重新生成中，请稍候…',
       inversion: false,
       responseCount,
       error: false,
@@ -477,58 +434,21 @@ async function onRegenerate(index: number) {
   )
 
   try {
-    let lastText = ''
-    const fetchChatAPIOnce = async () => {
-      await fetchChatAPIProcess<Chat.ConversationResponse>({
-        roomId,
-        uuid: chatUuid || Date.now(),
-        regenerate: true,
-        prompt: message,
-        uploadFileKeys,
-        options,
-        signal: controller.signal,
-        onDownloadProgress: ({ event }) => {
-          const xhr = event.target as XMLHttpRequest
-          const chunk = xhr.responseText
-          const lastIndex = chunk.lastIndexOf('\n', chunk.length - 2)
-          let realChunk = chunk
-          if (lastIndex !== -1) realChunk = chunk.substring(lastIndex)
-          try {
-            const data = JSON.parse(realChunk)
-            lastChatInfo = data
-            const usage = (data.detail && data.detail.usage) ? data.detail.usage : undefined
-            updateChat(
-              roomId,
-              index,
-              {
-                dateTime: new Date().toLocaleString(),
-                text: lastText + (data.text ?? ''),
-                inversion: false,
-                responseCount,
-                error: false,
-                loading: true,
-                conversationOptions: { conversationId: data.conversationId, parentMessageId: data.id },
-                requestOptions: { prompt: message, options: { ...options } },
-                usage,
-              },
-            )
-            if (openLongReply && data.detail?.choices?.[0]?.finish_reason === 'length') {
-              options.parentMessageId = data.id
-              lastText = data.text
-              message = ''
-              return fetchChatAPIOnce()
-            }
-          }
-          catch (error) {}
-        },
-      })
-      updateChatSome(roomId, index, { loading: false })
-    }
-    await fetchChatAPIOnce()
+    await fetchChatAPIProcess<{ jobId: string }>({
+      roomId,
+      uuid: chatUuid || Date.now(),
+      regenerate: true,
+      prompt: message,
+      uploadFileKeys,
+      options,
+    })
+
+    startPolling()
   }
   catch (error: any) {
     if (error.message === 'canceled') {
       updateChatSome(roomId, index, { loading: false })
+      loading.value = false
       return
     }
     const errorMessage = error?.message ?? t('common.wrong')
@@ -546,9 +466,8 @@ async function onRegenerate(index: number) {
         requestOptions: { prompt: message, options: { ...options } },
       },
     )
-  }
-  finally {
     loading.value = false
+    stopPolling()
   }
 }
 
@@ -926,7 +845,6 @@ onUnmounted(() => {
           </div>
 
           <div class="flex items-center space-x-2">
-            <!-- 图片上传：方案A，开启 multiple -->
             <div>
               <NUpload
                 action="/api/upload-image"
@@ -949,7 +867,6 @@ onUnmounted(() => {
               </NUpload>
             </div>
 
-            <!-- 文本/附件上传：方案A，开启 multiple -->
             <div>
               <NUpload
                 action="/api/upload-image"
