@@ -93,6 +93,16 @@ export async function getChatByMessageId(messageId: string) {
   return await chatCol.findOne({ 'options.messageId': messageId })
 }
 
+export async function updateChatResponsePartial(chatId: string, response: string) {
+  const query = { _id: new ObjectId(chatId) }
+  const update = {
+    $set: {
+      response: response ?? '',
+    },
+  }
+  await chatCol.updateOne(query, update)
+}
+
 export async function updateChat(chatId: string, response: string, messageId: string, conversationId: string, model: string, usage: UsageResponse, previousResponse?: []) {
   const query = { _id: new ObjectId(chatId) }
   const update = {
