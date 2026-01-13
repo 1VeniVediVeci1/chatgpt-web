@@ -130,7 +130,7 @@ async function fetchLatestAndUpdateUI(roomId: number) {
     // 只更新最后一条 assistant（inversion=false）
     if (!dataSources.value[lastIndex].inversion) {
       updateChatSome(roomId, lastIndex, {
-        text: latestText || '生成中，请稍候…',
+        text: latestText || '',
         loading: true,
       })
       scrollToBottomIfAtBottom()
@@ -170,7 +170,7 @@ async function checkProcessStatus() {
           {
             uuid: Date.now(),
             dateTime: new Date().toLocaleString(),
-            text: '生成中，请稍候…',
+            text: '',
             loading: true,
             inversion: false,
             error: false,
@@ -343,7 +343,7 @@ async function onConversation() {
     {
       uuid: chatUuid,
       dateTime: new Date().toLocaleString(),
-      text: '生成中，请稍候…',
+      text: '',
       loading: true,
       inversion: false,
       error: false,
@@ -444,7 +444,7 @@ async function onRegenerate(index: number) {
     index,
     {
       dateTime: new Date().toLocaleString(),
-      text: '重新生成中，请稍候…',
+      text: '',
       inversion: false,
       responseCount,
       error: false,
