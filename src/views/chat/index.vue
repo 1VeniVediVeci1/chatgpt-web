@@ -394,7 +394,6 @@ async function handleStop() {
   controller.abort()
   stopPolling()
 
-  const roomId = getCurrentRoomId()
   const lastIndex = dataSources.value.length - 1
   const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion) ? (dataSources.value[lastIndex].text ?? '') : ''
 
