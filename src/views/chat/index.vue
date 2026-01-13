@@ -36,7 +36,7 @@ const userStore = useUserStore()
 const chatStore = useChatStore()
 
 const { isMobile } = useBasicLayout()
-const { addChat, updateChat, updateChatSome } = useChat()
+const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
 const { uuid } = route.params as { uuid: string }
@@ -57,7 +57,7 @@ const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
 const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatHistory.value?.chatModel ?? userStore.userInfo.config.chatModel)
 
-// 当前正在生成的那条消息 uuid（用于 /chat-latest）
+// ✅ 当前正在生成的 chat.uuid（用于 /chat-latest）
 const processingUuidRef = ref<number | null>(null)
 
 // ===== 模型分组：Gemini / 非流式(图片) / 其它 =====
@@ -87,8 +87,6 @@ const groupedChatModelOptions = computed(() => {
 })
 
 const currentNavIndexRef = ref<number>(-1)
-
-// 这里简单用全局配置判断即可，实际可动态判断
 const isVisionModel = ref(true)
 
 let loadingms: MessageReactive
@@ -109,32 +107,44 @@ function getCurrentRoomId(): number {
 
 function inferLatestUuidFromUI(): number | null {
   if (!dataSources.value.length) return null
-  // 最后一条消息的 uuid 往往就是最新一轮的 uuid
   return dataSources.value[dataSources.value.length - 1].uuid ?? null
 }
 
-async function fetchLatestAndUpdateUI(roomId: number) {
+async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
   const u = processingUuidRef.value ?? inferLatestUuidFromUI()
   if (!u) return
 
   try {
-    const r = await get<{ text: string; isProcessing: boolean }>({
+    const r = await get<{
+      text: string
+      isProcessing: boolean
+      conversationOptions: any
+      usage?: any
+    }>({
       url: '/chat-latest',
       data: { roomId, uuid: u },
     })
 
-    const latestText = (r.data as any)?.text ?? ''
+    const d: any = r.data
     const lastIndex = dataSources.value.length - 1
     if (lastIndex < 0) return
 
-    // 只更新最后一条 assistant（inversion=false）
     if (!dataSources.value[lastIndex].inversion) {
       updateChatSome(roomId, lastIndex, {
-        text: latestText || '',
-        loading: true,
+        text: d.text ?? '',
+        loading: finalize ? false : true,
+        conversationOptions: d.conversationOptions ?? dataSources.value[lastIndex].conversationOptions ?? null,
+        usage: d.usage ?? dataSources.value[lastIndex].usage,
       })
-      scrollToBottomIfAtBottom()
     }
+
+    if (finalize) {
+      loading.value = false
+      processingUuidRef.value = null
+      stopPolling()
+    }
+
+    scrollToBottomIfAtBottom()
   }
   catch {
     // ignore
@@ -150,43 +160,36 @@ async function checkProcessStatus() {
     const { data } = await fetchChatProcessStatus<{
       isProcessing: boolean
       roomId: number | null
+      uuid: number | null
       messageId: string | null
     }>()
 
     if (data.isProcessing && Number(data.roomId) === roomId) {
       loading.value = true
-
-      // 如果还没记住 processingUuid，就从 UI 推断一个
-      if (!processingUuidRef.value)
-        processingUuidRef.value = inferLatestUuidFromUI()
+      processingUuidRef.value = data.uuid ?? processingUuidRef.value ?? inferLatestUuidFromUI()
 
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 确保页面有一个 assistant 占位
+      // 确保最后一条是 assistant（用于承载伪流式内容）
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
-        addChat(
-          roomId,
-          {
-            uuid: Date.now(),
-            dateTime: new Date().toLocaleString(),
-            text: '',
-            loading: true,
-            inversion: false,
-            error: false,
-            conversationOptions: null,
-            requestOptions: { prompt: '...', options: null },
-          },
-        )
+        addChat(roomId, {
+          uuid: Date.now(),
+          dateTime: new Date().toLocaleString(),
+          text: '', // ✅ 不显示“生成中”
+          loading: true,
+          inversion: false,
+          error: false,
+          conversationOptions: null,
+          requestOptions: { prompt: '...', options: null },
+        })
         scrollToBottom()
       }
       else {
         updateChatSome(roomId, lastIndex, { loading: true })
       }
 
-      // 拉一次最新文本
-      await fetchLatestAndUpdateUI(roomId)
-
+      await fetchLatestAndUpdateUI(roomId, false)
       startPolling()
     }
   }
@@ -209,41 +212,23 @@ function startPolling() {
       const { data } = await fetchChatProcessStatus<{
         isProcessing: boolean
         roomId: number | null
+        uuid: number | null
         messageId: string | null
       }>()
 
-      // 其他房间还在跑，不影响本房间
+      // 其他房间在跑，不影响本房间
       if (Number(data.roomId) !== roomId && data.isProcessing)
         return
 
       if (data.isProcessing) {
         loading.value = true
-        await fetchLatestAndUpdateUI(roomId)
+        if (data.uuid != null)
+          processingUuidRef.value = data.uuid
+        await fetchLatestAndUpdateUI(roomId, false)
       }
       else {
-        if (loading.value) {
-          loading.value = false
-          stopPolling()
-          processingUuidRef.value = null
-
-          // 生成结束：刷新历史
-          setTimeout(async () => {
-            const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
-            if (chatIndex > -1)
-              chatStore.chat[chatIndex].data = []
-
-            await chatStore.syncChat(
-              { uuid: roomId } as Chat.History,
-              undefined,
-              () => {
-                scrollToBottom()
-              },
-            )
-          }, 800)
-        }
-        else {
-          stopPolling()
-        }
+        // ✅ 不再“清空并刷新整房间”，只做 finalize 收尾
+        await fetchLatestAndUpdateUI(roomId, true)
       }
     }
     catch (error) {
@@ -287,7 +272,6 @@ const debouncedLoad = debounce(handleLoadingChain, 200)
 
 async function onConversation() {
   let message = prompt.value
-
   if (loading.value) return
   if (!message || message.trim() === '') return
 
@@ -313,19 +297,16 @@ async function onConversation() {
   processingUuidRef.value = chatUuid
 
   // 用户消息
-  addChat(
-    roomId,
-    {
-      uuid: chatUuid,
-      dateTime: new Date().toLocaleString(),
-      text: message,
-      images: uploadFileKeys,
-      inversion: true,
-      error: false,
-      conversationOptions: null,
-      requestOptions: { prompt: message, options: null },
-    },
-  )
+  addChat(roomId, {
+    uuid: chatUuid,
+    dateTime: new Date().toLocaleString(),
+    text: message,
+    images: uploadFileKeys,
+    inversion: true,
+    error: false,
+    conversationOptions: null,
+    requestOptions: { prompt: message, options: null },
+  })
   scrollToBottom()
 
   loading.value = true
@@ -337,24 +318,21 @@ async function onConversation() {
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // assistant 占位
-  addChat(
-    roomId,
-    {
-      uuid: chatUuid,
-      dateTime: new Date().toLocaleString(),
-      text: '',
-      loading: true,
-      inversion: false,
-      error: false,
-      conversationOptions: null,
-      requestOptions: { prompt: message, options: { ...options } },
-    },
-  )
+  // assistant 占位（不显示任何提示文字）
+  addChat(roomId, {
+    uuid: chatUuid,
+    dateTime: new Date().toLocaleString(),
+    text: '', // ✅ 不显示“生成中…”
+    loading: true,
+    inversion: false,
+    error: false,
+    conversationOptions: null,
+    requestOptions: { prompt: message, options: { ...options } },
+  })
   scrollToBottom()
 
   try {
-    // ✅ 提交后台任务（立即返回）
+    // 提交后台任务（立即返回）
     await fetchChatAPIProcess<{ jobId: string }>({
       roomId,
       uuid: chatUuid,
@@ -369,19 +347,15 @@ async function onConversation() {
   }
   catch (error: any) {
     const errorMessage = error?.message ?? t('common.wrong')
-    updateChat(
-      roomId,
-      dataSources.value.length - 1,
-      {
-        dateTime: new Date().toLocaleString(),
-        text: errorMessage,
-        inversion: false,
-        error: true,
-        loading: false,
-        conversationOptions: null,
-        requestOptions: { prompt: message, options: { ...options } },
-      },
-    )
+    updateChat(roomId, dataSources.value.length - 1, {
+      dateTime: new Date().toLocaleString(),
+      text: errorMessage,
+      inversion: false,
+      error: true,
+      loading: false,
+      conversationOptions: null,
+      requestOptions: { prompt: message, options: { ...options } },
+    })
     loading.value = false
     stopPolling()
     processingUuidRef.value = null
@@ -392,25 +366,22 @@ async function handleStop() {
   if (!loading.value) return
 
   controller.abort()
-  stopPolling()
 
+  // 把当前已展示的文本发给后端，后端会立刻写 partial（体验更好）
+  const roomId = getCurrentRoomId()
   const lastIndex = dataSources.value.length - 1
-  const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion) ? (dataSources.value[lastIndex].text ?? '') : ''
+  const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion)
+    ? (dataSources.value[lastIndex].text ?? '')
+    : ''
 
   try {
-    // 后端 abort 只认 userId（不再依赖 messageId/conversationId）
     await fetchChatStopResponding(currentText, '', '')
   }
-  catch { /* ignore */ }
-  finally {
-    loading.value = false
-    processingUuidRef.value = null
-
-    // 停止后刷新一下
-    setTimeout(() => {
-      handleLoadingChain()
-    }, 800)
+  catch {
+    // ignore
   }
+
+  // 不立即 stopPolling：让轮询自然检测到 done，然后 finalize
 }
 
 async function onRegenerate(index: number) {
@@ -439,20 +410,16 @@ async function onRegenerate(index: number) {
   const chatUuid = dataSources.value[index].uuid || Date.now()
   processingUuidRef.value = chatUuid
 
-  updateChat(
-    roomId,
-    index,
-    {
-      dateTime: new Date().toLocaleString(),
-      text: '',
-      inversion: false,
-      responseCount,
-      error: false,
-      loading: true,
-      conversationOptions: null,
-      requestOptions: { prompt: message, options: { ...options } },
-    },
-  )
+  updateChat(roomId, index, {
+    dateTime: new Date().toLocaleString(),
+    text: '', // ✅ 不显示“重新生成中…”
+    inversion: false,
+    responseCount,
+    error: false,
+    loading: true,
+    conversationOptions: null,
+    requestOptions: { prompt: message, options: { ...options } },
+  })
 
   try {
     await fetchChatAPIProcess<{ jobId: string }>({
@@ -468,20 +435,16 @@ async function onRegenerate(index: number) {
   }
   catch (error: any) {
     const errorMessage = error?.message ?? t('common.wrong')
-    updateChat(
-      roomId,
-      index,
-      {
-        dateTime: new Date().toLocaleString(),
-        text: errorMessage,
-        inversion: false,
-        responseCount,
-        error: true,
-        loading: false,
-        conversationOptions: null,
-        requestOptions: { prompt: message, options: { ...options } },
-      },
-    )
+    updateChat(roomId, index, {
+      dateTime: new Date().toLocaleString(),
+      text: errorMessage,
+      inversion: false,
+      responseCount,
+      error: true,
+      loading: false,
+      conversationOptions: null,
+      requestOptions: { prompt: message, options: { ...options } },
+    })
     loading.value = false
     stopPolling()
     processingUuidRef.value = null
@@ -492,21 +455,17 @@ async function onResponseHistory(index: number, historyIndex: number) {
   const roomId = getCurrentRoomId()
   if (!roomId) return
   const chat = (await fetchChatResponseoHistory(roomId, dataSources.value[index].uuid || Date.now(), historyIndex)).data
-  updateChat(
-    roomId,
-    index,
-    {
-      dateTime: chat.dateTime,
-      text: chat.text,
-      inversion: false,
-      responseCount: chat.responseCount,
-      error: true,
-      loading: false,
-      conversationOptions: chat.conversationOptions,
-      requestOptions: { prompt: chat.requestOptions.prompt, options: { ...chat.requestOptions.options } },
-      usage: chat.usage,
-    },
-  )
+  updateChat(roomId, index, {
+    dateTime: chat.dateTime,
+    text: chat.text,
+    inversion: false,
+    responseCount: chat.responseCount,
+    error: true,
+    loading: false,
+    conversationOptions: chat.conversationOptions,
+    requestOptions: { prompt: chat.requestOptions.prompt, options: { ...chat.requestOptions.options } },
+    usage: chat.usage,
+  })
 }
 
 function handleExport() {
@@ -656,9 +615,7 @@ function renderOption(option: { label: string }) {
 }
 
 const placeholder = computed(() => (isMobile.value ? t('chat.placeholderMobile') : t('chat.placeholder')))
-
 const buttonDisabled = computed(() => loading.value || !prompt.value || prompt.value.trim() === '')
-
 const footerClass = computed(() => (isMobile.value ? ['sticky', 'left-0', 'bottom-0', 'right-0', 'p-2', 'pr-3', 'overflow-hidden'] : ['p-4']))
 
 async function handleSyncChatModel(chatModel: string) {
@@ -744,17 +701,8 @@ onUnmounted(() => {
       @toggle-show-prompt="showPrompt = true"
     />
     <main class="flex-1 overflow-hidden">
-      <div
-        id="scrollRef"
-        ref="scrollRef"
-        class="h-full overflow-hidden overflow-y-auto"
-        @scroll="handleScroll"
-      >
-        <div
-          id="image-wrapper"
-          class="w-full max-w-screen-xl m-auto dark:bg-[#101014]"
-          :class="[isMobile ? 'p-2' : 'p-4']"
-        >
+      <div id="scrollRef" ref="scrollRef" class="h-full overflow-hidden overflow-y-auto" @scroll="handleScroll">
+        <div id="image-wrapper" class="w-full max-w-screen-xl m-auto dark:bg-[#101014]" :class="[isMobile ? 'p-2' : 'p-4']">
           <NSpin :show="firstLoading">
             <template v-if="!dataSources.length">
               <div class="flex items-center justify-center mt-4 text-center text-neutral-300">
@@ -783,11 +731,7 @@ onUnmounted(() => {
                   @response-history="(ev) => onResponseHistory(index, ev)"
                 />
                 <div class="sticky bottom-0 left-0 flex justify-center">
-                  <NButton
-                    v-if="loading"
-                    type="warning"
-                    @click="handleStop"
-                  >
+                  <NButton v-if="loading" type="warning" @click="handleStop">
                     <template #icon>
                       <SvgIcon icon="ri:stop-circle-line" />
                     </template>
@@ -805,11 +749,7 @@ onUnmounted(() => {
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
           <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div
-              v-for="(key, index) in imageUploadFileKeysRef"
-              :key="`img-${index}`"
-              class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
-            >
+            <div v-for="(key, index) in imageUploadFileKeysRef" :key="`img-${index}`" class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700">
               <SvgIcon icon="ri:image-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
               <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteImageFile(index)">
@@ -819,11 +759,7 @@ onUnmounted(() => {
           </div>
 
           <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div
-              v-for="(key, index) in textUploadFileKeysRef"
-              :key="`txt-${index}`"
-              class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700"
-            >
+            <div v-for="(key, index) in textUploadFileKeysRef" :key="`txt-${index}`" class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700">
               <SvgIcon icon="ri:file-text-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
               <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteTextFile(index)">
@@ -922,11 +858,7 @@ onUnmounted(() => {
           </div>
 
           <div class="flex items-center justify-between space-x-2">
-            <NAutoComplete
-              v-model:value="prompt"
-              :options="searchOptions"
-              :render-label="renderOption"
-            >
+            <NAutoComplete v-model:value="prompt" :options="searchOptions" :render-label="renderOption">
               <template #default="{ handleInput, handleBlur, handleFocus }">
                 <NInput
                   ref="inputRef"
