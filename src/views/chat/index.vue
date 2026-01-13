@@ -22,11 +22,11 @@ import {
 import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
+import { get } from '@/utils/request'
 
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
 let controller = new AbortController()
-let lastChatInfo: any = { text: 'Stopped', id: null, conversationId: null }
 
 const route = useRoute()
 const dialog = useDialog()
@@ -36,7 +36,7 @@ const userStore = useUserStore()
 const chatStore = useChatStore()
 
 const { isMobile } = useBasicLayout()
-const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
+const { addChat, updateChat, updateChatSome } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
 const { uuid } = route.params as { uuid: string }
@@ -56,6 +56,9 @@ const inputRef = ref<Ref | null>(null)
 const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
 const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatHistory.value?.chatModel ?? userStore.userInfo.config.chatModel)
+
+// 当前正在生成的那条消息 uuid（用于 /chat-latest）
+const processingUuidRef = ref<number | null>(null)
 
 // ===== 模型分组：Gemini / 非流式(图片) / 其它 =====
 const groupedChatModelOptions = computed(() => {
@@ -95,10 +98,6 @@ let prevScrollTop: number
 const promptStore = usePromptStore()
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-function handleSubmit() {
-  onConversation()
-}
-
 const imageUploadFileKeysRef = ref<string[]>([])
 const textUploadFileKeysRef = ref<string[]>([])
 
@@ -106,6 +105,40 @@ let pollInterval: NodeJS.Timeout | null = null
 
 function getCurrentRoomId(): number {
   return chatStore.active ? chatStore.active : Number(uuid)
+}
+
+function inferLatestUuidFromUI(): number | null {
+  if (!dataSources.value.length) return null
+  // 最后一条消息的 uuid 往往就是最新一轮的 uuid
+  return dataSources.value[dataSources.value.length - 1].uuid ?? null
+}
+
+async function fetchLatestAndUpdateUI(roomId: number) {
+  const u = processingUuidRef.value ?? inferLatestUuidFromUI()
+  if (!u) return
+
+  try {
+    const r = await get<{ text: string; isProcessing: boolean }>({
+      url: '/chat-latest',
+      data: { roomId, uuid: u },
+    })
+
+    const latestText = (r.data as any)?.text ?? ''
+    const lastIndex = dataSources.value.length - 1
+    if (lastIndex < 0) return
+
+    // 只更新最后一条 assistant（inversion=false）
+    if (!dataSources.value[lastIndex].inversion) {
+      updateChatSome(roomId, lastIndex, {
+        text: latestText || '生成中，请稍候…',
+        loading: true,
+      })
+      scrollToBottomIfAtBottom()
+    }
+  }
+  catch {
+    // ignore
+  }
 }
 
 async function checkProcessStatus() {
@@ -123,22 +156,21 @@ async function checkProcessStatus() {
     if (data.isProcessing && Number(data.roomId) === roomId) {
       loading.value = true
 
-      lastChatInfo = {
-        id: null,
-        conversationId: null,
-        text: '...',
-      }
+      // 如果还没记住 processingUuid，就从 UI 推断一个
+      if (!processingUuidRef.value)
+        processingUuidRef.value = inferLatestUuidFromUI()
 
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
+      // 确保页面有一个 assistant 占位
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(
           roomId,
           {
             uuid: Date.now(),
             dateTime: new Date().toLocaleString(),
-            text: '...',
+            text: '生成中，请稍候…',
             loading: true,
             inversion: false,
             error: false,
@@ -148,9 +180,12 @@ async function checkProcessStatus() {
         )
         scrollToBottom()
       }
-      else if (lastItem) {
+      else {
         updateChatSome(roomId, lastIndex, { loading: true })
       }
+
+      // 拉一次最新文本
+      await fetchLatestAndUpdateUI(roomId)
 
       startPolling()
     }
@@ -177,31 +212,25 @@ function startPolling() {
         messageId: string | null
       }>()
 
-      // 其他房间还在跑，不影响本房间轮询
-      if (Number(data.roomId) !== roomId && data.isProcessing) {
+      // 其他房间还在跑，不影响本房间
+      if (Number(data.roomId) !== roomId && data.isProcessing)
         return
-      }
 
       if (data.isProcessing) {
         loading.value = true
-        const lastIndex = dataSources.value.length - 1
-        if (lastIndex > -1 && !dataSources.value[lastIndex].inversion) {
-          if (!dataSources.value[lastIndex].loading) {
-            updateChatSome(roomId, lastIndex, { loading: true })
-          }
-        }
+        await fetchLatestAndUpdateUI(roomId)
       }
       else {
         if (loading.value) {
           loading.value = false
           stopPolling()
+          processingUuidRef.value = null
 
           // 生成结束：刷新历史
           setTimeout(async () => {
             const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
-            if (chatIndex > -1) {
+            if (chatIndex > -1)
               chatStore.chat[chatIndex].data = []
-            }
 
             await chatStore.syncChat(
               { uuid: roomId } as Chat.History,
@@ -278,12 +307,12 @@ async function onConversation() {
   imageUploadFileKeysRef.value = []
   textUploadFileKeysRef.value = []
 
-  // 仅用于取消“提交请求”，后台任务不受影响
   controller = new AbortController()
 
   const chatUuid = Date.now()
+  processingUuidRef.value = chatUuid
 
-  // 1) 先把用户消息写入本地
+  // 用户消息
   addChat(
     roomId,
     {
@@ -302,13 +331,13 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
-  // 2) 计算上下文（用于后端生成）
+  // 上下文
   let options: Chat.ConversationRequest = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // 3) 本地插入一条“助手占位消息”
+  // assistant 占位
   addChat(
     roomId,
     {
@@ -325,7 +354,7 @@ async function onConversation() {
   scrollToBottom()
 
   try {
-    // 4) ✅ 提交后台任务（立即返回 Accepted）
+    // ✅ 提交后台任务（立即返回）
     await fetchChatAPIProcess<{ jobId: string }>({
       roomId,
       uuid: chatUuid,
@@ -333,18 +362,12 @@ async function onConversation() {
       prompt: message,
       uploadFileKeys,
       options,
+      signal: controller.signal,
     })
 
-    // 5) ✅ 开始轮询任务状态，结束后自动刷新 chat-history
     startPolling()
   }
   catch (error: any) {
-    if (error.message === 'canceled') {
-      updateChatSome(roomId, dataSources.value.length - 1, { loading: false })
-      loading.value = false
-      return
-    }
-
     const errorMessage = error?.message ?? t('common.wrong')
     updateChat(
       roomId,
@@ -361,35 +384,33 @@ async function onConversation() {
     )
     loading.value = false
     stopPolling()
+    processingUuidRef.value = null
   }
 }
 
 async function handleStop() {
-  if (!loading.value)
-    return
+  if (!loading.value) return
 
-  // 仅取消“提交请求”的 controller（后台任务需要调用后端 abort）
   controller.abort()
+  stopPolling()
+
+  const roomId = getCurrentRoomId()
+  const lastIndex = dataSources.value.length - 1
+  const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion) ? (dataSources.value[lastIndex].text ?? '') : ''
 
   try {
-    // 后端会根据 userId abort 当前任务
-    await fetchChatStopResponding(
-      'Stopped',
-      lastChatInfo.id || '',
-      lastChatInfo.conversationId || '',
-    )
+    // 后端 abort 只认 userId（不再依赖 messageId/conversationId）
+    await fetchChatStopResponding(currentText, '', '')
   }
-  catch (e) {
-    // ignore
-  }
+  catch { /* ignore */ }
   finally {
     loading.value = false
-    stopPolling()
+    processingUuidRef.value = null
 
-    // 触发一次刷新，拿到被停止后的落库结果
+    // 停止后刷新一下
     setTimeout(() => {
       handleLoadingChain()
-    }, 500)
+    }, 800)
   }
 }
 
@@ -416,7 +437,8 @@ async function onRegenerate(index: number) {
   }
 
   loading.value = true
-  const chatUuid = dataSources.value[index].uuid
+  const chatUuid = dataSources.value[index].uuid || Date.now()
+  processingUuidRef.value = chatUuid
 
   updateChat(
     roomId,
@@ -436,21 +458,16 @@ async function onRegenerate(index: number) {
   try {
     await fetchChatAPIProcess<{ jobId: string }>({
       roomId,
-      uuid: chatUuid || Date.now(),
+      uuid: chatUuid,
       regenerate: true,
       prompt: message,
       uploadFileKeys,
       options,
+      signal: controller.signal,
     })
-
     startPolling()
   }
   catch (error: any) {
-    if (error.message === 'canceled') {
-      updateChatSome(roomId, index, { loading: false })
-      loading.value = false
-      return
-    }
     const errorMessage = error?.message ?? t('common.wrong')
     updateChat(
       roomId,
@@ -468,6 +485,7 @@ async function onRegenerate(index: number) {
     )
     loading.value = false
     stopPolling()
+    processingUuidRef.value = null
   }
 }
 
@@ -516,9 +534,8 @@ function handleExport() {
         window.URL.revokeObjectURL(imgUrl)
         d.loading = false
         ms.success(t('chat.exportSuccess'))
-        Promise.resolve()
       }
-      catch (error: any) {
+      catch {
         ms.error(t('chat.exportFailed'))
       }
       finally {
@@ -549,7 +566,7 @@ function handleDelete(index: number, fast: boolean) {
   }
 }
 
-function updateCurrentNavIndex(index: number, newIndex: number) {
+function updateCurrentNavIndex(_index: number, newIndex: number) {
   currentNavIndexRef.value = newIndex
 }
 
@@ -573,13 +590,13 @@ function handleEnter(event: KeyboardEvent) {
   if (!isMobile.value) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
-      handleSubmit()
+      onConversation()
     }
   }
   else {
     if (event.key === 'Enter' && event.ctrlKey) {
       event.preventDefault()
-      handleSubmit()
+      onConversation()
     }
   }
 }
@@ -627,9 +644,7 @@ const searchOptions = computed(() => {
   if (prompt.value.startsWith('/')) {
     return promptTemplate.value
       .filter((item: { title: string }) => item.title.toLowerCase().includes(prompt.value.substring(1).toLowerCase()))
-      .map((obj: { value: any }) => {
-        return { label: obj.value, value: obj.value }
-      })
+      .map((obj: { value: any }) => ({ label: obj.value, value: obj.value }))
   }
   return []
 })
@@ -641,20 +656,11 @@ function renderOption(option: { label: string }) {
   return []
 }
 
-const placeholder = computed(() => {
-  if (isMobile.value) return t('chat.placeholderMobile')
-  return t('chat.placeholder')
-})
+const placeholder = computed(() => (isMobile.value ? t('chat.placeholderMobile') : t('chat.placeholder')))
 
-const buttonDisabled = computed(() => {
-  return loading.value || !prompt.value || prompt.value.trim() === ''
-})
+const buttonDisabled = computed(() => loading.value || !prompt.value || prompt.value.trim() === '')
 
-const footerClass = computed(() => {
-  let classes = ['p-4']
-  if (isMobile.value) classes = ['sticky', 'left-0', 'bottom-0', 'right-0', 'p-2', 'pr-3', 'overflow-hidden']
-  return classes
-})
+const footerClass = computed(() => (isMobile.value ? ['sticky', 'left-0', 'bottom-0', 'right-0', 'p-2', 'pr-3', 'overflow-hidden'] : ['p-4']))
 
 async function handleSyncChatModel(chatModel: string) {
   const roomId = getCurrentRoomId()
@@ -667,7 +673,7 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
-function handleBeforeUpload(data: { file: UploadFileInfo; fileList: UploadFileInfo[] }) {
+function handleBeforeUpload(data: { file: UploadFileInfo }) {
   if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
     ms.error('文件大小不能超过 100MB')
     return false
@@ -709,18 +715,13 @@ const uploadHeaders = computed(() => {
 onMounted(async () => {
   firstLoading.value = true
   debouncedLoad()
-
-  if (authStore.token) {
-    const chatModels = authStore.session?.chatModels
-    if (chatModels != null && chatModels.filter(d => d.value === userStore.userInfo.config.chatModel).length <= 0)
-      ms.error('你选择的模型已不存在，请重新选择 | The selected model not exists, please choose again.', { duration: 7000 })
-  }
 })
 
 watch(
   () => chatStore.active,
   () => {
     stopPolling()
+    processingUuidRef.value = null
     if (chatStore.active) {
       firstLoading.value = true
       debouncedLoad()
@@ -804,10 +805,7 @@ onUnmounted(() => {
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          <div
-            v-if="imageUploadFileKeysRef.length > 0"
-            class="flex flex-wrap items-center gap-2 mb-2"
-          >
+          <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div
               v-for="(key, index) in imageUploadFileKeysRef"
               :key="`img-${index}`"
@@ -815,19 +813,13 @@ onUnmounted(() => {
             >
               <SvgIcon icon="ri:image-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button
-                class="ml-1 text-red-500 hover:text-red-700"
-                @click="handleDeleteImageFile(index)"
-              >
+              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteImageFile(index)">
                 <SvgIcon icon="ri:close-line" />
               </button>
             </div>
           </div>
 
-          <div
-            v-if="textUploadFileKeysRef.length > 0"
-            class="flex flex-wrap items-center gap-2 mb-2"
-          >
+          <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
             <div
               v-for="(key, index) in textUploadFileKeysRef"
               :key="`txt-${index}`"
@@ -835,10 +827,7 @@ onUnmounted(() => {
             >
               <SvgIcon icon="ri:file-text-line" class="mr-1" />
               <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button
-                class="ml-1 text-red-500 hover:text-red-700"
-                @click="handleDeleteTextFile(index)"
-              >
+              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteTextFile(index)">
                 <SvgIcon icon="ri:close-line" />
               </button>
             </div>
@@ -857,9 +846,7 @@ onUnmounted(() => {
                 @finish="handleFinishImage"
                 @before-upload="handleBeforeUpload"
               >
-                <div
-                  class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer"
-                >
+                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
                   <span class="text-xl text-[#4f555e] dark:text-white">
                     <SvgIcon icon="ri:image-add-line" />
                   </span>
@@ -879,9 +866,7 @@ onUnmounted(() => {
                 @finish="handleFinishText"
                 @before-upload="handleBeforeUpload"
               >
-                <div
-                  class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer"
-                >
+                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
                   <span class="text-xl text-[#4f555e] dark:text-white">
                     <SvgIcon icon="ri:attachment-2" />
                   </span>
@@ -895,19 +880,13 @@ onUnmounted(() => {
               </span>
             </HoverButton>
 
-            <HoverButton
-              v-if="!isMobile"
-              @click="handleExport"
-            >
+            <HoverButton v-if="!isMobile" @click="handleExport">
               <span class="text-xl text-[#4f555e] dark:text-white">
                 <SvgIcon icon="ri:download-2-line" />
               </span>
             </HoverButton>
 
-            <HoverButton
-              v-if="!isMobile"
-              @click="showPrompt = true"
-            >
+            <HoverButton v-if="!isMobile" @click="showPrompt = true">
               <span class="text-xl text-[#4f555e] dark:text-white">
                 <IconPrompt class="w-[20px] m-auto" />
               </span>
@@ -965,11 +944,7 @@ onUnmounted(() => {
               </template>
             </NAutoComplete>
 
-            <NButton
-              type="primary"
-              :disabled="buttonDisabled"
-              @click="handleSubmit"
-            >
+            <NButton type="primary" :disabled="buttonDisabled" @click="onConversation">
               <template #icon>
                 <span class="dark:text-black">
                   <SvgIcon icon="ri:send-plane-fill" />
@@ -981,10 +956,6 @@ onUnmounted(() => {
       </div>
     </footer>
 
-    <Prompt
-      v-if="showPrompt"
-      v-model:roomId="uuid"
-      v-model:visible="showPrompt"
-    />
+    <Prompt v-if="showPrompt" v-model:roomId="uuid" v-model:visible="showPrompt" />
   </div>
 </template>
