@@ -220,79 +220,61 @@ router.post('/chat-clear', auth, async (req, res) => {
   }
 })
 
-router.post('/chat-process', [auth, limiter], async (req, res) => {
-  res.setHeader('Content-type', 'application/octet-stream')
+/**
+ * ✅ Job化：后台执行生成并落库
+ * - 不再 res.write stream
+ * - 前端通过 /chat-process-status 轮询，结束后再 /chat-history 拉取
+ */
+async function runChatJobInBackground(params: {
+  userId: string
+  roomId: number
+  uuid: number
+  regenerate: boolean
+  prompt: string
+  uploadFileKeys?: string[]
+  options: any
+  systemMessage?: string
+  temperature?: number
+  top_p?: number
+  model: string
+  room: any
+  message: ChatInfo
+  user: UserInfo
+}) {
+  const {
+    userId,
+    roomId,
+    uuid,
+    regenerate,
+    prompt,
+    uploadFileKeys,
+    options,
+    systemMessage,
+    temperature,
+    top_p,
+    model,
+    room,
+    message,
+    user,
+  } = params
 
-  let { roomId, uuid, regenerate, prompt, uploadFileKeys, options = {}, systemMessage, temperature, top_p } = req.body as RequestProps
-  const userId = req.headers.userId.toString()
   const config = await getCacheConfig()
-  const room = await getChatRoom(userId, roomId)
-  if (room == null)
-    globalThis.console.error(`Unable to get chat room \t ${userId}\t ${roomId}`)
-  if (room != null && isNotEmptyString(room.prompt))
-    systemMessage = room.prompt
-  const model = room.chatModel
 
-  let lastResponse
+  let lastResponse: ChatMessage | undefined
   let result: null | {
     message: string
     data: ChatResponse
     status: string
-  }
-  let message: ChatInfo
-  let user = await getUserById(userId)
-  try {
-    if (userId === '6406d8c50aedd633885fa16f') {
-      user = { _id: userId, roles: [UserRole.User], useAmount: 999, advanced: { maxContextCount: 999 }, limit_switch: false } as UserInfo
-    }
-    else {
-      if (config.siteConfig?.usageCountLimit) {
-        const useAmount = user ? (user.useAmount ?? 0) : 0
-        if (useAmount <= 0 && user.limit_switch) {
-          res.send({ status: 'Fail', message: '提问次数用完啦 | Question limit reached', data: null })
-          return
-        }
-      }
-    }
+  } = null
 
-    if (config.auditConfig.enabled || config.auditConfig.customizeEnabled) {
-      if (!user.roles.includes(UserRole.Admin) && await containsSensitiveWords(config.auditConfig, prompt)) {
-        res.send({ status: 'Fail', message: '含有敏感词 | Contains sensitive words', data: null })
-        return
-      }
-    }
-    message = regenerate ? await getChat(roomId, uuid) : await insertChat(uuid, prompt, uploadFileKeys, roomId, model, options as ChatOptions)
-    let firstChunk = true
+  try {
     result = await chatReplyProcess({
       message: prompt,
       uploadFileKeys,
       lastContext: options,
+      // 可选：想写“中间结果”到DB可以在这里节流 updateChat
       process: (chat: ChatMessage) => {
         lastResponse = chat
-        const chuck = {
-          id: chat.id,
-          conversationId: chat.conversationId,
-          text: chat.text,
-          detail: {
-            choices: [
-              {
-                finish_reason: undefined,
-              },
-            ],
-          },
-        }
-        if (chat.detail && chat.detail.choices.length > 0)
-          chuck.detail.choices[0].finish_reason = chat.detail.choices[0].finish_reason
-
-        // ★★★ 核心修改 ★★★
-        try {
-          res.write(firstChunk ? JSON.stringify(chuck) : `\n${JSON.stringify(chuck)}`)
-        } catch (err) {
-          // ★★★ 添加 Log ★★★
-          // 如果你刷新页面，这里应该疯狂输出，但不会导致进程挂掉
-          console.log('[DEBUG] 前端断开了，但我还在继续生成...') 
-        }
-        firstChunk = false
       },
       systemMessage,
       temperature,
@@ -302,7 +284,8 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       tryCount: 0,
       room,
     })
-    
+
+    // 补 usage（与原逻辑一致）
     if (!result.data.detail?.usage) {
       if (!result.data.detail)
         result.data.detail = {}
@@ -312,29 +295,19 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       result.data.detail.usage.total_tokens = result.data.detail.usage.prompt_tokens + result.data.detail.usage.completion_tokens
       result.data.detail.usage.estimated = true
     }
-    
-    try {
-      res.write(`\n${JSON.stringify(result.data)}`)
-    } catch (err) {}
   }
-  catch (error) {
-    try {
-      res.write(JSON.stringify({ message: error?.message }))
-    } catch (err) {}
+  catch (error: any) {
+    console.error('[Job] chatReplyProcess error:', error)
 
-    // 确保 finally 中能拿到 result，避免后续继续抛出 TypeError
+    // 确保 finally 中能拿到 result
     result = {
       status: 'Fail',
       message: error?.message ?? 'Please check the back-end console',
-      data: lastResponse ?? { text: error?.message ?? '' } as any,
+      data: (lastResponse ?? { text: error?.message ?? '' } as any),
     }
   }
   finally {
-    try {
-      res.end()
-    } catch (err) {}
-
-    // === 这里开始是新的安全兜底逻辑 ===
+    // === 与原 finally 等价的安全兜底 ===
     const safeResult = result ?? {
       status: 'Fail',
       message: lastResponse?.text ?? 'Unknown error',
@@ -348,44 +321,143 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       return
 
     if (safeResult.status !== 'Success') {
-      lastResponse = lastResponse ?? { text: safeResult.message }
+      lastResponse = lastResponse ?? { text: safeResult.message } as any
       safeResult.data = lastResponse as any
     }
 
-    const resultData = safeResult.data
+    const resultData = safeResult.data as any
 
-    if (regenerate && message.options.messageId) {
-      const previousResponse = message.previousResponse || []
-      previousResponse.push({ response: message.response, options: message.options })
-      await updateChat(message._id as unknown as string,
-        resultData.text,
-        resultData.id,
-        resultData.conversationId,
-        model,
-        resultData.detail?.usage as UsageResponse,
-        previousResponse as [])
+    try {
+      // 写入主表 chat（与原逻辑一致）
+      if (regenerate && message.options?.messageId) {
+        const previousResponse = message.previousResponse || []
+        previousResponse.push({ response: message.response, options: message.options })
+        await updateChat(
+          message._id as unknown as string,
+          resultData.text,
+          resultData.id,
+          resultData.conversationId,
+          model,
+          resultData.detail?.usage as UsageResponse,
+          previousResponse as [],
+        )
+      }
+      else {
+        await updateChat(
+          message._id as unknown as string,
+          resultData.text,
+          resultData.id,
+          resultData.conversationId,
+          model,
+          resultData.detail?.usage as UsageResponse,
+        )
+      }
+
+      // usage 记录
+      if (resultData.detail?.usage) {
+        await insertChatUsage(
+          ObjectId.createFromHexString(userId),
+          roomId,
+          message._id,
+          resultData.id,
+          model,
+          resultData.detail?.usage as UsageResponse,
+        )
+      }
+
+      // 次数扣减（与原逻辑一致）
+      if (config.siteConfig?.usageCountLimit) {
+        if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
+          await updateAmountMinusOne(userId)
+      }
+    }
+    catch (e) {
+      console.error('[Job] persist result failed:', e)
+    }
+  }
+}
+
+router.post('/chat-process', [auth, limiter], async (req, res) => {
+  let { roomId, uuid, regenerate, prompt, uploadFileKeys, options = {}, systemMessage, temperature, top_p } = req.body as RequestProps
+  const userId = req.headers.userId.toString()
+  const config = await getCacheConfig()
+
+  // ✅ 防止一个用户同时开多个后台任务导致资源失控（你也可以改成排队）
+  const state = getChatProcessState(userId)
+  if (state.isProcessing) {
+    res.send({ status: 'Fail', message: '当前已有生成任务在进行中，请稍后或先停止生成。', data: null })
+    return
+  }
+
+  const room = await getChatRoom(userId, roomId)
+  if (room == null)
+    globalThis.console.error(`Unable to get chat room \t ${userId}\t ${roomId}`)
+  if (room != null && isNotEmptyString(room.prompt))
+    systemMessage = room.prompt
+  const model = room.chatModel
+
+  let user = await getUserById(userId)
+
+  try {
+    // guest
+    if (userId === '6406d8c50aedd633885fa16f') {
+      user = { _id: userId, roles: [UserRole.User], useAmount: 999, advanced: { maxContextCount: 999 }, limit_switch: false } as any
     }
     else {
-      await updateChat(message._id as unknown as string,
-        resultData.text,
-        resultData.id,
-        resultData.conversationId,
-        model,
-        resultData.detail?.usage as UsageResponse)
+      if (config.siteConfig?.usageCountLimit) {
+        const useAmount = user ? (user.useAmount ?? 0) : 0
+        if (useAmount <= 0 && user.limit_switch) {
+          res.send({ status: 'Fail', message: '提问次数用完啦 | Question limit reached', data: null })
+          return
+        }
+      }
     }
 
-    if (resultData.detail?.usage) {
-      await insertChatUsage(ObjectId.createFromHexString(req.headers.userId),
+    // audit
+    if (config.auditConfig.enabled || config.auditConfig.customizeEnabled) {
+      if (!user.roles.includes(UserRole.Admin) && await containsSensitiveWords(config.auditConfig, prompt)) {
+        res.send({ status: 'Fail', message: '含有敏感词 | Contains sensitive words', data: null })
+        return
+      }
+    }
+
+    // 创建/获取 chat 记录（与原逻辑一致）
+    const message: ChatInfo = regenerate
+      ? await getChat(roomId, uuid)
+      : await insertChat(uuid, prompt, uploadFileKeys, roomId, model, options as ChatOptions)
+
+    // ✅ 立刻返回“已受理”，让前端去轮询
+    res.send({
+      status: 'Success',
+      message: 'Accepted',
+      data: {
+        jobId: message._id.toString(),
         roomId,
-        message._id,
-        resultData.id,
-        model,
-        resultData.detail?.usage as UsageResponse)
-    }
-    if (config.siteConfig?.usageCountLimit) {
-      if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
-        await updateAmountMinusOne(userId)
-    }
+        uuid,
+      },
+    })
+
+    // ✅ 后台异步执行（不 await）
+    void runChatJobInBackground({
+      userId,
+      roomId,
+      uuid,
+      regenerate,
+      prompt,
+      uploadFileKeys,
+      options,
+      systemMessage,
+      temperature,
+      top_p,
+      model,
+      room,
+      message,
+      user,
+    })
+  }
+  catch (error: any) {
+    console.error(error)
+    res.send({ status: 'Fail', message: error?.message ?? 'Submit job failed', data: null })
   }
 })
 
@@ -402,7 +474,7 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
     res.send({ status: 'Success', message: 'OK', data: null })
   }
   catch (error) {
-    res.send({ status: 'Fail', message: '重置邮件已发送 | Reset email has been sent', data: null })
+    res.send({ status: 'Fail', message: 'Abort failed', data: null })
   }
 })
 
