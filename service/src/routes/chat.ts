@@ -343,8 +343,8 @@ async function runChatJobInBackground(params: {
   let lastResponse: any
   let result: any = null
 
-  // ✅ 节流参数：每 N ms 落库一次（默认 800ms）
-  const FLUSH_INTERVAL_MS = Number(process.env.JOB_FLUSH_MS ?? 800)
+  // ✅ 节流参数：每 N ms 落库一次（默认 300ms）
+  const FLUSH_INTERVAL_MS = Number(process.env.JOB_FLUSH_MS ?? 300)
   let lastFlushTime = 0
   let lastFlushedLen = 0
 
