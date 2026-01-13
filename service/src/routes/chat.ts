@@ -3,7 +3,7 @@ import type { TiktokenModel } from 'gpt-token'
 import { textTokens } from 'gpt-token'
 import Router from 'express'
 import { limiter } from '../middleware/limiter'
-import { abortChatProcess, chatReplyProcess, containsSensitiveWords, getChatProcessState } from '../chatgpt'
+import { abortChatProcess, chatReplyProcess, containsSensitiveWords } from '../chatgpt'
 import { auth } from '../middleware/auth'
 import { getCacheConfig } from '../storage/config'
 import type { ChatInfo, ChatOptions, UserInfo } from '../storage/model'
@@ -21,12 +21,25 @@ import {
   insertChatUsage,
   updateAmountMinusOne,
   updateChat,
-  updateChatResponsePartial, // ✅ 下面 mongo.ts 里会让你新增这个函数
+  updateChatResponsePartial,
 } from '../storage/mongo'
 import { isNotEmptyString } from '../utils/is'
 import type { RequestProps } from '../types'
 
 export const router = Router()
+
+/**
+ * ✅ Job 状态（解决“status 提前结束导致前端刷新拿不到数据”的竞态）
+ * key = userId
+ */
+type JobState = {
+  status: 'running' | 'done'
+  roomId: number
+  uuid: number
+  chatId: string // chat _id (用于 abort 定位)
+  updatedAt: number
+}
+const jobStates = new Map<string, JobState>()
 
 router.get('/chat-history', auth, async (req, res) => {
   try {
@@ -34,6 +47,7 @@ router.get('/chat-history', auth, async (req, res) => {
     const roomId = +req.query.roomId
     const lastId = req.query.lastId as string
     const all = req.query.all as string
+
     if ((!roomId || !await existsChatRoom(userId, roomId)) && (all === null || all === 'undefined' || all === undefined || all.trim().length === 0)) {
       res.send({ status: 'Success', message: null, data: [] })
       return
@@ -49,7 +63,7 @@ router.get('/chat-history', auth, async (req, res) => {
             return
           }
         }
-        catch (error) {
+        catch (error: any) {
           res.send({ status: 'Unauthorized', message: error.message ?? 'Please authenticate.', data: null })
         }
       }
@@ -59,7 +73,8 @@ router.get('/chat-history', auth, async (req, res) => {
     }
 
     const chats = await getChats(roomId, !isNotEmptyString(lastId) ? null : Number.parseInt(lastId), all)
-    const result = []
+    const result: any[] = []
+
     chats.forEach((c) => {
       if (c.status !== Status.InversionDeleted) {
         result.push({
@@ -77,8 +92,9 @@ router.get('/chat-history', auth, async (req, res) => {
           },
         })
       }
+
       if (c.status !== Status.ResponseDeleted) {
-        const usage = c.options.completion_tokens
+        const usage = c.options?.completion_tokens
           ? {
               completion_tokens: c.options.completion_tokens || null,
               prompt_tokens: c.options.prompt_tokens || null,
@@ -86,25 +102,30 @@ router.get('/chat-history', auth, async (req, res) => {
               estimated: c.options.estimated || null,
             }
           : undefined
+
         result.push({
           uuid: c.uuid,
           dateTime: new Date(c.dateTime).toLocaleString(),
           text: c.response,
           inversion: false,
           error: false,
-          loading: false, // 注意：loading 仍由前端轮询决定
+          loading: false, // loading 由前端轮询决定
           responseCount: (c.previousResponse?.length ?? 0) + 1,
-          conversationOptions: {
-            parentMessageId: c.options.messageId,
-            conversationId: c.options.conversationId,
-          },
+          conversationOptions: c.options?.messageId
+            ? {
+                parentMessageId: c.options.messageId,
+                conversationId: c.options.conversationId,
+              }
+            : null,
           requestOptions: {
             prompt: c.prompt,
-            parentMessageId: c.options.parentMessageId,
-            options: {
-              parentMessageId: c.options.messageId,
-              conversationId: c.options.conversationId,
-            },
+            parentMessageId: c.options?.parentMessageId,
+            options: c.options?.messageId
+              ? {
+                  parentMessageId: c.options.messageId,
+                  conversationId: c.options.conversationId,
+                }
+              : null,
           },
           usage,
         })
@@ -119,8 +140,67 @@ router.get('/chat-history', auth, async (req, res) => {
   }
 })
 
+router.get('/chat-response-history', auth, async (req, res) => {
+  try {
+    const userId = req.headers.userId as string
+    const roomId = +req.query.roomId
+    const uuid = +req.query.uuid
+    const index = +req.query.index
+    if (!roomId || !await existsChatRoom(userId, roomId)) {
+      res.send({ status: 'Success', message: null, data: [] })
+      return
+    }
+    const chat = await getChat(roomId, uuid)
+    if (chat.previousResponse === undefined || chat.previousResponse.length < index) {
+      res.send({ status: 'Fail', message: 'Error', data: [] })
+      return
+    }
+    const response = index >= chat.previousResponse.length
+      ? chat
+      : chat.previousResponse[index]
+    const usage = response.options?.completion_tokens
+      ? {
+          completion_tokens: response.options.completion_tokens || null,
+          prompt_tokens: response.options.prompt_tokens || null,
+          total_tokens: response.options.total_tokens || null,
+          estimated: response.options.estimated || null,
+        }
+      : undefined
+    res.send({
+      status: 'Success',
+      message: null,
+      data: {
+        uuid: chat.uuid,
+        dateTime: new Date(chat.dateTime).toLocaleString(),
+        text: response.response,
+        inversion: false,
+        error: false,
+        loading: false,
+        responseCount: (chat.previousResponse?.length ?? 0) + 1,
+        conversationOptions: {
+          parentMessageId: response.options.messageId,
+          conversationId: response.options.conversationId,
+        },
+        requestOptions: {
+          prompt: chat.prompt,
+          parentMessageId: response.options.parentMessageId,
+          options: {
+            parentMessageId: response.options.messageId,
+            conversationId: response.options.conversationId,
+          },
+        },
+        usage,
+      },
+    })
+  }
+  catch (error) {
+    console.error(error)
+    res.send({ status: 'Fail', message: 'Load error', data: null })
+  }
+})
+
 /**
- * ✅ 新增：拉取某条 chat(uuid) 的“最新 response”（用于伪流式）
+ * ✅ 新增：拉取某条 chat(uuid) 的最新 response（伪流式）
  * GET /chat-latest?roomId=xxx&uuid=yyy
  */
 router.get('/chat-latest', auth, async (req, res) => {
@@ -140,8 +220,24 @@ router.get('/chat-latest', auth, async (req, res) => {
       return
     }
 
-    const state = getChatProcessState(userId)
-    const isProcessing = !!(state.isProcessing && Number(state.roomId) === roomId && state.messageId === chat._id?.toString())
+    const job = jobStates.get(userId)
+    const isProcessing = !!(job?.status === 'running' && job.roomId === roomId && job.uuid === uuid)
+
+    const usage = chat.options?.completion_tokens
+      ? {
+          completion_tokens: chat.options.completion_tokens || null,
+          prompt_tokens: chat.options.prompt_tokens || null,
+          total_tokens: chat.options.total_tokens || null,
+          estimated: chat.options.estimated || null,
+        }
+      : undefined
+
+    const conversationOptions = chat.options?.messageId
+      ? {
+          parentMessageId: chat.options.messageId,
+          conversationId: chat.options.conversationId,
+        }
+      : null
 
     res.send({
       status: 'Success',
@@ -149,6 +245,8 @@ router.get('/chat-latest', auth, async (req, res) => {
       data: {
         text: chat.response || '',
         isProcessing,
+        conversationOptions,
+        usage,
         chatId: chat._id?.toString(),
       },
     })
@@ -245,43 +343,39 @@ async function runChatJobInBackground(params: {
   let lastResponse: any
   let result: any = null
 
-  // ✅ 节流参数：每 500ms 落库一次
-  const FLUSH_INTERVAL_MS = Number(process.env.JOB_FLUSH_MS ?? 500)
+  // ✅ 节流参数：每 N ms 落库一次（默认 800ms）
+  const FLUSH_INTERVAL_MS = Number(process.env.JOB_FLUSH_MS ?? 800)
   let lastFlushTime = 0
   let lastFlushedLen = 0
 
-  // 开始时先写入空 response，避免前端拉到 undefined
+  // 确保 response 字段存在
   try {
     await updateChatResponsePartial(message._id.toString(), '')
-  } catch {}
+  }
+  catch {}
 
   try {
     result = await chatReplyProcess({
       message: prompt,
       uploadFileKeys,
       lastContext: options,
-      process: async (chat: any) => {
+      process: (chat: any) => {
         lastResponse = chat
-
-        // 只对文本流式（chat.text 为 string）做伪流式落库
         if (typeof chat?.text !== 'string') return
 
         const now = Date.now()
         const len = chat.text.length
 
-        // 避免频繁写库：时间 + 内容增长双条件
         if (now - lastFlushTime < FLUSH_INTERVAL_MS) return
         if (len <= lastFlushedLen) return
 
         lastFlushTime = now
         lastFlushedLen = len
 
-        // ✅ 只更新 response 字段（不碰 messageId/conversationId/usage）
-        try {
-          await updateChatResponsePartial(message._id.toString(), chat.text)
-        } catch (e) {
-          console.error('[Job] partial flush failed:', e)
-        }
+        void updateChatResponsePartial(message._id.toString(), chat.text)
+          .catch((e) => {
+            console.error('[Job] partial flush failed:', e)
+          })
       },
       systemMessage,
       temperature,
@@ -292,7 +386,7 @@ async function runChatJobInBackground(params: {
       room,
     })
 
-    // 最终补 usage（和原逻辑一致）
+    // 补 usage
     if (!result.data.detail?.usage) {
       if (!result.data.detail)
         result.data.detail = {}
@@ -304,8 +398,10 @@ async function runChatJobInBackground(params: {
     }
   }
   catch (error: any) {
-    // ✅ Abort 时，尽量用 lastResponse.text 作为最终结果，不要写“报错信息”覆盖用户已生成内容
-    const isAbort = String(error?.name).includes('Abort') || String(error?.message).toLowerCase().includes('aborted') || String(error?.message).toLowerCase().includes('canceled')
+    const isAbort =
+      String(error?.name).includes('Abort')
+      || String(error?.message).toLowerCase().includes('aborted')
+      || String(error?.message).toLowerCase().includes('canceled')
 
     console.error('[Job] chatReplyProcess error:', error?.message ?? error)
 
@@ -329,7 +425,6 @@ async function runChatJobInBackground(params: {
     }
   }
   finally {
-    // === 兜底安全逻辑 + 最终落库（类似原 finally） ===
     const safeResult = result ?? {
       status: 'Fail',
       message: lastResponse?.text ?? 'Unknown error',
@@ -339,8 +434,10 @@ async function runChatJobInBackground(params: {
     if (!safeResult.data && lastResponse)
       safeResult.data = lastResponse
 
-    if (!safeResult.data)
+    if (!safeResult.data) {
+      jobStates.set(userId, { status: 'done', roomId, uuid, chatId: message._id.toString(), updatedAt: Date.now() })
       return
+    }
 
     if (safeResult.status !== 'Success') {
       lastResponse = lastResponse ?? { text: safeResult.message }
@@ -349,25 +446,39 @@ async function runChatJobInBackground(params: {
 
     const resultData = safeResult.data as any
 
-    // 最后再写一次 response，保证 DB 是最新
+    // 最后写一次 response，保证 DB 最新
     try {
       if (typeof resultData.text === 'string')
         await updateChatResponsePartial(message._id.toString(), resultData.text)
-    } catch {}
+    }
+    catch {}
 
     try {
-      // 最终写入 messageId / conversationId / usage 等（使用原 updateChat）
-      // 注意：这一步才决定“上下文链”数据
-      await updateChat(
-        message._id as unknown as string,
-        resultData.text,
-        resultData.id,
-        resultData.conversationId,
-        model,
-        resultData.detail?.usage as UsageResponse,
-      )
+      // ✅ regenerate 处理：把旧回复塞到 previousResponse
+      if (regenerate && message.options?.messageId) {
+        const previousResponse = message.previousResponse || []
+        previousResponse.push({ response: message.response, options: message.options })
+        await updateChat(
+          message._id as unknown as string,
+          resultData.text,
+          resultData.id,
+          resultData.conversationId,
+          model,
+          resultData.detail?.usage as UsageResponse,
+          previousResponse as [],
+        )
+      }
+      else {
+        await updateChat(
+          message._id as unknown as string,
+          resultData.text,
+          resultData.id,
+          resultData.conversationId,
+          model,
+          resultData.detail?.usage as UsageResponse,
+        )
+      }
 
-      // usage 记录
       if (resultData.detail?.usage) {
         await insertChatUsage(
           ObjectId.createFromHexString(userId),
@@ -379,7 +490,6 @@ async function runChatJobInBackground(params: {
         )
       }
 
-      // 次数扣减
       if (config.siteConfig?.usageCountLimit) {
         if (userId !== '6406d8c50aedd633885fa16f' && user && user.useAmount && user.limit_switch)
           await updateAmountMinusOne(userId)
@@ -387,6 +497,22 @@ async function runChatJobInBackground(params: {
     }
     catch (e) {
       console.error('[Job] persist result failed:', e)
+    }
+    finally {
+      // ✅ DB 真正写完后才 done（避免前端“结束后刷新为空”）
+      jobStates.set(userId, {
+        status: 'done',
+        roomId,
+        uuid,
+        chatId: message._id.toString(),
+        updatedAt: Date.now(),
+      })
+
+      setTimeout(() => {
+        const s = jobStates.get(userId)
+        if (s?.status === 'done' && Date.now() - s.updatedAt > 55_000)
+          jobStates.delete(userId)
+      }, 60_000)
     }
   }
 }
@@ -396,9 +522,9 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   const userId = req.headers.userId.toString()
   const config = await getCacheConfig()
 
-  // ✅ 一个用户同一时间只允许一个任务（避免资源失控）
-  const state = getChatProcessState(userId)
-  if (state.isProcessing) {
+  // ✅ running 则拒绝（避免多个后台任务堆积）
+  const runningJob = jobStates.get(userId)
+  if (runningJob?.status === 'running') {
     res.send({ status: 'Fail', message: '当前已有生成任务在进行中，请稍后或先停止生成。', data: null })
     return
   }
@@ -413,6 +539,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   let user = await getUserById(userId)
 
   try {
+    // guest
     if (userId === '6406d8c50aedd633885fa16f') {
       user = { _id: userId, roles: [UserRole.User], useAmount: 999, advanced: { maxContextCount: 999 }, limit_switch: false } as any
     }
@@ -426,6 +553,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       }
     }
 
+    // audit
     if (config.auditConfig.enabled || config.auditConfig.customizeEnabled) {
       if (!user.roles.includes(UserRole.Admin) && await containsSensitiveWords(config.auditConfig, prompt)) {
         res.send({ status: 'Fail', message: '含有敏感词 | Contains sensitive words', data: null })
@@ -433,9 +561,19 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       }
     }
 
+    // 创建/获取 chat 记录
     const message: ChatInfo = regenerate
       ? await getChat(roomId, uuid)
       : await insertChat(uuid, prompt, uploadFileKeys, roomId, model, options as ChatOptions)
+
+    // ✅ 标记 running（注意：这里的 uuid 是本轮 chat.uuid）
+    jobStates.set(userId, {
+      status: 'running',
+      roomId,
+      uuid,
+      chatId: message._id.toString(),
+      updatedAt: Date.now(),
+    })
 
     // ✅ 立刻返回
     res.send({
@@ -479,7 +617,7 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
 
     const chatId = await abortChatProcess(userId)
 
-    // 可选：立即写一次（更快让用户看到停止时的内容）
+    // 可选：立即写一次 partial（让用户更快看到停止后的内容）
     if (chatId && typeof text === 'string') {
       try { await updateChatResponsePartial(chatId, text) } catch {}
     }
@@ -494,8 +632,27 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
 router.post('/chat-process-status', auth, async (req, res) => {
   try {
     const userId = req.headers.userId as string
-    const status = getChatProcessState(userId)
-    res.send({ status: 'Success', message: '', data: status })
+    const job = jobStates.get(userId)
+
+    if (job?.status === 'running') {
+      res.send({
+        status: 'Success',
+        message: '',
+        data: {
+          isProcessing: true,
+          roomId: job.roomId,
+          uuid: job.uuid,
+          messageId: job.chatId,
+        },
+      })
+      return
+    }
+
+    res.send({
+      status: 'Success',
+      message: '',
+      data: { isProcessing: false, roomId: null, uuid: null, messageId: null },
+    })
   }
   catch (error: any) {
     res.send({ status: 'Fail', message: error.message, data: null })
