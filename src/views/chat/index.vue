@@ -36,7 +36,7 @@ const userStore = useUserStore()
 const chatStore = useChatStore()
 
 const { isMobile } = useBasicLayout()
-const { addChat, updateChat, updateChatSome, getChatByUuidAndIndex } = useChat()
+const { addChat, updateChat, updateChatSome } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
 const { uuid } = route.params as { uuid: string }
@@ -368,7 +368,6 @@ async function handleStop() {
   controller.abort()
 
   // 把当前已展示的文本发给后端，后端会立刻写 partial（体验更好）
-  const roomId = getCurrentRoomId()
   const lastIndex = dataSources.value.length - 1
   const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion)
     ? (dataSources.value[lastIndex].text ?? '')
