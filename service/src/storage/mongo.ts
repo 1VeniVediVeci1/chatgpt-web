@@ -624,3 +624,13 @@ export async function clearUserPrompt(userId: string) {
 export async function importUserPrompt(userPromptList: UserPrompt[]) {
   await userPromptCol.insertMany(userPromptList)
 }
+
+export async function updateChatResponsePartial(chatId: string, response: string) {
+  const query = { _id: new ObjectId(chatId) }
+  const update = {
+    $set: {
+      response: response ?? '',
+    },
+  }
+  await chatCol.updateOne(query, update)
+}
