@@ -557,7 +557,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         contents,
         config: {
           responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: { imageSize: '4K' },
+          imageConfig: { 
+            aspectRatio: '16:9',
+            imageSize: '4K',
+          },
           ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
         } as any,
       } as any)
