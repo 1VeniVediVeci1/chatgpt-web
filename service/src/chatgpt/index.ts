@@ -16,12 +16,9 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
-import * as fsData from 'fs'
 
 /**
- * 兼容你现有逻辑里构造的 parts：
- * - { text: string }
- * - { inlineData: { mimeType, data(base64) } }
+ * 兼容 Gemini 构造的 parts
  */
 type GeminiPart = {
   text?: string
@@ -102,130 +99,13 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// ===================== Gemini 图片模型 Debug 工具 =====================
-// docker-compose 环境变量：DEBUG_GEMINI_IMAGE=true
-function isGeminiImageDebugEnabled() {
-  return process.env.DEBUG_GEMINI_IMAGE === 'true'
-}
-
-function debugMaxText() {
-  const n = Number(process.env.DEBUG_GEMINI_IMAGE_MAX_TEXT ?? 800)
-  return Number.isFinite(n) ? Math.max(100, n) : 800
-}
-
-function safeTruncate(str: string, max = debugMaxText()) {
-  if (!str) return ''
-  if (str.length <= max) return str
-  return `${str.slice(0, max)}...[truncated ${str.length - max}]`
-}
-
-function safeBase64Preview(b64: string, head = 24, tail = 24) {
-  if (!b64) return { len: 0, head: '', tail: '' }
-  return {
-    len: b64.length,
-    head: b64.slice(0, head),
-    tail: b64.slice(-tail),
-  }
-}
-
-function safeUrlPreview(u: string) {
-  if (!u) return ''
-  if (u.startsWith('data:')) return `data:<omitted,len=${u.length}>`
-  return safeTruncate(u, 220)
-}
-
-function debugPartSummary(part: any) {
-  const summary: any = {}
-  if (part?.text) {
-    summary.type = 'text'
-    summary.textLen = part.text.length
-    summary.textPreview = safeTruncate(part.text)
-  }
-  else if (part?.inlineData?.data) {
-    summary.type = 'inlineData'
-    summary.mimeType = part.inlineData.mimeType
-    summary.data = safeBase64Preview(part.inlineData.data)
-  }
-  else if (part?.fileData) {
-    summary.type = 'fileData'
-    summary.fileData = part.fileData
-  }
-  else {
-    summary.type = 'unknown'
-    summary.keys = Object.keys(part || {})
-  }
-  return summary
-}
-
-function debugGeminiResponseShape(response: any) {
-  const candidates = response?.candidates ?? []
-  const first = candidates?.[0]
-  const parts = first?.content?.parts ?? []
-  return {
-    topKeys: Object.keys(response || {}),
-    candidatesCount: candidates.length,
-    firstCandidateKeys: first ? Object.keys(first) : [],
-    firstContentKeys: first?.content ? Object.keys(first.content) : [],
-    partsCount: parts.length,
-    parts: parts.map((p: any, idx: number) => ({ idx, ...debugPartSummary(p) })),
-    usageMetadata: response?.usageMetadata ?? null,
-    promptFeedback: response?.promptFeedback ?? null,
-  }
-}
-
-function debugGeminiInputParts(parts: any[]) {
-  const out: any[] = []
-  for (const [i, p] of parts.entries()) {
-    if (p?.text) {
-      out.push({
-        idx: i,
-        type: 'text',
-        textLen: p.text.length,
-        textPreview: safeTruncate(p.text),
-      })
-    }
-    else if (p?.inlineData?.data) {
-      out.push({
-        idx: i,
-        type: 'inlineData',
-        mimeType: p.inlineData.mimeType,
-        data: safeBase64Preview(p.inlineData.data),
-      })
-    }
-    else {
-      out.push({ idx: i, type: 'unknown', keys: Object.keys(p || {}) })
-    }
-  }
-  return out
-}
-
-function debugGeminiHistory(history: any[]) {
-  return (history || []).map((m: any, idx: number) => {
-    const role = m?.role
-    const parts = m?.parts ?? []
-    const texts = parts
-      .filter((p: any) => p?.text)
-      .map((p: any) => safeTruncate(p.text))
-    const inlineCount = parts.filter((p: any) => p?.inlineData?.data).length
-    return { idx, role, textParts: texts, inlineCount }
-  })
-}
-// ====================================================================
-
-// ====== 解析文本中的图片引用（避免 base64 作为文本进入 Gemini） ======
-const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
+// ===================== Helper: Extract Images =====================
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
-
-// 更宽松：先抓括号内整体，再取第一个 token 当 URL（兼容 title/换行等）
 const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([\s\S]*?)\s*$/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
-
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
+const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 
-/**
- * 把 text 里出现的 data:image/...;base64,... 全部落盘到 /uploads
- * 并把 dataURL 替换为 /uploads/xxx.ext
- */
 async function replaceDataUrlImagesWithUploads(text: string): Promise<{
   text: string
   saved: Array<{ mime: string; filename: string; bytes: number }>
@@ -262,10 +142,6 @@ async function replaceDataUrlImagesWithUploads(text: string): Promise<{
   return { text: out, saved }
 }
 
-/**
- * 从一段文本中抽取所有图片 URL，并把图片位置替换成占位符 [Image]
- * - 支持 markdown 图片、HTML img、裸 data:image base64、兜底 /uploads/...
- */
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
 
@@ -298,11 +174,6 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
   return { cleanedText: cleaned, urls }
 }
 
-/**
- * 从 MessageContent(可能是 string 或 OpenAI 多模态数组) 中：
- * 1) 抽取所有图片 url
- * 2) 返回“清理后的文本”(图片位置替换成 [Image])
- */
 async function extractImageUrlsFromMessageContent(content: MessageContent): Promise<{ cleanedText: string; urls: string[] }> {
   const urls: string[] = []
   let cleanedText = ''
@@ -364,7 +235,7 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<GeminiPart | 
   return null
 }
 
-// ===== Image# 映射结构 =====
+// ===== Image Binding Type =====
 type ImageBinding = {
   tag: 'Image#1' | 'Image#2'
   kind: 'initial' | 'latest'
@@ -378,11 +249,6 @@ type HistoryMessageMeta = {
   messageId: string
 }
 
-/**
- * 根据 cleanedText 中的 `[Image]` 占位符顺序，把每个占位符替换成：
- * - [Image#1] / [Image#2]（若 url 命中映射）
- * - 否则 [Image]
- */
 function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bindings: ImageBinding[]): string {
   const map = new Map<string, ImageBinding['tag']>()
   for (const b of bindings) map.set(b.url, b.tag)
@@ -391,11 +257,9 @@ function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bi
   for (const u of urls) {
     const tag = map.get(u)
     const token = tag ? `[${tag}]` : '[Image]'
-    // 只替换第一个出现的 [Image]
     out = out.replace('[Image]', token)
   }
 
-  // 若 cleanedText 为空但有 urls，则补齐占位符
   if (!out.trim() && urls.length) {
     out = urls.map(u => (map.get(u) ? `[${map.get(u)}]` : '[Image]')).join(' ')
   }
@@ -403,9 +267,6 @@ function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bi
   return out
 }
 
-/**
- * 构造 Gemini history（只放文本），同时收集图片 url & message meta
- */
 async function buildGeminiHistoryFromLastMessageId(params: {
   lastMessageId?: string
   maxContextCount: number
@@ -452,34 +313,23 @@ async function buildGeminiHistoryFromLastMessageId(params: {
   return { metas, allUrls }
 }
 
-/**
- * 选取两张图：
- * - Image#1: 最初参考图（优先最早 user 图，否则最早图）
- * - Image#2: 最新结果图（优先最近 model 的 /uploads 图，否则最近图）
- */
 function selectTwoImages(metas: HistoryMessageMeta[], allUrls: string[], currentUrls: string[]): ImageBinding[] {
-  // 把当前输入里的图片也纳入“可选集合”（仅用于“首次就有参考图”的场景）
   const combinedAll = dedupeUrlsPreserveOrder([...allUrls, ...currentUrls])
-
   if (!combinedAll.length) return []
 
   const allInOrder = combinedAll
 
-  // 找最早 user 图
   const earliestUserUrl = (() => {
     for (const m of metas) {
       if (m.role !== 'user') continue
       for (const u of m.urls) return u
     }
-    // 如果历史没有，但当前输入有图，就用当前第一张
     return currentUrls[0]
   })()
 
   const initial = earliestUserUrl || allInOrder[0]
 
-  // 找最近 model 的 uploads 图（更像“上一轮生成结果”）
   const latestModelUploads = (() => {
-    // 从后往前找
     for (let i = metas.length - 1; i >= 0; i--) {
       const m = metas[i]
       if (m.role !== 'model') continue
@@ -509,14 +359,7 @@ export async function initApi(key: KeyConfig, {
   systemMessage,
   lastMessageId,
   isImageModel,
-}: Pick<OpenAI.ChatCompletionCreateParams, 'temperature' | 'model' | 'top_p'> & {
-  maxContextCount: number
-  content: MessageContent
-  abortSignal?: AbortSignal
-  systemMessage?: string
-  lastMessageId?: string
-  isImageModel?: boolean
-}) {
+}: any) {
   const config = await getCacheConfig()
   const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
   const openai = new OpenAI({
@@ -536,7 +379,7 @@ export async function initApi(key: KeyConfig, {
     const message = await getMessageById(lastMessageId)
     if (!message) break
 
-    let safeContent = message.text
+    let safeContent = message.text as string
     if (typeof safeContent === 'string') {
       safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
     }
@@ -577,22 +420,20 @@ export async function initApi(key: KeyConfig, {
 
     if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none') {
       ; (options as any).reasoning_effort = reasoningEffort
-      console.log(`[OpenAI] reasoning_effort enabled: model=${model}, value=${reasoningEffort}`)
     }
   }
   catch (e) {
     console.error('[OpenAI] set reasoning_effort failed:', e)
   }
 
-  console.log(`[OpenAI] Request Model: ${model}, URL: ${OPENAI_API_BASE_URL}`)
-
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
   })
 
-  return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
+  return apiResponse
 }
 
+// ✅ 修改：ProcessThreads 支持 Key (userId:roomId)
 type ProcessThread = { key: string; userId: string; roomId: number; abort: AbortController; messageId: string }
 const processThreads: ProcessThread[] = []
 const makeThreadKey = (userId: string, roomId: number) => `${userId}:${roomId}`
@@ -605,14 +446,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const customMessageId = generateMessageId()
 
   const threadKey = makeThreadKey(userId, roomId)
-  
-  // 同一 room 若已有任务，先 abort 再替换（避免孤儿任务）
+
+  // ✅ 只清除当前 Room 的旧任务，不清除其他 Room 的
   const existingIdx = processThreads.findIndex(t => t.key === threadKey)
   if (existingIdx > -1) {
     processThreads[existingIdx].abort.abort()
     processThreads.splice(existingIdx, 1)
   }
-  console.log(`[DEBUG] Pushing thread for userId: ${userId}, roomId: ${roomId}`)
+
   processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
 
   await ensureUploadDir()
@@ -620,7 +461,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
   if (!key) {
-    const idx = processThreads.findIndex(d => d.userId === userId)
+    const idx = processThreads.findIndex(d => d.key === threadKey)
     if (idx > -1) processThreads.splice(idx, 1)
     throw new Error('没有对应的 apikeys 配置，请再试一次。')
   }
@@ -656,7 +497,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
     }
 
-    const finalMessage = message + (fileContext ? `\n\nAttached Files Content:\n${fileContext}` : '')
+    const finalMessage = message + (fileContext ? `\n\nAttached Files content:\n${fileContext}` : '')
 
     if (imageFiles.length > 0) {
       content = [{ type: 'text', text: finalMessage }]
@@ -673,72 +514,34 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ====== ① Gemini 图片模型：只上传 Image#1(最初参考) + Image#2(上一轮结果) ======
+    // ① Gemini
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
-
-      // A) 历史提取（仅文本 + urls 元数据）
       const { metas, allUrls } = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
         forGeminiImageModel: true,
       })
-
-      // B) 本轮输入提取
       const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
-
-      // C) 选择两张关键图，并生成映射表
       const bindings = selectTwoImages(metas, allUrls, currentUrls)
-
-      // D) 构造 Gemini history（把历史中的 [Image] 替换为 [Image#1]/[Image#2]）
       const history = metas.map(m => {
         const labeled = applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings)
         return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
       })
 
-      // E) 仅上传两张图
-      const selectedUrls = bindings.map(b => b.url)
-
-      // 若用户在当前轮上传了新图但不在选中集里，可 debug 提醒
-      if (isGeminiImageDebugEnabled()) {
-        const ignoredCurrent = currentUrls.filter(u => !selectedUrls.includes(u))
-        if (ignoredCurrent.length) {
-          console.log('[GeminiImage DEBUG] ignoredCurrentUrls(because_only_2_images_policy)=', ignoredCurrent.map(safeUrlPreview))
-        }
-      }
-
       const inputParts: GeminiPart[] = []
-
-      // 先给一段映射说明（让模型知道 Image#1/2 分别是谁）
       if (bindings.length) {
-        const mapText = bindings.map(b => `${b.tag}=${b.kind === 'initial' ? '最初参考图' : '上一轮生成图'}(${safeUrlPreview(b.url)})`).join('\n')
+        const mapText = bindings.map(b => `${b.tag}=${b.kind === 'initial' ? '最初参考图' : '上一轮生成图'}(${b.url})`).join('\n')
         inputParts.push({ text: `【图片映射表】\n${mapText}\n` })
       }
-
-      // 每张图前都加标签文本，并紧挨着图片（关键）
       for (const b of bindings) {
         inputParts.push({ text: `【${b.tag}：${b.kind === 'initial' ? '最初参考图' : '上一轮生成图'}】` })
         const imgPart = await imageUrlToGeminiInlinePart(b.url)
         if (imgPart) inputParts.push(imgPart)
-        else inputParts.push({ text: `（警告：${b.tag} 加载失败：${safeUrlPreview(b.url)}）` })
       }
-
-      const targetTag = bindings.find(b => b.tag === 'Image#2') ? 'Image#2' : (bindings[0]?.tag ?? 'Image#1')
-      const userInstruction = (currentCleanedText && currentCleanedText.trim())
-        ? currentCleanedText.trim()
-        : '请继续生成/修改图片。'
-
+      const userInstruction = (currentCleanedText && currentCleanedText.trim()) ? currentCleanedText.trim() : '请继续生成/修改图片。'
       inputParts.push({ text: `【编辑指令】${userInstruction}` })
 
-      if (isGeminiImageDebugEnabled()) {
-        console.log('[GeminiImage DEBUG] model=', model)
-        console.log('[GeminiImage DEBUG] bindings=', bindings.map(b => ({ tag: b.tag, kind: b.kind, url: safeUrlPreview(b.url) })))
-        console.log('[GeminiImage DEBUG] history=', JSON.stringify(debugGeminiHistory(history), null, 2))
-        console.log('[GeminiImage DEBUG] selectedUrls=', selectedUrls.map(safeUrlPreview))
-        console.log('[GeminiImage DEBUG] inputParts=', JSON.stringify(debugGeminiInputParts(inputParts as any), null, 2))
-      }
-
-      // ========= 关键修改：使用 @google/genai，并支持第三方代理 baseUrl + 4K =========
       const ai = new GoogleGenAI({
         apiKey: key.key,
         ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
@@ -753,51 +556,29 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         model,
         contents,
         config: {
-          // 需要同时返回文本和图片
           responseModalities: ['TEXT', 'IMAGE'],
-          // 指定 4K
-          imageConfig: {
-              imageSize: '4K',
-          },
-          // 尽量保留你的 systemMessage 语义（不同版本 SDK 可能忽略未知字段，但不会报错）
+          imageConfig: { imageSize: '4K' },
           ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
-          // 如果你想把代理 header 也一并放在单次请求里，可以在这里追加：
-          // ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
         } as any,
       } as any)
 
-      if (isGeminiImageDebugEnabled()) {
-        console.log('[GeminiImage DEBUG] responseShape=', JSON.stringify(debugGeminiResponseShape(response as any), null, 2))
-      }
-
       if (!response.candidates || response.candidates.length === 0) {
-        throw new Error(`[Gemini] Empty candidates. usage=${JSON.stringify((response as any).usageMetadata ?? {})}`)
+        throw new Error(`[Gemini] Empty candidates.`)
       }
 
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
       for (const part of parts as any[]) {
-        // Gemini 可能把图片用 Markdown(dataURL) 塞进 text
         if (part?.text) {
           const rawText = part.text as string
           const replaced = await replaceDataUrlImagesWithUploads(rawText)
-
-          if (isGeminiImageDebugEnabled() && replaced.saved.length) {
-            console.log('[GeminiImage DEBUG] extractedDataUrlImagesFromText=', replaced.saved.map(s => ({
-              mime: s.mime,
-              filename: s.filename,
-              bytes: s.bytes,
-            })))
-          }
-
           text += replaced.text
         }
-
-        // 兼容 inlineData 输出
         const inline = part?.inlineData
         const inlineB64 = inline?.data
         if (inlineB64) {
+          // save image...
           const mime = inline.mimeType || 'image/png'
           const base64 = inlineB64 as string
           const buffer = Buffer.from(base64, 'base64')
@@ -805,17 +586,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           const filePath = path.join(UPLOAD_DIR, filename)
           await fs.writeFile(filePath, buffer)
-
-          if (isGeminiImageDebugEnabled()) {
-            console.log('[GeminiImage DEBUG] savedImageFromInlineData=', {
-              mime,
-              bytes: buffer.length,
-              filename,
-              filePath,
-              base64: safeBase64Preview(base64),
-            })
-          }
-
           const prefix = text ? '\n\n' : ''
           text += `${prefix}![Generated Image](/uploads/${filename})`
         }
@@ -861,7 +631,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ====== ② 其它模型 (OpenAI / Dall-E / Normal Gemini) ======
+    // ② OpenAI
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -877,7 +647,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let text = ''
     let chatIdRes = customMessageId
     let modelRes = ''
-    let usageRes: OpenAI.Completions.CompletionUsage
+    let usageRes: any
 
     if (isImage) {
       const response = api as any
@@ -910,6 +680,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
     else {
+      // Stream
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
         text += chunk.choices[0]?.delta.content ?? ''
         chatIdRes = customMessageId
@@ -946,24 +717,23 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       if (options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
-        const index = processThreads.findIndex(d => d.userId === threadKey)
+        const index = processThreads.findIndex(d => d.key === threadKey)
         if (index > -1) processThreads.splice(index, 1)
-
         return await chatReplyProcess(options)
       }
     }
     globalThis.console.error(error)
-
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
-    const index = processThreads.findIndex(d => d.userId === threadKey)
+    const index = processThreads.findIndex(d => d.key === threadKey)
     if (index > -1) processThreads.splice(index, 1)
   }
 }
 
+// ✅ 修改：支持 roomId
 export function abortChatProcess(userId: string, roomId: number) {
   const key = makeThreadKey(userId, roomId)
   const index = processThreads.findIndex(d => d.key === key)
@@ -1055,7 +825,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
       }
       else {
         let responseText = chatInfo.response || ''
-        // 兜底：旧数据/异常 dataURL 避免爆上下文
         if (responseText && typeof responseText === 'string') {
           responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
         }
@@ -1109,7 +878,9 @@ function getAccountId(accessToken: string): string {
   }
 }
 
+// ✅ 修改：状态支持 Key
 export function getChatProcessState(userId: string) {
+  // 原有的单用户查询在 Job 模式下已主要由路由层的 jobStates 接管，但 retain 兼容
   const thread = processThreads.find(d => d.userId === userId)
   if (thread) {
     return {
