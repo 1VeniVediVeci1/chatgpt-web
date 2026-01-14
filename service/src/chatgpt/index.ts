@@ -101,7 +101,8 @@ const _lockedKeys: { key: string; lockedTime: number }[] = []
 
 // ===================== Helper: Extract Images =====================
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([\s\S]*?)\s*$/g
+// ✅ 修正：Markdown 图片 ![alt](url "title")
+const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([^)]+?)\s*$/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
@@ -195,6 +196,8 @@ async function extractImageUrlsFromMessageContent(content: MessageContent): Prom
       }
       else if (p?.type === 'image_url' && p.image_url?.url) {
         urls.push(p.image_url.url)
+        // ✅ 关键修复：数组 content 里的 image_url 也要补占位符，后续才能打标签
+        cleanedText += (cleanedText ? '\n' : '') + '[Image]'
       }
     }
     if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'
@@ -232,13 +235,15 @@ async function imageUrlToGeminiInlinePart(urlStr: string): Promise<GeminiPart | 
     return { inlineData: { mimeType: fileData.mime, data: fileData.data } }
   }
 
+  // 目前不支持 http(s) 外链直传（如需支持，需自行下载后转 base64）
   return null
 }
 
 // ===== Image Binding Type =====
+// ✅ 改为：每次上传最近两轮的所有图片（分组打标签）
 type ImageBinding = {
-  tag: 'Image#1' | 'Image#2'
-  kind: 'initial' | 'latest'
+  tag: string
+  source: 'current_user' | 'last_ai' | 'prev_user' | 'prev_ai'
   url: string
 }
 
@@ -250,7 +255,7 @@ type HistoryMessageMeta = {
 }
 
 function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bindings: ImageBinding[]): string {
-  const map = new Map<string, ImageBinding['tag']>()
+  const map = new Map<string, string>()
   for (const b of bindings) map.set(b.url, b.tag)
 
   let out = cleanedText || ''
@@ -313,40 +318,57 @@ async function buildGeminiHistoryFromLastMessageId(params: {
   return { metas, allUrls }
 }
 
-function selectTwoImages(metas: HistoryMessageMeta[], allUrls: string[], currentUrls: string[]): ImageBinding[] {
-  const combinedAll = dedupeUrlsPreserveOrder([...allUrls, ...currentUrls])
-  if (!combinedAll.length) return []
+// ✅ 新增：取最近 N 条某角色消息（从后往前）
+function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: number): HistoryMessageMeta[] {
+  const out: HistoryMessageMeta[] = []
+  for (let i = metas.length - 1; i >= 0; i--) {
+    if (metas[i].role !== role) continue
+    out.push(metas[i]) // newest -> older
+    if (out.length >= n) break
+  }
+  return out
+}
 
-  const allInOrder = combinedAll
+// ✅ 新增：选择“最近两轮”的所有图片：
+// 本次用户(当前消息) + 最近一条AI + 上一次用户 + 倒数第二条AI
+function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: string[]): ImageBinding[] {
+  const lastModels = getLastNByRole(metas, 'model', 2) // [latest, prev]
+  const lastUsers = getLastNByRole(metas, 'user', 1)   // 只需要“上一次用户”
 
-  const earliestUserUrl = (() => {
-    for (const m of metas) {
-      if (m.role !== 'user') continue
-      for (const u of m.urls) return u
-    }
-    return currentUrls[0]
-  })()
+  const groups = [
+    { source: 'current_user' as const, tagPrefix: 'U0', urls: currentUrls },
+    { source: 'last_ai' as const, tagPrefix: 'A0', urls: lastModels[0]?.urls ?? [] },
+    { source: 'prev_user' as const, tagPrefix: 'U1', urls: lastUsers[0]?.urls ?? [] },
+    { source: 'prev_ai' as const, tagPrefix: 'A1', urls: lastModels[1]?.urls ?? [] },
+  ]
 
-  const initial = earliestUserUrl || allInOrder[0]
-
-  const latestModelUploads = (() => {
-    for (let i = metas.length - 1; i >= 0; i--) {
-      const m = metas[i]
-      if (m.role !== 'model') continue
-      for (let j = m.urls.length - 1; j >= 0; j--) {
-        const u = m.urls[j]
-        if (u && u.includes('/uploads/')) return u
-      }
-    }
-    return undefined
-  })()
-
-  const latest = latestModelUploads || allInOrder[allInOrder.length - 1]
-
+  const seen = new Set<string>()
   const bindings: ImageBinding[] = []
-  if (initial) bindings.push({ tag: 'Image#1', kind: 'initial', url: initial })
-  if (latest && latest !== initial) bindings.push({ tag: 'Image#2', kind: 'latest', url: latest })
+
+  for (const g of groups) {
+    let idx = 0
+    for (const u of g.urls) {
+      if (!u) continue
+      if (seen.has(u)) continue
+      seen.add(u)
+
+      idx += 1
+      bindings.push({
+        tag: `${g.tagPrefix}_${idx}`,
+        source: g.source,
+        url: u,
+      })
+    }
+  }
+
   return bindings
+}
+
+const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = {
+  current_user: '本次用户消息',
+  last_ai: '最近一条AI回复',
+  prev_user: '上一次用户消息',
+  prev_ai: '倒数第二条AI回复',
 }
 
 export async function initApi(key: KeyConfig, {
@@ -514,33 +536,58 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ① Gemini
+    // ① Gemini（图片模型）
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
-      const { metas, allUrls } = await buildGeminiHistoryFromLastMessageId({
+
+      // ✅ 仅构建历史（用于找“最近两轮”图片），不再需要 allUrls / 最初参考图
+      const { metas } = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
         forGeminiImageModel: true,
       })
+
+      // 当前消息提取
       const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
-      const bindings = selectTwoImages(metas, allUrls, currentUrls)
+
+      // ✅ 选择最近两轮的所有图片（按指定顺序）
+      const bindings = selectRecentTwoRoundsImages(metas, currentUrls)
+
+      // 给历史消息打标签（只会对“最近两轮图片”替换为 [U0_1]/[A0_1]...）
       const history = metas.map(m => {
         const labeled = applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings)
         return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
       })
 
+      // 当前指令也打标签（如果当前消息里有图）
+      const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
+        ? currentCleanedText.trim()
+        : '请继续生成/修改图片。'
+
+      const labeledUserInstruction = applyImageBindingsToCleanedText(
+        userInstructionBase,
+        currentUrls,
+        bindings,
+      )
+
+      // 组装 Gemini 输入：先映射表，再按顺序逐张上传
       const inputParts: GeminiPart[] = []
+
       if (bindings.length) {
-        const mapText = bindings.map(b => `${b.tag}=${b.kind === 'initial' ? '最初参考图' : '上一轮生成图'}(${b.url})`).join('\n')
-        inputParts.push({ text: `【图片映射表】\n${mapText}\n` })
+        const mapText = bindings
+          .map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${b.url})`)
+          .join('\n')
+        inputParts.push({ text: `【最近两轮图片映射表】\n${mapText}\n` })
       }
+
       for (const b of bindings) {
-        inputParts.push({ text: `【${b.tag}：${b.kind === 'initial' ? '最初参考图' : '上一轮生成图'}】` })
+        inputParts.push({ text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
         const imgPart = await imageUrlToGeminiInlinePart(b.url)
         if (imgPart) inputParts.push(imgPart)
+        else inputParts.push({ text: `（该图片无法以内联方式上传：${b.url}）` })
       }
-      const userInstruction = (currentCleanedText && currentCleanedText.trim()) ? currentCleanedText.trim() : '请继续生成/修改图片。'
-      inputParts.push({ text: `【编辑指令】${userInstruction}` })
+
+      inputParts.push({ text: `【编辑指令】${labeledUserInstruction}` })
 
       const ai = new GoogleGenAI({
         apiKey: key.key,
@@ -557,7 +604,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         contents,
         config: {
           responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: { 
+          imageConfig: {
             aspectRatio: '16:9',
             imageSize: '4K',
           },
