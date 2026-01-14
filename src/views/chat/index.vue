@@ -160,6 +160,7 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
 async function checkProcessStatus() {
   try {
     stopPolling()
+    loading.value = false // 切换前先重置
     const roomId = getCurrentRoomId()
     if (!roomId) return
 
@@ -171,7 +172,6 @@ async function checkProcessStatus() {
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 确保最后一条是 assistant 占位（text 为空，不显示“生成中”）
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(roomId, {
           uuid: Date.now(),
@@ -186,7 +186,9 @@ async function checkProcessStatus() {
         scrollToBottom()
       }
       else {
-        updateChatSome(roomId, lastIndex, { loading: true })
+        // 如果是 old 消息，强制转 loading
+        if (!dataSources.value[lastIndex].loading)
+          updateChatSome(roomId, lastIndex, { loading: true })
       }
 
       await fetchLatestAndUpdateUI(roomId, false)
@@ -212,7 +214,9 @@ function startPolling() {
         await fetchLatestAndUpdateUI(roomId, false)
       }
       else {
-        // ✅ 不刷新整房间：只 finalize 当前 room 的最后一条 assistant
+        loading.value = false
+        // 这一步确保切回来看已完成的房间时，去掉 loading
+        stopPolling()
         await fetchLatestAndUpdateUI(roomId, true)
       }
     }
@@ -234,8 +238,10 @@ const handleLoadingChain = async () => {
   const roomId = getCurrentRoomId()
   if (!roomId) return
 
+  // 1. 切换房间时先停止旧轮询
   stopPolling()
 
+  // 2. 拉取历史
   await chatStore.syncChat(
     { uuid: roomId } as Chat.History,
     undefined,
@@ -248,6 +254,7 @@ const handleLoadingChain = async () => {
       if (inputRef.value && !isMobile.value)
         (inputRef.value as any)?.focus()
 
+      // 3. 历史拉完后，检查该房间是否有运行任务
       checkProcessStatus()
     },
   )
@@ -301,7 +308,6 @@ async function onConversation() {
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // assistant 占位（空，不显示提示）
   addChat(roomId, {
     uuid: chatUuid,
     dateTime: new Date().toLocaleString(),
@@ -354,7 +360,6 @@ async function handleStop() {
     ? (dataSources.value[lastIndex].text ?? '')
     : ''
 
-  // ✅ 按 room 停止
   await post({
     url: '/chat-abort',
     data: { roomId, text: currentText },
@@ -493,9 +498,15 @@ function handleDelete(index: number, fast: boolean) {
       content: t('chat.deleteMessageConfirm'),
       positiveText: t('common.yes'),
       negativeText: t('common.no'),
-      onPositiveClick: () => chatStore.deleteChatByUuid(roomId, index),
+      onPositiveClick: () => {
+        chatStore.deleteChatByUuid(roomId, index)
+      },
     })
   }
+}
+
+function updateCurrentNavIndex(_index: number, newIndex: number) {
+  currentNavIndexRef.value = newIndex
 }
 
 function handleClear() {
@@ -508,7 +519,9 @@ function handleClear() {
     content: t('chat.clearChatConfirm'),
     positiveText: t('common.yes'),
     negativeText: t('common.no'),
-    onPositiveClick: () => chatStore.clearChatByUuid(roomId),
+    onPositiveClick: () => {
+      chatStore.clearChatByUuid(roomId)
+    },
   })
 }
 
@@ -644,11 +657,12 @@ onMounted(async () => {
 watch(
   () => chatStore.active,
   () => {
+    // 切换房间：停止旧轮询，重置一些状态
     stopPolling()
     processingUuidRef.value = null
     if (chatStore.active) {
       firstLoading.value = true
-      debouncedLoad()
+      debouncedLoad() // 重新拉取历史并 checkStatus
     }
   },
 )
@@ -692,7 +706,7 @@ onUnmounted(() => stopPolling())
                   :error="item.error"
                   :loading="item.loading"
                   @regenerate="onRegenerate(index)"
-                  @update-current-nav-index="(itemId: number) => currentNavIndexRef = itemId"
+                  @update-current-nav-index="(itemId: number) => updateCurrentNavIndex(index, itemId)"
                   @delete="(fast) => handleDelete(index, fast)"
                   @response-history="(ev) => onResponseHistory(index, ev)"
                 />
