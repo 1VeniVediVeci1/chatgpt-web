@@ -13,16 +13,11 @@ import HeaderComponent from './components/Header/index.vue'
 import { HoverButton, SvgIcon } from '@/components/common'
 import { useBasicLayout } from '@/hooks/useBasicLayout'
 import { useAuthStore, useChatStore, usePromptStore, useUserStore } from '@/store'
-import {
-  fetchChatAPIProcess,
-  fetchChatProcessStatus,
-  fetchChatResponseoHistory,
-  fetchChatStopResponding,
-} from '@/api'
+import { fetchChatAPIProcess, fetchChatResponseoHistory } from '@/api'
 import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
-import { get } from '@/utils/request'
+import { get, post } from '@/utils/request'
 
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
@@ -57,10 +52,9 @@ const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
 const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatHistory.value?.chatModel ?? userStore.userInfo.config.chatModel)
 
-// ✅ 当前正在生成的 chat.uuid（用于 /chat-latest）
+// 当前 room 正在生成的 uuid（用于 /chat-latest）
 const processingUuidRef = ref<number | null>(null)
 
-// ===== 模型分组：Gemini / 非流式(图片) / 其它 =====
 const groupedChatModelOptions = computed(() => {
   const session = authStore.session
   const base = session?.chatModels ?? []
@@ -110,6 +104,18 @@ function inferLatestUuidFromUI(): number | null {
   return dataSources.value[dataSources.value.length - 1].uuid ?? null
 }
 
+async function fetchRoomProcessStatus(roomId: number) {
+  return await post<{
+    isProcessing: boolean
+    roomId: number | null
+    uuid: number | null
+    messageId: string | null
+  }>({
+    url: '/chat-process-status',
+    data: { roomId },
+  })
+}
+
 async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
   const u = processingUuidRef.value ?? inferLatestUuidFromUI()
   if (!u) return
@@ -157,26 +163,20 @@ async function checkProcessStatus() {
     const roomId = getCurrentRoomId()
     if (!roomId) return
 
-    const { data } = await fetchChatProcessStatus<{
-      isProcessing: boolean
-      roomId: number | null
-      uuid: number | null
-      messageId: string | null
-    }>()
-
-    if (data.isProcessing && Number(data.roomId) === roomId) {
+    const { data } = await fetchRoomProcessStatus(roomId)
+    if (data.isProcessing) {
       loading.value = true
-      processingUuidRef.value = data.uuid ?? processingUuidRef.value ?? inferLatestUuidFromUI()
+      processingUuidRef.value = data.uuid ?? inferLatestUuidFromUI()
 
       const lastIndex = dataSources.value.length - 1
       const lastItem = dataSources.value[lastIndex]
 
-      // 确保最后一条是 assistant（用于承载伪流式内容）
+      // 确保最后一条是 assistant 占位（text 为空，不显示“生成中”）
       if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
         addChat(roomId, {
           uuid: Date.now(),
           dateTime: new Date().toLocaleString(),
-          text: '', // ✅ 不显示“生成中”
+          text: '',
           loading: true,
           inversion: false,
           error: false,
@@ -193,46 +193,31 @@ async function checkProcessStatus() {
       startPolling()
     }
   }
-  catch (error) {
-    console.error('Check process status failed:', error)
+  catch (e) {
+    console.error(e)
   }
 }
 
 function startPolling() {
   stopPolling()
-
   pollInterval = setInterval(async () => {
     try {
       const roomId = getCurrentRoomId()
-      if (!roomId) {
-        stopPolling()
-        return
-      }
+      if (!roomId) return
 
-      const { data } = await fetchChatProcessStatus<{
-        isProcessing: boolean
-        roomId: number | null
-        uuid: number | null
-        messageId: string | null
-      }>()
-
-      // 其他房间在跑，不影响本房间
-      if (Number(data.roomId) !== roomId && data.isProcessing)
-        return
-
+      const { data } = await fetchRoomProcessStatus(roomId)
       if (data.isProcessing) {
         loading.value = true
-        if (data.uuid != null)
-          processingUuidRef.value = data.uuid
+        if (data.uuid != null) processingUuidRef.value = data.uuid
         await fetchLatestAndUpdateUI(roomId, false)
       }
       else {
-        // ✅ 不再“清空并刷新整房间”，只做 finalize 收尾
+        // ✅ 不刷新整房间：只 finalize 当前 room 的最后一条 assistant
         await fetchLatestAndUpdateUI(roomId, true)
       }
     }
-    catch (error) {
-      console.error('Poll error', error)
+    catch (e) {
+      console.error(e)
       stopPolling()
     }
   }, 2000)
@@ -272,8 +257,8 @@ const debouncedLoad = debounce(handleLoadingChain, 200)
 
 async function onConversation() {
   let message = prompt.value
-  if (loading.value) return
   if (!message || message.trim() === '') return
+  if (loading.value) return
 
   const roomId = getCurrentRoomId()
   if (!roomId) return
@@ -296,7 +281,6 @@ async function onConversation() {
   const chatUuid = Date.now()
   processingUuidRef.value = chatUuid
 
-  // 用户消息
   addChat(roomId, {
     uuid: chatUuid,
     dateTime: new Date().toLocaleString(),
@@ -312,17 +296,16 @@ async function onConversation() {
   loading.value = true
   prompt.value = ''
 
-  // 上下文
   let options: Chat.ConversationRequest = {}
   const lastContext = conversationList.value[conversationList.value.length - 1]?.conversationOptions
   if (lastContext && usingContext.value)
     options = { ...lastContext }
 
-  // assistant 占位（不显示任何提示文字）
+  // assistant 占位（空，不显示提示）
   addChat(roomId, {
     uuid: chatUuid,
     dateTime: new Date().toLocaleString(),
-    text: '', // ✅ 不显示“生成中…”
+    text: '',
     loading: true,
     inversion: false,
     error: false,
@@ -332,7 +315,6 @@ async function onConversation() {
   scrollToBottom()
 
   try {
-    // 提交后台任务（立即返回）
     await fetchChatAPIProcess<{ jobId: string }>({
       roomId,
       uuid: chatUuid,
@@ -342,7 +324,6 @@ async function onConversation() {
       options,
       signal: controller.signal,
     })
-
     startPolling()
   }
   catch (error: any) {
@@ -367,20 +348,17 @@ async function handleStop() {
 
   controller.abort()
 
-  // 把当前已展示的文本发给后端，后端会立刻写 partial（体验更好）
+  const roomId = getCurrentRoomId()
   const lastIndex = dataSources.value.length - 1
   const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion)
     ? (dataSources.value[lastIndex].text ?? '')
     : ''
 
-  try {
-    await fetchChatStopResponding(currentText, '', '')
-  }
-  catch {
-    // ignore
-  }
-
-  // 不立即 stopPolling：让轮询自然检测到 done，然后 finalize
+  // ✅ 按 room 停止
+  await post({
+    url: '/chat-abort',
+    data: { roomId, text: currentText },
+  }).catch(() => {})
 }
 
 async function onRegenerate(index: number) {
@@ -411,7 +389,7 @@ async function onRegenerate(index: number) {
 
   updateChat(roomId, index, {
     dateTime: new Date().toLocaleString(),
-    text: '', // ✅ 不显示“重新生成中…”
+    text: '',
     inversion: false,
     responseCount,
     error: false,
@@ -489,7 +467,6 @@ function handleExport() {
         tempLink.click()
         document.body.removeChild(tempLink)
         window.URL.revokeObjectURL(imgUrl)
-        d.loading = false
         ms.success(t('chat.exportSuccess'))
       }
       catch {
@@ -516,15 +493,9 @@ function handleDelete(index: number, fast: boolean) {
       content: t('chat.deleteMessageConfirm'),
       positiveText: t('common.yes'),
       negativeText: t('common.no'),
-      onPositiveClick: () => {
-        chatStore.deleteChatByUuid(roomId, index)
-      },
+      onPositiveClick: () => chatStore.deleteChatByUuid(roomId, index),
     })
   }
-}
-
-function updateCurrentNavIndex(_index: number, newIndex: number) {
-  currentNavIndexRef.value = newIndex
 }
 
 function handleClear() {
@@ -537,9 +508,7 @@ function handleClear() {
     content: t('chat.clearChatConfirm'),
     positiveText: t('common.yes'),
     negativeText: t('common.no'),
-    onPositiveClick: () => {
-      chatStore.clearChatByUuid(roomId)
-    },
+    onPositiveClick: () => chatStore.clearChatByUuid(roomId),
   })
 }
 
@@ -684,9 +653,7 @@ watch(
   },
 )
 
-onUnmounted(() => {
-  stopPolling()
-})
+onUnmounted(() => stopPolling())
 </script>
 
 <template>
@@ -725,15 +692,13 @@ onUnmounted(() => {
                   :error="item.error"
                   :loading="item.loading"
                   @regenerate="onRegenerate(index)"
-                  @update-current-nav-index="(itemId: number) => updateCurrentNavIndex(index, itemId)"
+                  @update-current-nav-index="(itemId: number) => currentNavIndexRef = itemId"
                   @delete="(fast) => handleDelete(index, fast)"
                   @response-history="(ev) => onResponseHistory(index, ev)"
                 />
                 <div class="sticky bottom-0 left-0 flex justify-center">
                   <NButton v-if="loading" type="warning" @click="handleStop">
-                    <template #icon>
-                      <SvgIcon icon="ri:stop-circle-line" />
-                    </template>
+                    <template #icon><SvgIcon icon="ri:stop-circle-line" /></template>
                     Stop Responding
                   </NButton>
                 </div>
@@ -769,117 +734,65 @@ onUnmounted(() => {
 
           <div class="flex items-center space-x-2">
             <div>
-              <NUpload
-                action="/api/upload-image"
-                multiple
-                :max="100"
-                :headers="uploadHeaders"
-                :show-file-list="false"
-                response-type="json"
-                accept="image/*"
-                @finish="handleFinishImage"
-                @before-upload="handleBeforeUpload"
-              >
+              <NUpload action="/api/upload-image" multiple :max="100" :headers="uploadHeaders" :show-file-list="false" response-type="json" accept="image/*"
+                @finish="handleFinishImage" @before-upload="handleBeforeUpload">
                 <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                  <span class="text-xl text-[#4f555e] dark:text-white">
-                    <SvgIcon icon="ri:image-add-line" />
-                  </span>
+                  <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:image-add-line" /></span>
                 </div>
               </NUpload>
             </div>
 
             <div>
-              <NUpload
-                action="/api/upload-image"
-                multiple
-                :max="100"
-                :headers="uploadHeaders"
-                :show-file-list="false"
-                response-type="json"
+              <NUpload action="/api/upload-image" multiple :max="100" :headers="uploadHeaders" :show-file-list="false" response-type="json"
                 accept=".txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log,.ini,.config"
-                @finish="handleFinishText"
-                @before-upload="handleBeforeUpload"
-              >
+                @finish="handleFinishText" @before-upload="handleBeforeUpload">
                 <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                  <span class="text-xl text-[#4f555e] dark:text-white">
-                    <SvgIcon icon="ri:attachment-2" />
-                  </span>
+                  <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:attachment-2" /></span>
                 </div>
               </NUpload>
             </div>
 
             <HoverButton @click="handleClear">
-              <span class="text-xl text-[#4f555e] dark:text-white">
-                <SvgIcon icon="ri:delete-bin-line" />
-              </span>
+              <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:delete-bin-line" /></span>
             </HoverButton>
 
             <HoverButton v-if="!isMobile" @click="handleExport">
-              <span class="text-xl text-[#4f555e] dark:text-white">
-                <SvgIcon icon="ri:download-2-line" />
-              </span>
+              <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:download-2-line" /></span>
             </HoverButton>
 
             <HoverButton v-if="!isMobile" @click="showPrompt = true">
-              <span class="text-xl text-[#4f555e] dark:text-white">
-                <IconPrompt class="w-[20px] m-auto" />
-              </span>
+              <span class="text-xl text-[#4f555e] dark:text-white"><IconPrompt class="w-[20px] m-auto" /></span>
             </HoverButton>
 
-            <HoverButton
-              v-if="!isMobile"
+            <HoverButton v-if="!isMobile"
               :tooltip="usingContext ? $t('chat.clickTurnOffContext') : $t('chat.clickTurnOnContext')"
               :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }"
-              @click="handleToggleUsingContext"
-            >
-              <span class="text-xl">
-                <SvgIcon icon="ri:chat-history-line" />
-              </span>
+              @click="handleToggleUsingContext">
+              <span class="text-xl"><SvgIcon icon="ri:chat-history-line" /></span>
             </HoverButton>
 
-            <NSelect
-              style="width: 250px"
-              :value="currentChatModel"
-              :options="groupedChatModelOptions"
+            <NSelect style="width: 250px" :value="currentChatModel" :options="groupedChatModelOptions"
               :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
-              @update-value="(val) => handleSyncChatModel(val)"
-            />
+              @update-value="(val) => handleSyncChatModel(val)" />
 
-            <NSlider
-              v-model:value="userStore.userInfo.advanced.maxContextCount"
-              :max="100"
-              :min="0"
-              :step="1"
-              style="width: 88px"
-              :format-tooltip="formatTooltip"
-              @update:value="() => { userStore.updateSetting(false) }"
-            />
+            <NSlider v-model:value="userStore.userInfo.advanced.maxContextCount" :max="100" :min="0" :step="1"
+              style="width: 88px" :format-tooltip="formatTooltip"
+              @update:value="() => { userStore.updateSetting(false) }" />
           </div>
 
           <div class="flex items-center justify-between space-x-2">
             <NAutoComplete v-model:value="prompt" :options="searchOptions" :render-label="renderOption">
               <template #default="{ handleInput, handleBlur, handleFocus }">
-                <NInput
-                  ref="inputRef"
-                  v-model:value="prompt"
+                <NInput ref="inputRef" v-model:value="prompt"
                   :disabled="!!authStore.session?.auth && !authStore.token && !authStore.session?.authProxyEnabled"
-                  type="textarea"
-                  :placeholder="placeholder"
+                  type="textarea" :placeholder="placeholder"
                   :autosize="{ minRows: isMobile ? 1 : 4, maxRows: isMobile ? 4 : 8 }"
-                  @input="handleInput"
-                  @focus="handleFocus"
-                  @blur="handleBlur"
-                  @keypress="handleEnter"
-                />
+                  @input="handleInput" @focus="handleFocus" @blur="handleBlur" @keypress="handleEnter" />
               </template>
             </NAutoComplete>
 
             <NButton type="primary" :disabled="buttonDisabled" @click="onConversation">
-              <template #icon>
-                <span class="dark:text-black">
-                  <SvgIcon icon="ri:send-plane-fill" />
-                </span>
-              </template>
+              <template #icon><span class="dark:text-black"><SvgIcon icon="ri:send-plane-fill" /></span></template>
             </NButton>
           </div>
         </NSpace>
