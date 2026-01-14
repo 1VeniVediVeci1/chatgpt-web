@@ -593,7 +593,9 @@ export async function initApi(key: KeyConfig, {
   return apiResponse as AsyncIterable<OpenAI.ChatCompletionChunk>
 }
 
-const processThreads: { userId: string; abort: AbortController; messageId: string; roomId: number }[] = []
+type ProcessThread = { key: string; userId: string; roomId: number; abort: AbortController; messageId: string }
+const processThreads: ProcessThread[] = []
+const makeThreadKey = (userId: string, roomId: number) => `${userId}:${roomId}`
 
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const userId = options.user._id.toString()
@@ -602,11 +604,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const abort = new AbortController()
   const customMessageId = generateMessageId()
 
-  const existingIdx = processThreads.findIndex(t => t.userId === userId)
-  if (existingIdx > -1) processThreads.splice(existingIdx, 1)
-
+  const threadKey = makeThreadKey(userId, roomId)
+  
+  // 同一 room 若已有任务，先 abort 再替换（避免孤儿任务）
+  const existingIdx = processThreads.findIndex(t => t.key === threadKey)
+  if (existingIdx > -1) {
+    processThreads[existingIdx].abort.abort()
+    processThreads.splice(existingIdx, 1)
+  }
   console.log(`[DEBUG] Pushing thread for userId: ${userId}, roomId: ${roomId}`)
-  processThreads.push({ userId, abort, messageId, roomId })
+  processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
 
   await ensureUploadDir()
   const model = options.room.chatModel
@@ -939,7 +946,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       if (options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
-        const index = processThreads.findIndex(d => d.userId === userId)
+        const index = processThreads.findIndex(d => d.userId === threadKey)
         if (index > -1) processThreads.splice(index, 1)
 
         return await chatReplyProcess(options)
@@ -952,13 +959,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
-    const index = processThreads.findIndex(d => d.userId === userId)
+    const index = processThreads.findIndex(d => d.userId === threadKey)
     if (index > -1) processThreads.splice(index, 1)
   }
 }
 
-export function abortChatProcess(userId: string) {
-  const index = processThreads.findIndex(d => d.userId === userId)
+export function abortChatProcess(userId: string, roomId: number) {
+  const key = makeThreadKey(userId, roomId)
+  const index = processThreads.findIndex(d => d.key === key)
   if (index <= -1) return
   const messageId = processThreads[index].messageId
   processThreads[index].abort.abort()
