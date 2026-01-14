@@ -30,9 +30,6 @@ export const router = Router()
 
 /**
  * ✅ Job 状态（按 userId+roomId 管理）
- * 解决：
- * - 允许不同 room 并发
- * - status 不会“提前结束导致前端刷新为空”
  */
 type JobState = {
   userId: string
@@ -98,7 +95,10 @@ router.get('/chat-history', auth, async (req, res) => {
           inversion: true,
           error: false,
           conversationOptions: null,
-          requestOptions: { prompt: c.prompt, options: null },
+          requestOptions: {
+            prompt: c.prompt,
+            options: null,
+          },
         })
       }
 
@@ -121,13 +121,19 @@ router.get('/chat-history', auth, async (req, res) => {
           loading: false,
           responseCount: (c.previousResponse?.length ?? 0) + 1,
           conversationOptions: c.options?.messageId
-            ? { parentMessageId: c.options.messageId, conversationId: c.options.conversationId }
+            ? {
+                parentMessageId: c.options.messageId,
+                conversationId: c.options.conversationId,
+              }
             : null,
           requestOptions: {
             prompt: c.prompt,
             parentMessageId: c.options?.parentMessageId,
             options: c.options?.messageId
-              ? { parentMessageId: c.options.messageId, conversationId: c.options.conversationId }
+              ? {
+                  parentMessageId: c.options.messageId,
+                  conversationId: c.options.conversationId,
+                }
               : null,
           },
           usage,
@@ -158,7 +164,9 @@ router.get('/chat-response-history', auth, async (req, res) => {
       res.send({ status: 'Fail', message: 'Error', data: [] })
       return
     }
-    const response = index >= chat.previousResponse.length ? chat : chat.previousResponse[index]
+    const response = index >= chat.previousResponse.length
+      ? chat
+      : chat.previousResponse[index]
     const usage = response.options?.completion_tokens
       ? {
           completion_tokens: response.options.completion_tokens || null,
@@ -201,8 +209,7 @@ router.get('/chat-response-history', auth, async (req, res) => {
 })
 
 /**
- * ✅ 伪流式：返回某条 uuid 的最新 response + 元数据
- * GET /chat-latest?roomId=xxx&uuid=yyy
+ * ✅ 伪流式：返回某条 uuid 的最新 response
  */
 router.get('/chat-latest', auth, async (req, res) => {
   try {
@@ -392,6 +399,8 @@ async function runChatJobInBackground(params: {
       || String(error?.message).toLowerCase().includes('aborted')
       || String(error?.message).toLowerCase().includes('canceled')
 
+    console.error('[Job] chatReplyProcess error:', error?.message ?? error)
+
     if (isAbort && lastResponse?.text) {
       result = {
         status: 'Success',
@@ -485,7 +494,6 @@ async function runChatJobInBackground(params: {
       console.error('[Job] persist result failed:', e)
     }
     finally {
-      // ✅ DB 真落库后才 done
       jobStates.set(key, {
         userId,
         roomId,
@@ -509,7 +517,6 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   const userId = req.headers.userId.toString()
   const config = await getCacheConfig()
 
-  // ✅ 同一 room 只允许一个 running job
   const key = jobKey(userId, roomId)
   const existing = jobStates.get(key)
   if (existing?.status === 'running') {
@@ -517,7 +524,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
     return
   }
 
-  // ✅ 限制用户并发（避免无限开房间把机器拖死）
+  // ✅ 限制每个用户最多 3 个并发（跨房间）
   const maxJobs = Number(process.env.MAX_RUNNING_JOBS_PER_USER ?? 3)
   if (countRunningJobs(userId) >= maxJobs) {
     res.send({ status: 'Fail', message: `并发生成达到上限(${maxJobs})，请先等待已有任务完成或停止。`, data: null })
@@ -558,7 +565,6 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       ? await getChat(roomId, uuid)
       : await insertChat(uuid, prompt, uploadFileKeys, roomId, model, options as ChatOptions)
 
-    // 标记 running（room 维度）
     jobStates.set(key, {
       userId,
       roomId,
@@ -619,10 +625,6 @@ router.post('/chat-abort', [auth, limiter], async (req, res) => {
   }
 })
 
-/**
- * ✅ status 改为“按 room 查询”
- * POST /chat-process-status { roomId }
- */
 router.post('/chat-process-status', auth, async (req, res) => {
   try {
     const userId = req.headers.userId as string
