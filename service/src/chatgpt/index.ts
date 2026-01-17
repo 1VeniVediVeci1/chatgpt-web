@@ -248,6 +248,166 @@ async function replaceDataUrlImagesWithUploads(text: string): Promise<{
   return { text: out, saved }
 }
 
+type SavedUpload = { mime: string; filename: string; bytes: number }
+
+// 单次请求内缓存，避免同一张 dataURL 重复落盘
+type DataUrlCache = Map<string, string>
+
+function parseDataUrlImage(dataUrl: string): { mime: string; base64: string } | null {
+  // 允许 mime 中出现 +.- 等
+  const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(dataUrl)
+  if (!m) return null
+  const mime = m[1] || 'image/png'
+  const base64 = (m[2] || '').replace(/\s+/g, '') // 防止有换行
+  if (!base64) return null
+  return { mime, base64 }
+}
+
+function mimeToExt(mime: string): string {
+  const t = (mime || '').toLowerCase()
+  if (t === 'image/jpeg') return 'jpg'
+  if (t === 'image/jpg') return 'jpg'
+  if (t === 'image/png') return 'png'
+  if (t === 'image/webp') return 'webp'
+  if (t === 'image/gif') return 'gif'
+  if (t === 'image/bmp') return 'bmp'
+  if (t === 'image/heic') return 'heic'
+  // 兜底：用 mime 子类型
+  const sub = t.split('/')[1]
+  return sub || 'png'
+}
+
+/**
+ * 把 dataURL(image/*;base64,...) 落盘到 /uploads 并返回 /uploads/filename
+ */
+async function saveDataUrlImageToUploads(
+  dataUrl: string,
+  cache?: DataUrlCache,
+): Promise<{ url: string; saved: SavedUpload } | null> {
+  try {
+    if (!dataUrl?.startsWith('data:image/')) return null
+
+    if (cache?.has(dataUrl)) {
+      // 已经落盘过
+      const url = cache.get(dataUrl)!
+      // 这里没法知道 bytes/mime（可选），返回一个空的 saved 也行；为了统计更准确，这里返回 null saved
+      return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } }
+    }
+
+    const parsed = parseDataUrlImage(dataUrl)
+    if (!parsed) return null
+
+    await ensureUploadDir()
+
+    const buffer = Buffer.from(parsed.base64, 'base64')
+    const ext = mimeToExt(parsed.mime)
+    const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
+    const filePath = path.join(UPLOAD_DIR, filename)
+    await fs.writeFile(filePath, buffer)
+
+    const url = `/uploads/${filename}`
+    cache?.set(dataUrl, url)
+
+    return {
+      url,
+      saved: { mime: parsed.mime, filename, bytes: buffer.length },
+    }
+  }
+  catch (e) {
+    console.error('[saveDataUrlImageToUploads] failed:', e)
+    return null
+  }
+}
+
+/**
+ * 规范化 Gemini 输入用的 MessageContent：
+ * - text part 里出现的 dataURL：落盘并替换为 /uploads/xxx
+ * - image_url.url 如果是 dataURL：落盘并替换为 /uploads/xxx
+ */
+async function normalizeMessageContentDataUrlsToUploads(
+  content: MessageContent,
+  cache?: DataUrlCache,
+): Promise<{ content: MessageContent; saved: SavedUpload[] }> {
+  const savedAll: SavedUpload[] = []
+
+  if (typeof content === 'string') {
+    const replaced = await replaceDataUrlImagesWithUploads(content)
+    savedAll.push(...replaced.saved)
+    return { content: replaced.text, saved: savedAll }
+  }
+
+  if (Array.isArray(content)) {
+    const newParts: any[] = []
+
+    for (const p of content as any[]) {
+      // text part：替换 text 中的 dataURL
+      if (p?.type === 'text' && typeof p.text === 'string') {
+        const replaced = await replaceDataUrlImagesWithUploads(p.text)
+        savedAll.push(...replaced.saved)
+        newParts.push({ ...p, text: replaced.text })
+        continue
+      }
+
+      // image_url part：如果 url 是 dataURL，落盘后替换成 /uploads/xxx
+      if (p?.type === 'image_url' && typeof p.image_url?.url === 'string') {
+        const u = p.image_url.url as string
+        if (u.startsWith('data:image/')) {
+          const r = await saveDataUrlImageToUploads(u, cache)
+          if (r?.url) {
+            savedAll.push(r.saved)
+            newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } })
+            continue
+          }
+        }
+        newParts.push(p)
+        continue
+      }
+
+      newParts.push(p)
+    }
+
+    return { content: newParts as any, saved: savedAll }
+  }
+
+  return { content, saved: savedAll }
+}
+
+/**
+ * 把 urls[] 里的 dataURL 统一落盘成 /uploads，避免后续（映射表/日志）把 base64 放进 text
+ */
+async function normalizeUrlsDataUrlsToUploads(urls: string[], cache?: DataUrlCache): Promise<{ urls: string[]; saved: SavedUpload[] }> {
+  const out: string[] = []
+  const savedAll: SavedUpload[] = []
+
+  for (const u of urls || []) {
+    if (typeof u === 'string' && u.startsWith('data:image/')) {
+      const r = await saveDataUrlImageToUploads(u, cache)
+      if (r?.url) {
+        out.push(r.url)
+        savedAll.push(r.saved)
+      }
+      else {
+        out.push(u)
+      }
+    }
+    else {
+      out.push(u)
+    }
+  }
+
+  return { urls: out, saved: savedAll }
+}
+
+/** 日志/映射表用：避免输出超长 dataURL */
+function shortUrlForLog(u: string): string {
+  if (!u) return ''
+  if (u.startsWith('data:image/')) {
+    const mime = u.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/)?.[1] ?? 'image/*'
+    return `dataUrl(${mime},len=${u.length})`
+  }
+  return u.length > 200 ? `${u.slice(0, 200)}...(len=${u.length})` : u
+}
+
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
 
@@ -677,322 +837,206 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   try {
     // ① Gemini（图片模型）
     if (isGeminiImageModel) {
-      const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
+  const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
 
-      // ✅ 仅构建历史（用于找“最近两轮”图片），不再需要 allUrls / 最初参考图
-      const { metas } = await buildGeminiHistoryFromLastMessageId({
-        lastMessageId: lastContext.parentMessageId,
-        maxContextCount,
-        forGeminiImageModel: true,
-      })
+  // ===== Scheme B: 进入 Gemini 前，把当前消息 content 内的 dataURL 全部落盘成 /uploads =====
+  const dataUrlCache: DataUrlCache = new Map()
+  const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache)
+  content = normalizedCurrent.content
+  // ============================================================================
 
-      // 当前消息提取
-      const { cleanedText: currentCleanedText, urls: currentUrls } = await extractImageUrlsFromMessageContent(content)
+  // ✅ 构建历史（用于找“最近两轮”图片）
+  const { metas } = await buildGeminiHistoryFromLastMessageId({
+    lastMessageId: lastContext.parentMessageId,
+    maxContextCount,
+    forGeminiImageModel: true,
+  })
 
-      // ✅ 选择最近两轮的所有图片（按指定顺序）
-      const bindings = selectRecentTwoRoundsImages(metas, currentUrls)
+  // ===== Scheme B: 历史 metas 里的 urls 如果是 dataURL，也统一落盘成 /uploads =====
+  const metasNormalized: HistoryMessageMeta[] = []
+  for (const m of metas) {
+    const nu = await normalizeUrlsDataUrlsToUploads(m.urls || [], dataUrlCache)
+    metasNormalized.push({ ...m, urls: nu.urls })
+  }
+  // ============================================================================
 
-      // 给历史消息打标签（只会对“最近两轮图片”替换为 [U0_1]/[A0_1]...）
-      const history = metas.map(m => {
-        const labeled = applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings)
-        return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
-      })
+  // 当前消息提取（此时 urls 已经被替换成 /uploads/xxx，不会出现巨长 dataURL）
+  const { cleanedText: currentCleanedText, urls: currentUrlsRaw } = await extractImageUrlsFromMessageContent(content)
 
-      // 当前指令也打标签（如果当前消息里有图）
-      const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
-        ? currentCleanedText.trim()
-        : '请继续生成/修改图片。'
+  // 再保险一次：如果还有 dataURL（例如其它来源拼进来的），也落盘
+  const currentUrlsNorm = await normalizeUrlsDataUrlsToUploads(currentUrlsRaw || [], dataUrlCache)
+  const currentUrls = currentUrlsNorm.urls
 
-      const labeledUserInstruction = applyImageBindingsToCleanedText(
-        userInstructionBase,
-        currentUrls,
-        bindings,
-      )
+  // ✅ 选择最近两轮的所有图片（按指定顺序）
+  const bindings = selectRecentTwoRoundsImages(metasNormalized, currentUrls)
 
-      // 组装 Gemini 输入：先映射表，再按顺序逐张上传
-      const inputParts: GeminiPart[] = []
+  // 给历史消息打标签
+  const history = metasNormalized.map(m => {
+    const labeled = applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings)
+    return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
+  })
 
-      if (bindings.length) {
-        const mapText = bindings
-          .map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${b.url})`)
-          .join('\n')
-        inputParts.push({ text: `【最近两轮图片映射表】\n${mapText}\n` })
-      }
+  // 当前指令也打标签
+  const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
+    ? currentCleanedText.trim()
+    : '请继续生成/修改图片。'
 
-      for (const b of bindings) {
-        inputParts.push({ text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
-        const imgPart = await imageUrlToGeminiInlinePart(b.url)
-        if (imgPart) inputParts.push(imgPart)
-        else inputParts.push({ text: `（该图片无法以内联方式上传：${b.url}）` })
-      }
+  const labeledUserInstruction = applyImageBindingsToCleanedText(
+    userInstructionBase,
+    currentUrls,
+    bindings,
+  )
 
-      inputParts.push({ text: `【编辑指令】${labeledUserInstruction}` })
+  // 组装 Gemini 输入：先映射表，再按顺序逐张上传
+  const inputParts: GeminiPart[] = []
 
-      const ai = new GoogleGenAI({
-        apiKey: key.key,
-        ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
-      })
+  if (bindings.length) {
+    // 映射表仍输出 url，但现在是 /uploads/xxx（短），不会再爆 token
+    const mapText = bindings
+      .map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`)
+      .join('\n')
+    inputParts.push({ text: `【最近两轮图片映射表】\n${mapText}\n` })
+  }
 
-      const contents = [
-        ...history,
-        { role: 'user', parts: inputParts },
-      ]
+  for (const b of bindings) {
+    inputParts.push({ text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
+    const imgPart = await imageUrlToGeminiInlinePart(b.url)
+    if (imgPart) inputParts.push(imgPart)
+    else inputParts.push({ text: `（该图片无法以内联方式上传：${shortUrlForLog(b.url)}）` })
+  }
 
-      // ===== DEBUG: Gemini request summary (新增) =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Request Debug] ======')
-        debugLog('[model]', model)
-        debugLog('[baseUrl]', baseUrl ?? '(default)')
-        debugLog('[systemMessage]', systemMessage ? trunc(systemMessage) : '(none)')
-        debugLog('[bindings]', safeJson(bindings.map(b => ({
-          tag: b.tag,
-          source: b.source,
-          url: b.url,
-        }))))
-        debugLog('[contentsSummary]', safeJson(summarizeGeminiContents(contents)))
-        debugLog('====== [Gemini Request Debug End] ======')
-      }
-      // =============================================
+  inputParts.push({ text: `【编辑指令】${labeledUserInstruction}` })
 
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: {
-            aspectRatio: '16:9',
-            imageSize: '4K',
-          },
-          ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
-        } as any,
-      } as any)
+  const ai = new GoogleGenAI({
+    apiKey: key.key,
+    ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
+  })
 
-      // ===== DEBUG: Gemini response summary (新增) =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Response Debug] ======')
-        debugLog('[candidatesCount]', response?.candidates?.length ?? 0)
-        const partsDbg = response?.candidates?.[0]?.content?.parts ?? []
-        debugLog('[firstCandidatePartsSummary]', safeJson(summarizeGeminiParts(partsDbg as any[])))
-        const usage = (response as any)?.usageMetadata
-        if (usage) debugLog('[usageMetadata]', usage)
-        debugLog('====== [Gemini Response Debug End] ======')
-      }
-      // ==============================================
+  const contents = [
+    ...history,
+    { role: 'user', parts: inputParts },
+  ]
 
-      if (!response.candidates || response.candidates.length === 0) {
-        throw new Error(`[Gemini] Empty candidates.`)
-      }
+  // ===== DEBUG: Gemini request summary（修正：bindings.url 不再输出长 dataURL）=====
+  if (API_DEBUG) {
+    debugLog('====== [Gemini Request Debug] ======')
+    debugLog('[model]', model)
+    debugLog('[baseUrl]', baseUrl ?? '(default)')
+    debugLog('[systemMessage]', systemMessage ? trunc(systemMessage) : '(none)')
 
-      let text = ''
-      const parts = response.candidates?.[0]?.content?.parts ?? []
+    debugLog('[normalizedCurrentSaved]', safeJson(normalizedCurrent.saved.map(s => ({
+      filename: s.filename, mime: s.mime, bytes: s.bytes,
+    }))))
 
-      for (const part of parts as any[]) {
-        if (part?.text) {
-          const rawText = part.text as string
-          const replaced = await replaceDataUrlImagesWithUploads(rawText)
-          text += replaced.text
-        }
-        const inline = part?.inlineData
-        const inlineB64 = inline?.data
-        if (inlineB64) {
-          // save image...
-          const mime = inline.mimeType || 'image/png'
-          const base64 = inlineB64 as string
-          const buffer = Buffer.from(base64, 'base64')
-          const ext = mime.split('/')[1] || 'png'
-          const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
-          const filePath = path.join(UPLOAD_DIR, filename)
-          await fs.writeFile(filePath, buffer)
-          const prefix = text ? '\n\n' : ''
-          text += `${prefix}![Generated Image](/uploads/${filename})`
-        }
-      }
+    debugLog('[bindings]', safeJson(bindings.map(b => ({
+      tag: b.tag,
+      source: b.source,
+      url: shortUrlForLog(b.url),
+    }))))
+    debugLog('[contentsSummary]', safeJson(summarizeGeminiContents(contents)))
+    debugLog('====== [Gemini Request Debug End] ======')
+  }
+  // ==============================================================================
 
-      if (!text) text = '[Gemini] Success but no text/image parts returned.'
-
-      const usageRes: any = (response as any).usageMetadata
-        ? {
-            prompt_tokens: (response as any).usageMetadata.promptTokenCount ?? 0,
-            completion_tokens: (response as any).usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: (response as any).usageMetadata.totalTokenCount ?? 0,
-            estimated: true,
-          }
-        : undefined
-
-      // ===== DEBUG: Final Gemini text (新增) =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Final Output Debug] ======')
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('[finalUsage]', usageRes ?? '(none)')
-        debugLog('====== [Gemini Final Output Debug End] ======')
-      }
-      // ============================================
-
-      process?.({
-        id: customMessageId,
-        text,
-        role: 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
-        detail: undefined,
-      })
-
-      return sendResponse({
-        type: 'Success',
-        data: {
-          object: 'chat.completion',
-          choices: [{
-            message: { role: 'assistant', content: text },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
-          created: Date.now(),
-          conversationId: lastContext.conversationId,
-          model,
-          text,
-          id: customMessageId,
-          detail: { usage: usageRes },
-        },
-      })
-    }
-
-    // ② OpenAI
-    const api = await initApi(key, {
-      model,
-      maxContextCount,
-      temperature,
-      top_p,
-      content,
-      abortSignal: abort.signal,
-      systemMessage,
-      lastMessageId: lastContext.parentMessageId,
-      isImageModel: isImage,
-    })
-
-    let text = ''
-    let chatIdRes = customMessageId
-    let modelRes = ''
-    let usageRes: any
-
-    if (isImage) {
-      const response = api as any
-      const choice = response.choices[0]
-      let rawContent = choice.message?.content || ''
-      modelRes = response.model
-      usageRes = response.usage
-
-      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) {
-        text = `![Generated Image](${rawContent})`
-      }
-      else {
-        text = rawContent
-      }
-
-      // ===== DEBUG: OpenAI non-stream response (新增) =====
-      if (API_DEBUG) {
-        debugLog('====== [OpenAI Response Debug] ======')
-        debugLog('[model]', modelRes)
-        debugLog('[usage]', usageRes ?? '(none)')
-        debugLog('[rawContentLen]', typeof rawContent === 'string' ? rawContent.length : -1)
-        debugLog('[rawContentPreview]', trunc(rawContent))
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('====== [OpenAI Response Debug End] ======')
-      }
-      // ===============================================
-
-      process?.({
-        id: customMessageId,
-        text,
-        role: choice.message.role || 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
-        detail: {
-          choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
-          created: response.created,
-          id: response.id,
-          model: response.model,
-          object: 'chat.completion',
-          usage: response.usage,
-        } as any,
-      })
-    }
-    else {
-      // Stream
-      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
-        text += chunk.choices[0]?.delta.content ?? ''
-        chatIdRes = customMessageId
-        modelRes = chunk.model
-        usageRes = usageRes || chunk.usage
-        process?.({
-          ...chunk,
-          id: customMessageId,
-          text,
-          role: chunk.choices[0]?.delta.role || 'assistant',
-          conversationId: lastContext.conversationId,
-          parentMessageId: lastContext.parentMessageId,
-        })
-      }
-
-      // ===== DEBUG: OpenAI stream final (新增) =====
-      if (API_DEBUG) {
-        debugLog('====== [OpenAI Stream Final Debug] ======')
-        debugLog('[model]', modelRes)
-        debugLog('[usage]', usageRes ?? '(none)')
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('====== [OpenAI Stream Final Debug End] ======')
-      }
-      // =============================================
-    }
-
-    return sendResponse({
-      type: 'Success',
-      data: {
-        object: 'chat.completion',
-        choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
-        created: Date.now(),
-        conversationId: lastContext.conversationId,
-        model: modelRes,
-        text,
-        id: chatIdRes,
-        detail: { usage: usageRes && { ...usageRes, estimated: false } },
+  const response = await ai.models.generateContent({
+    model,
+    contents,
+    config: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: {
+        aspectRatio: '16:9',
+        imageSize: '4K',
       },
-    })
+      ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
+    } as any,
+  } as any)
+
+  // ===== DEBUG: Gemini response summary（保留）=====
+  if (API_DEBUG) {
+    debugLog('====== [Gemini Response Debug] ======')
+    debugLog('[candidatesCount]', response?.candidates?.length ?? 0)
+    const partsDbg = response?.candidates?.[0]?.content?.parts ?? []
+    debugLog('[firstCandidatePartsSummary]', safeJson(summarizeGeminiParts(partsDbg as any[])))
+    const usage = (response as any)?.usageMetadata
+    if (usage) debugLog('[usageMetadata]', usage)
+    debugLog('====== [Gemini Response Debug End] ======')
   }
-  catch (error: any) {
-    const code = error.statusCode
-    if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
-      if (options.tryCount++ < 3) {
-        _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
-        await new Promise(resolve => setTimeout(resolve, 2000))
-        const index = processThreads.findIndex(d => d.key === threadKey)
-        if (index > -1) processThreads.splice(index, 1)
-        return await chatReplyProcess(options)
+  // ==============================================
+
+  if (!response.candidates || response.candidates.length === 0) {
+    throw new Error(`[Gemini] Empty candidates.`)
+  }
+
+  let text = ''
+  const parts = response.candidates?.[0]?.content?.parts ?? []
+
+  for (const part of parts as any[]) {
+    if (part?.text) {
+      const rawText = part.text as string
+      const replaced = await replaceDataUrlImagesWithUploads(rawText)
+      text += replaced.text
+    }
+    const inline = part?.inlineData
+    const inlineB64 = inline?.data
+    if (inlineB64) {
+      const mime = inline.mimeType || 'image/png'
+      const base64 = inlineB64 as string
+      const buffer = Buffer.from(base64, 'base64')
+      const ext = mime.split('/')[1] || 'png'
+      const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
+      const filePath = path.join(UPLOAD_DIR, filename)
+      await fs.writeFile(filePath, buffer)
+      const prefix = text ? '\n\n' : ''
+      text += `${prefix}![Generated Image](/uploads/${filename})`
+    }
+  }
+
+  if (!text) text = '[Gemini] Success but no text/image parts returned.'
+
+  const usageRes: any = (response as any).usageMetadata
+    ? {
+        prompt_tokens: (response as any).usageMetadata.promptTokenCount ?? 0,
+        completion_tokens: (response as any).usageMetadata.candidatesTokenCount ?? 0,
+        total_tokens: (response as any).usageMetadata.totalTokenCount ?? 0,
+        estimated: true,
       }
-    }
-    globalThis.console.error(error)
+    : undefined
 
-    // ===== DEBUG: Error (新增) =====
-    if (API_DEBUG) {
-      debugLog('====== [Chat Error Debug] ======')
-      debugLog('[statusCode]', code)
-      debugLog('[message]', error?.message)
-      debugLog('[stack]', error?.stack ? trunc(error.stack, 2000) : '(no stack)')
-      debugLog('====== [Chat Error Debug End] ======')
-    }
-    // ============================
+  if (API_DEBUG) {
+    debugLog('====== [Gemini Final Output Debug] ======')
+    debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
+    debugLog('[finalTextPreview]', trunc(text))
+    debugLog('[finalUsage]', usageRes ?? '(none)')
+    debugLog('====== [Gemini Final Output Debug End] ======')
+  }
 
-    if (Reflect.has(ErrorCodeMessage, code))
-      return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
-    return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
-  }
-  finally {
-    const index = processThreads.findIndex(d => d.key === threadKey)
-    if (index > -1) processThreads.splice(index, 1)
-  }
+  process?.({
+    id: customMessageId,
+    text,
+    role: 'assistant',
+    conversationId: lastContext.conversationId,
+    parentMessageId: lastContext.parentMessageId,
+    detail: undefined,
+  })
+
+  return sendResponse({
+    type: 'Success',
+    data: {
+      object: 'chat.completion',
+      choices: [{
+        message: { role: 'assistant', content: text },
+        finish_reason: 'stop',
+        index: 0,
+        logprobs: null,
+      }],
+      created: Date.now(),
+      conversationId: lastContext.conversationId,
+      model,
+      text,
+      id: customMessageId,
+      detail: { usage: usageRes },
+    },
+  })
 }
 
 // ✅ 修改：支持 roomId
