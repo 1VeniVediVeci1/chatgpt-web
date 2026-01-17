@@ -140,7 +140,9 @@ function summarizeGeminiContents(contents: any[]) {
 function summarizeOpenAIMessages(messages: any[]) {
   return (messages ?? []).map((m, idx) => {
     const content = m?.content
-    let contentType = typeof content
+
+    // 这里必须用 string，不能用 typeof content 的窄类型推断
+    let contentType: string = typeof content
     let contentLen = 0
     let contentPreview: string | undefined
 
@@ -150,8 +152,8 @@ function summarizeOpenAIMessages(messages: any[]) {
     }
     else if (Array.isArray(content)) {
       contentType = 'array'
-      // 只做结构摘要，避免巨大输出
       contentLen = content.length
+      // 只做结构摘要，避免巨大输出
       contentPreview = trunc(content.map((p: any) => ({
         type: p?.type,
         textLen: typeof p?.text === 'string' ? p.text.length : undefined,
@@ -161,8 +163,13 @@ function summarizeOpenAIMessages(messages: any[]) {
           : undefined,
       })))
     }
+    else if (content === null) {
+      contentType = 'null'
+      contentLen = 0
+      contentPreview = 'null'
+    }
     else {
-      contentType = content == null ? 'null' : 'object'
+      contentType = 'object'
       contentPreview = trunc(content)
     }
 
@@ -1024,204 +1031,151 @@ async function containsSensitiveWords(audit: AuditConfig, text: string): Promise
   }
   return false
 }
-
 async function chatConfig() {
   const config = await getOriginConfig() as ModelConfig
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
+
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
-  if (chatInfo) {
-    const parentMessageId = isPrompt
-      ? chatInfo.options.parentMessageId
-      : `prompt_${id}`
+  if (!chatInfo)
+    return undefined
 
-    if (chatInfo.status !== Status.Normal) {
-      return parentMessageId ? getMessageById(parentMessageId) : undefined
+  const parentMessageId = isPrompt
+    ? chatInfo.options.parentMessageId
+    : `prompt_${id}`
+
+  if (chatInfo.status !== Status.Normal)
+    return parentMessageId ? getMessageById(parentMessageId) : undefined
+
+  if (isPrompt) {
+    let promptText = chatInfo.prompt
+    const allFileKeys = chatInfo.images || []
+    const textFiles = allFileKeys.filter(k => isTextFile(k))
+    const imageFiles = allFileKeys.filter(k => isImageFile(k))
+
+    if (textFiles.length > 0) {
+      let fileContext = ''
+      for (const fileKey of textFiles) {
+        try {
+          const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
+          const fileContent = await fs.readFile(filePath, 'utf-8')
+          fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
+        }
+        catch { }
+      }
+      promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
     }
-    else {
-      if (isPrompt) {
-        let promptText = chatInfo.prompt
-        const allFileKeys = chatInfo.images || []
-        const textFiles = allFileKeys.filter(k => isTextFile(k))
-        const imageFiles = allFileKeys.filter(k => isImageFile(k))
 
-        if (textFiles.length > 0) {
-          let fileContext = ''
-          for (const fileKey of textFiles) {
-            try {
-              const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
-              const fileContent = await fs.readFile(filePath, 'utf-8')
-              fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            }
-            catch (e) { }
-          }
-          promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
-        }
+    if (promptText && typeof promptText === 'string')
+      promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
 
-        if (promptText && typeof promptText === 'string') {
-          promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
-        }
+    let content: MessageContent = promptText
 
-        let content: MessageContent = promptText
-
-        if (imageFiles.length > 0) {
-          content = [{ type: 'text', text: promptText }]
-          for (const image of imageFiles) {
-            content.push({
-              type: 'image_url',
-              image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
-            })
-          }
-        }
-
-        // ===== DEBUG: getMessageById prompt (可选，新增) =====
-        if (API_DEBUG) {
-          debugLog('------ [getMessageById Prompt Debug] ------')
-          debugLog('[id]', id, '[parent]', parentMessageId)
-          debugLog('[promptTextLen]', typeof promptText === 'string' ? promptText.length : -1)
-          debugLog('[promptTextPreview]', trunc(promptText))
-          debugLog('[imageFiles]', imageFiles)
-          debugLog('[textFiles]', textFiles)
-          debugLog('------------------------------------------')
-        }
-        // ===========================================
-
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'user',
-          text: content,
-        }
+    if (imageFiles.length > 0) {
+      content = [{ type: 'text', text: promptText }]
+      for (const image of imageFiles) {
+        content.push({
+          type: 'image_url',
+          image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
+        })
       }
-      else {
-        let responseText = chatInfo.response || ''
-        if (responseText && typeof responseText === 'string') {
-          responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
-        }
+    }
 
-        // ===== DEBUG: getMessageById assistant (可选，新增) =====
-        if (API_DEBUG) {
-          debugLog('------ [getMessageById Assistant Debug] ------')
-          debugLog('[id]', id, '[parent]', parentMessageId)
-          debugLog('[responseLen]', typeof responseText === 'string' ? responseText.length : -1)
-          debugLog('[responsePreview]', trunc(responseText))
-          debugLog('---------------------------------------------')
-        }
-        // ============================================
+    if (API_DEBUG) {
+      debugLog('------ [getMessageById Prompt Debug] ------')
+      debugLog('[id]', id, '[parent]', parentMessageId)
+      debugLog('[promptTextLen]', typeof promptText === 'string' ? promptText.length : -1)
+      debugLog('[promptTextPreview]', trunc(promptText))
+      debugLog('[imageFiles]', imageFiles)
+      debugLog('[textFiles]', textFiles)
+      debugLog('------------------------------------------')
+    }
 
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'assistant',
-          text: responseText,
-        }
-      }
+    return {
+      id,
+      conversationId: chatInfo.options.conversationId,
+      parentMessageId,
+      role: 'user',
+      text: content,
     }
   }
   else {
-    return undefined
-  }
-}
-async function getMessageById(id: string): Promise<ChatMessage | undefined> {
-  const isPrompt = id.startsWith('prompt_')
-  const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
+    let responseText = chatInfo.response || ''
+    if (responseText && typeof responseText === 'string')
+      responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
 
-  if (chatInfo) {
-    const parentMessageId = isPrompt
-      ? chatInfo.options.parentMessageId
-      : `prompt_${id}`
-
-    if (chatInfo.status !== Status.Normal) {
-      return parentMessageId ? getMessageById(parentMessageId) : undefined
+    if (API_DEBUG) {
+      debugLog('------ [getMessageById Assistant Debug] ------')
+      debugLog('[id]', id, '[parent]', parentMessageId)
+      debugLog('[responseLen]', typeof responseText === 'string' ? responseText.length : -1)
+      debugLog('[responsePreview]', trunc(responseText))
+      debugLog('---------------------------------------------')
     }
-    else {
-      if (isPrompt) {
-        let promptText = chatInfo.prompt
-        const allFileKeys = chatInfo.images || []
-        const textFiles = allFileKeys.filter(k => isTextFile(k))
-        const imageFiles = allFileKeys.filter(k => isImageFile(k))
 
-        if (textFiles.length > 0) {
-          let fileContext = ''
-          for (const fileKey of textFiles) {
-            try {
-              const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
-              const fileContent = await fs.readFile(filePath, 'utf-8')
-              fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
-            }
-            catch (e) { }
-          }
-          promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
-        }
-
-        if (promptText && typeof promptText === 'string') {
-          promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
-        }
-
-        let content: MessageContent = promptText
-
-        if (imageFiles.length > 0) {
-          content = [{ type: 'text', text: promptText }]
-          for (const image of imageFiles) {
-            content.push({
-              type: 'image_url',
-              image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
-            })
-          }
-        }
-
-        // ===== DEBUG: getMessageById prompt (可选，新增) =====
-        if (API_DEBUG) {
-          debugLog('------ [getMessageById Prompt Debug] ------')
-          debugLog('[id]', id, '[parent]', parentMessageId)
-          debugLog('[promptTextLen]', typeof promptText === 'string' ? promptText.length : -1)
-          debugLog('[promptTextPreview]', trunc(promptText))
-          debugLog('[imageFiles]', imageFiles)
-          debugLog('[textFiles]', textFiles)
-          debugLog('------------------------------------------')
-        }
-        // ===========================================
-
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'user',
-          text: content,
-        }
-      }
-      else {
-        let responseText = chatInfo.response || ''
-        if (responseText && typeof responseText === 'string') {
-          responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
-        }
-
-        // ===== DEBUG: getMessageById assistant (可选，新增) =====
-        if (API_DEBUG) {
-          debugLog('------ [getMessageById Assistant Debug] ------')
-          debugLog('[id]', id, '[parent]', parentMessageId)
-          debugLog('[responseLen]', typeof responseText === 'string' ? responseText.length : -1)
-          debugLog('[responsePreview]', trunc(responseText))
-          debugLog('---------------------------------------------')
-        }
-        // ============================================
-
-        return {
-          id,
-          conversationId: chatInfo.options.conversationId,
-          parentMessageId,
-          role: 'assistant',
-          text: responseText,
-        }
-      }
+    return {
+      id,
+      conversationId: chatInfo.options.conversationId,
+      parentMessageId,
+      role: 'assistant',
+      text: responseText,
     }
   }
-  else {
-    return undefined
+}
+
+/**
+ * ===== 以下三个函数是你之前丢失导致 TS2304 的根源：必须存在且只能存在一次 =====
+ */
+async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
+  if (keys.length <= 0) return null
+  _lockedKeys
+    .filter(d => d.lockedTime <= Date.now() - 1000 * 20)
+    .forEach(d => _lockedKeys.splice(_lockedKeys.indexOf(d), 1))
+
+  let unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
+  const start = Date.now()
+
+  while (unsedKeys.length <= 0) {
+    if (Date.now() - start > 3000) break
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
+  }
+
+  if (unsedKeys.length <= 0) return null
+  return unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
+}
+
+async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string): Promise<KeyConfig | undefined> {
+  let keys = (await getCacheApiKeys())
+    .filter(d => hasAnyRole(d.userRoles, user.roles))
+    .filter(d => d.chatModels.includes(chatModel))
+
+  if (accountId)
+    keys = keys.filter(d => d.keyModel === 'ChatGPTUnofficialProxyAPI' && getAccountId(d.key) === accountId)
+
+  const picked = await randomKeyConfig(keys)
+
+  if (API_DEBUG) {
+    debugLog('====== [Key Pick Debug] ======')
+    debugLog('[chatModel]', chatModel, '[accountId]', accountId ?? '(none)')
+    debugLog('[candidateKeyCount]', keys.length)
+    debugLog('[picked]', picked ? { keyModel: picked.keyModel, baseUrl: picked.baseUrl, remark: picked.remark } : '(null)')
+    debugLog('====== [Key Pick Debug End] ======')
+  }
+
+  return picked ?? undefined
+}
+
+function getAccountId(accessToken: string): string {
+  try {
+    const jwt = jwt_decode(accessToken) as JWT
+    return jwt['https://api.openai.com/auth'].user_id
+  }
+  catch {
+    return ''
   }
 }
+
+export { chatReplyProcess, chatConfig, containsSensitiveWords }
