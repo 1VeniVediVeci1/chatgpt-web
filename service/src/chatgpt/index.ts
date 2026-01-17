@@ -87,6 +87,104 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
 
 dotenv.config()
 
+/**
+ * ===================== DEBUG LOGGER (新增) =====================
+ * 用环境变量开启：
+ *   API_DEBUG=true
+ *   API_DEBUG_MAX_TEXT=800
+ *
+ * 注意：
+ * - 不打印 key
+ * - 不打印 inlineData.data（base64），只打印长度
+ */
+const API_DEBUG = process.env.API_DEBUG === 'true'
+const API_DEBUG_MAX_TEXT = Number(process.env.API_DEBUG_MAX_TEXT ?? 800)
+
+function trunc(s: any, n = API_DEBUG_MAX_TEXT): string {
+  const str = typeof s === 'string' ? s : JSON.stringify(s ?? '')
+  if (!str) return ''
+  return str.length > n ? `${str.slice(0, n)}...(truncated,total=${str.length})` : str
+}
+
+function safeJson(obj: any): string {
+  try {
+    return JSON.stringify(obj, null, 2)
+  }
+  catch (e: any) {
+    return `[Unserializable: ${e?.message ?? e}]`
+  }
+}
+
+// 不打印 base64，仅打印长度
+function summarizeGeminiParts(parts: any[]) {
+  return (parts ?? []).map((p, idx) => ({
+    idx,
+    hasText: typeof p?.text === 'string',
+    textLen: typeof p?.text === 'string' ? p.text.length : 0,
+    textPreview: typeof p?.text === 'string' ? trunc(p.text) : undefined,
+
+    hasInlineData: !!p?.inlineData,
+    inlineMime: p?.inlineData?.mimeType,
+    inlineB64Len: typeof p?.inlineData?.data === 'string' ? p.inlineData.data.length : 0,
+  }))
+}
+
+function summarizeGeminiContents(contents: any[]) {
+  return (contents ?? []).map((c, idx) => ({
+    idx,
+    role: c?.role,
+    parts: summarizeGeminiParts(c?.parts),
+  }))
+}
+
+function summarizeOpenAIMessages(messages: any[]) {
+  return (messages ?? []).map((m, idx) => {
+    const content = m?.content
+    let contentType = typeof content
+    let contentLen = 0
+    let contentPreview: string | undefined
+
+    if (typeof content === 'string') {
+      contentLen = content.length
+      contentPreview = trunc(content)
+    }
+    else if (Array.isArray(content)) {
+      contentType = 'array'
+      // 只做结构摘要，避免巨大输出
+      contentLen = content.length
+      contentPreview = trunc(content.map((p: any) => ({
+        type: p?.type,
+        textLen: typeof p?.text === 'string' ? p.text.length : undefined,
+        hasImageUrl: !!p?.image_url?.url,
+        imageUrlType: typeof p?.image_url?.url === 'string'
+          ? (p.image_url.url.startsWith('data:') ? 'dataUrl' : (p.image_url.url.startsWith('http') ? 'http' : 'other'))
+          : undefined,
+      })))
+    }
+    else {
+      contentType = content == null ? 'null' : 'object'
+      contentPreview = trunc(content)
+    }
+
+    return {
+      idx,
+      role: m?.role,
+      contentType,
+      contentLen,
+      contentPreview,
+    }
+  })
+}
+
+function debugLog(...args: any[]) {
+  if (!API_DEBUG) return
+  // eslint-disable-next-line no-console
+  console.log(...args)
+}
+/**
+ * ===================== DEBUG LOGGER END =====================
+ */
+
 const ErrorCodeMessage: Record<string, string> = {
   401: '提供错误的API密钥',
   403: '服务器拒绝访问，请稍后再试',
@@ -333,7 +431,7 @@ function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: 
 // 本次用户(当前消息) + 最近一条AI + 上一次用户 + 倒数第二条AI
 function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: string[]): ImageBinding[] {
   const lastModels = getLastNByRole(metas, 'model', 2) // [latest, prev]
-  const lastUsers = getLastNByRole(metas, 'user', 1)   // 只需要“上一次用户”
+  const lastUsers = getLastNByRole(metas, 'user', 1) // 只需要“上一次用户”
 
   const groups = [
     { source: 'current_user' as const, tagPrefix: 'U0', urls: currentUrls },
@@ -370,7 +468,6 @@ const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = {
   prev_user: '上一次用户消息',
   prev_ai: '倒数第二条AI回复',
 }
-
 export async function initApi(key: KeyConfig, {
   model,
   maxContextCount,
@@ -447,6 +544,17 @@ export async function initApi(key: KeyConfig, {
   catch (e) {
     console.error('[OpenAI] set reasoning_effort failed:', e)
   }
+
+  // ===== DEBUG: OpenAI Request Summary (新增) =====
+  if (API_DEBUG) {
+    debugLog('====== [OpenAI Request Debug] ======')
+    debugLog('[baseURL]', OPENAI_API_BASE_URL)
+    debugLog('[model]', model)
+    debugLog('[isImageModel]', !!isImageModel)
+    debugLog('[messagesSummary]', safeJson(summarizeOpenAIMessages(messages)))
+    debugLog('====== [OpenAI Request Debug End] ======')
+  }
+  // ============================================
 
   const apiResponse = await openai.chat.completions.create(options, {
     signal: abortSignal,
@@ -535,6 +643,30 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
+  // ===== DEBUG: Incoming user request (新增) =====
+  if (API_DEBUG) {
+    debugLog('====== [Chat Request Debug] ======')
+    debugLog('[roomId]', roomId, '[model]', model, '[isGeminiImageModel]', isGeminiImageModel, '[isImage]', isImage)
+    debugLog('[userMessage]', trunc(message))
+    debugLog('[uploadFileKeys]', uploadFileKeys ?? [])
+    debugLog('[contentType]', typeof content, Array.isArray(content) ? '(array content parts)' : '')
+    if (Array.isArray(content)) {
+      debugLog('[contentPartsSummary]', safeJson((content as any[]).map((p, idx) => ({
+        idx,
+        type: p?.type,
+        textLen: typeof p?.text === 'string' ? p.text.length : 0,
+        hasImageUrl: !!p?.image_url?.url,
+        imageUrlType: typeof p?.image_url?.url === 'string'
+          ? (p.image_url.url.startsWith('data:') ? 'dataUrl' : (p.image_url.url.startsWith('http') ? 'http' : 'other'))
+          : undefined,
+      }))))
+    }
+    else {
+      debugLog('[contentPreview]', trunc(content))
+    }
+    debugLog('====== [Chat Request Debug End] ======')
+  }
+  // =============================================
   try {
     // ① Gemini（图片模型）
     if (isGeminiImageModel) {
@@ -599,6 +731,22 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         { role: 'user', parts: inputParts },
       ]
 
+      // ===== DEBUG: Gemini request summary (新增) =====
+      if (API_DEBUG) {
+        debugLog('====== [Gemini Request Debug] ======')
+        debugLog('[model]', model)
+        debugLog('[baseUrl]', baseUrl ?? '(default)')
+        debugLog('[systemMessage]', systemMessage ? trunc(systemMessage) : '(none)')
+        debugLog('[bindings]', safeJson(bindings.map(b => ({
+          tag: b.tag,
+          source: b.source,
+          url: b.url,
+        }))))
+        debugLog('[contentsSummary]', safeJson(summarizeGeminiContents(contents)))
+        debugLog('====== [Gemini Request Debug End] ======')
+      }
+      // =============================================
+
       const response = await ai.models.generateContent({
         model,
         contents,
@@ -611,6 +759,18 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
         } as any,
       } as any)
+
+      // ===== DEBUG: Gemini response summary (新增) =====
+      if (API_DEBUG) {
+        debugLog('====== [Gemini Response Debug] ======')
+        debugLog('[candidatesCount]', response?.candidates?.length ?? 0)
+        const partsDbg = response?.candidates?.[0]?.content?.parts ?? []
+        debugLog('[firstCandidatePartsSummary]', safeJson(summarizeGeminiParts(partsDbg as any[])))
+        const usage = (response as any)?.usageMetadata
+        if (usage) debugLog('[usageMetadata]', usage)
+        debugLog('====== [Gemini Response Debug End] ======')
+      }
+      // ==============================================
 
       if (!response.candidates || response.candidates.length === 0) {
         throw new Error(`[Gemini] Empty candidates.`)
@@ -651,6 +811,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
             estimated: true,
           }
         : undefined
+
+      // ===== DEBUG: Final Gemini text (新增) =====
+      if (API_DEBUG) {
+        debugLog('====== [Gemini Final Output Debug] ======')
+        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
+        debugLog('[finalTextPreview]', trunc(text))
+        debugLog('[finalUsage]', usageRes ?? '(none)')
+        debugLog('====== [Gemini Final Output Debug End] ======')
+      }
+      // ============================================
 
       process?.({
         id: customMessageId,
@@ -713,6 +883,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         text = rawContent
       }
 
+      // ===== DEBUG: OpenAI non-stream response (新增) =====
+      if (API_DEBUG) {
+        debugLog('====== [OpenAI Response Debug] ======')
+        debugLog('[model]', modelRes)
+        debugLog('[usage]', usageRes ?? '(none)')
+        debugLog('[rawContentLen]', typeof rawContent === 'string' ? rawContent.length : -1)
+        debugLog('[rawContentPreview]', trunc(rawContent))
+        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
+        debugLog('[finalTextPreview]', trunc(text))
+        debugLog('====== [OpenAI Response Debug End] ======')
+      }
+      // ===============================================
+
       process?.({
         id: customMessageId,
         text,
@@ -745,6 +928,17 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           parentMessageId: lastContext.parentMessageId,
         })
       }
+
+      // ===== DEBUG: OpenAI stream final (新增) =====
+      if (API_DEBUG) {
+        debugLog('====== [OpenAI Stream Final Debug] ======')
+        debugLog('[model]', modelRes)
+        debugLog('[usage]', usageRes ?? '(none)')
+        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
+        debugLog('[finalTextPreview]', trunc(text))
+        debugLog('====== [OpenAI Stream Final Debug End] ======')
+      }
+      // =============================================
     }
 
     return sendResponse({
@@ -773,6 +967,17 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
     }
     globalThis.console.error(error)
+
+    // ===== DEBUG: Error (新增) =====
+    if (API_DEBUG) {
+      debugLog('====== [Chat Error Debug] ======')
+      debugLog('[statusCode]', code)
+      debugLog('[message]', error?.message)
+      debugLog('[stack]', error?.stack ? trunc(error.stack, 2000) : '(no stack)')
+      debugLog('====== [Chat Error Debug End] ======')
+    }
+    // ============================
+
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
@@ -791,6 +996,13 @@ export function abortChatProcess(userId: string, roomId: number) {
   const messageId = processThreads[index].messageId
   processThreads[index].abort.abort()
   processThreads.splice(index, 1)
+
+  if (API_DEBUG) {
+    debugLog('====== [Abort Debug] ======')
+    debugLog('[userId]', userId, '[roomId]', roomId, '[messageId]', messageId)
+    debugLog('====== [Abort Debug End] ======')
+  }
+
   return messageId
 }
 
@@ -817,7 +1029,6 @@ async function chatConfig() {
   const config = await getOriginConfig() as ModelConfig
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
-
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -865,6 +1076,19 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
             })
           }
         }
+
+        // ===== DEBUG: getMessageById prompt (可选，新增) =====
+        if (API_DEBUG) {
+          debugLog('------ [getMessageById Prompt Debug] ------')
+          debugLog('[id]', id, '[parent]', parentMessageId)
+          debugLog('[promptTextLen]', typeof promptText === 'string' ? promptText.length : -1)
+          debugLog('[promptTextPreview]', trunc(promptText))
+          debugLog('[imageFiles]', imageFiles)
+          debugLog('[textFiles]', textFiles)
+          debugLog('------------------------------------------')
+        }
+        // ===========================================
+
         return {
           id,
           conversationId: chatInfo.options.conversationId,
@@ -878,6 +1102,16 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
         if (responseText && typeof responseText === 'string') {
           responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
         }
+
+        // ===== DEBUG: getMessageById assistant (可选，新增) =====
+        if (API_DEBUG) {
+          debugLog('------ [getMessageById Assistant Debug] ------')
+          debugLog('[id]', id, '[parent]', parentMessageId)
+          debugLog('[responseLen]', typeof responseText === 'string' ? responseText.length : -1)
+          debugLog('[responsePreview]', trunc(responseText))
+          debugLog('---------------------------------------------')
+        }
+        // ============================================
 
         return {
           id,
@@ -893,53 +1127,101 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
     return undefined
   }
 }
+async function getMessageById(id: string): Promise<ChatMessage | undefined> {
+  const isPrompt = id.startsWith('prompt_')
+  const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
 
-async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
-  if (keys.length <= 0) return null
-  _lockedKeys.filter(d => d.lockedTime <= Date.now() - 1000 * 20).forEach(d => _lockedKeys.splice(_lockedKeys.indexOf(d), 1))
-  let unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
-  const start = Date.now()
-  while (unsedKeys.length <= 0) {
-    if (Date.now() - start > 3000) break
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    unsedKeys = keys.filter(d => _lockedKeys.filter(l => d.key === l.key).length <= 0)
-  }
-  if (unsedKeys.length <= 0) return null
-  const thisKey = unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
-  return thisKey
-}
+  if (chatInfo) {
+    const parentMessageId = isPrompt
+      ? chatInfo.options.parentMessageId
+      : `prompt_${id}`
 
-async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string): Promise<KeyConfig | undefined> {
-  let keys = (await getCacheApiKeys()).filter(d => hasAnyRole(d.userRoles, user.roles))
-    .filter(d => d.chatModels.includes(chatModel))
-  if (accountId)
-    keys = keys.filter(d => d.keyModel === 'ChatGPTUnofficialProxyAPI' && getAccountId(d.key) === accountId)
+    if (chatInfo.status !== Status.Normal) {
+      return parentMessageId ? getMessageById(parentMessageId) : undefined
+    }
+    else {
+      if (isPrompt) {
+        let promptText = chatInfo.prompt
+        const allFileKeys = chatInfo.images || []
+        const textFiles = allFileKeys.filter(k => isTextFile(k))
+        const imageFiles = allFileKeys.filter(k => isImageFile(k))
 
-  return randomKeyConfig(keys)
-}
+        if (textFiles.length > 0) {
+          let fileContext = ''
+          for (const fileKey of textFiles) {
+            try {
+              const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey))
+              const fileContent = await fs.readFile(filePath, 'utf-8')
+              fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
+            }
+            catch (e) { }
+          }
+          promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
+        }
 
-function getAccountId(accessToken: string): string {
-  try {
-    const jwt = jwt_decode(accessToken) as JWT
-    return jwt['https://api.openai.com/auth'].user_id
-  }
-  catch (error) {
-    return ''
-  }
-}
+        if (promptText && typeof promptText === 'string') {
+          promptText = promptText.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
+        }
 
-// ✅ 修改：状态支持 Key
-export function getChatProcessState(userId: string) {
-  // 原有的单用户查询在 Job 模式下已主要由路由层的 jobStates 接管，但 retain 兼容
-  const thread = processThreads.find(d => d.userId === userId)
-  if (thread) {
-    return {
-      isProcessing: true,
-      roomId: thread.roomId,
-      messageId: thread.messageId,
+        let content: MessageContent = promptText
+
+        if (imageFiles.length > 0) {
+          content = [{ type: 'text', text: promptText }]
+          for (const image of imageFiles) {
+            content.push({
+              type: 'image_url',
+              image_url: { url: await convertImageUrl(stripTypePrefix(image)) },
+            })
+          }
+        }
+
+        // ===== DEBUG: getMessageById prompt (可选，新增) =====
+        if (API_DEBUG) {
+          debugLog('------ [getMessageById Prompt Debug] ------')
+          debugLog('[id]', id, '[parent]', parentMessageId)
+          debugLog('[promptTextLen]', typeof promptText === 'string' ? promptText.length : -1)
+          debugLog('[promptTextPreview]', trunc(promptText))
+          debugLog('[imageFiles]', imageFiles)
+          debugLog('[textFiles]', textFiles)
+          debugLog('------------------------------------------')
+        }
+        // ===========================================
+
+        return {
+          id,
+          conversationId: chatInfo.options.conversationId,
+          parentMessageId,
+          role: 'user',
+          text: content,
+        }
+      }
+      else {
+        let responseText = chatInfo.response || ''
+        if (responseText && typeof responseText === 'string') {
+          responseText = responseText.replace(DATA_URL_IMAGE_RE, '[Image History]')
+        }
+
+        // ===== DEBUG: getMessageById assistant (可选，新增) =====
+        if (API_DEBUG) {
+          debugLog('------ [getMessageById Assistant Debug] ------')
+          debugLog('[id]', id, '[parent]', parentMessageId)
+          debugLog('[responseLen]', typeof responseText === 'string' ? responseText.length : -1)
+          debugLog('[responsePreview]', trunc(responseText))
+          debugLog('---------------------------------------------')
+        }
+        // ============================================
+
+        return {
+          id,
+          conversationId: chatInfo.options.conversationId,
+          parentMessageId,
+          role: 'assistant',
+          text: responseText,
+        }
+      }
     }
   }
-  return { isProcessing: false, roomId: null, messageId: null }
+  else {
+    return undefined
+  }
 }
-
-export { chatReplyProcess, chatConfig, containsSensitiveWords }
