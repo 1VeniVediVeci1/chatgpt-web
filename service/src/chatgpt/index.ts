@@ -16,6 +16,7 @@ import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from '
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
+import { abortablePromise, isAbortError } from './abortable'
 
 /**
  * 兼容 Gemini 构造的 parts
@@ -737,7 +738,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   const threadKey = makeThreadKey(userId, roomId)
 
-  // ✅ 只清除当前 Room 的旧任务，不清除其他 Room 的
+  // ✅ 只清除当前 Room 的旧任务
   const existingIdx = processThreads.findIndex(t => t.key === threadKey)
   if (existingIdx > -1) {
     processThreads[existingIdx].abort.abort()
@@ -750,6 +751,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const model = options.room.chatModel
   const key = await getRandomApiKey(options.user, model, options.room.accountId)
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
+
   if (!key) {
     const idx = processThreads.findIndex(d => d.key === threadKey)
     if (idx > -1) processThreads.splice(idx, 1)
@@ -759,6 +761,20 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   updateRoomChatModel(userId, options.room.roomId, model)
 
   const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
+
+  // ✅ 关键修复1：无论什么模型，先把“占位响应”抛给 process
+  // 这样：
+  // - runChatJobInBackground 即使在真正返回前就 abort，也能拿到 lastResponse（包含 id/conversationId）
+  // - 不会再因为 lastResponse.text 为空导致 abort 被当 Fail
+  process?.({
+    id: customMessageId,
+    text: '',
+    role: 'assistant',
+    conversationId: lastContext?.conversationId,
+    parentMessageId: lastContext?.parentMessageId,
+    detail: undefined,
+  })
+
   let content: MessageContent = message
   let fileContext = ''
   const globalConfig = await getCacheConfig()
@@ -803,89 +819,48 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
-  // ===== DEBUG: Incoming user request (新增) =====
-  if (API_DEBUG) {
-    debugLog('====== [Chat Request Debug] ======')
-    debugLog('[roomId]', roomId, '[model]', model, '[isGeminiImageModel]', isGeminiImageModel, '[isImage]', isImage)
-    debugLog('[userMessage]', trunc(message))
-    debugLog('[uploadFileKeys]', uploadFileKeys ?? [])
-    debugLog('[contentType]', typeof content, Array.isArray(content) ? '(array content parts)' : '')
-    if (Array.isArray(content)) {
-      debugLog('[contentPartsSummary]', safeJson((content as any[]).map((p, idx) => ({
-        idx,
-        type: p?.type,
-        textLen: typeof p?.text === 'string' ? p.text.length : 0,
-        hasImageUrl: !!p?.image_url?.url,
-        imageUrlType: typeof p?.image_url?.url === 'string'
-          ? (p.image_url.url.startsWith('data:') ? 'dataUrl' : (p.image_url.url.startsWith('http') ? 'http' : 'other'))
-          : undefined,
-      }))))
-    }
-    else {
-      debugLog('[contentPreview]', trunc(content))
-    }
-    debugLog('====== [Chat Request Debug End] ======')
-  }
-  // =============================================
-
   try {
+    // =========================
     // ① Gemini（图片模型）
+    // =========================
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
 
-      // ===== Scheme B: 进入 Gemini 前，把当前消息 content 内的 dataURL 全部落盘成 /uploads 并替换 =====
       const dataUrlCache: DataUrlCache = new Map()
       const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache)
       content = normalizedCurrent.content
-      // ===================================================================================================
 
-      // ✅ 构建历史（用于找“最近两轮”图片）
       const { metas } = await buildGeminiHistoryFromLastMessageId({
         lastMessageId: lastContext.parentMessageId,
         maxContextCount,
         forGeminiImageModel: true,
       })
 
-      // ===== Scheme B: 历史 metas 里提取到的 urls 如果是 dataURL，也统一落盘成 /uploads =====
       const metasNormalized: HistoryMessageMeta[] = []
       for (const m of metas) {
         const nu = await normalizeUrlsDataUrlsToUploads(m.urls || [], dataUrlCache)
         metasNormalized.push({ ...m, urls: nu.urls })
       }
-      // ============================================================================================
 
-      // 当前消息提取（此时 urls 理论上已经是 /uploads/...）
       const { cleanedText: currentCleanedText, urls: currentUrlsRaw } = await extractImageUrlsFromMessageContent(content)
-
-      // 再保险一次
       const currentUrlsNorm = await normalizeUrlsDataUrlsToUploads(currentUrlsRaw || [], dataUrlCache)
       const currentUrls = currentUrlsNorm.urls
 
-      // ✅ 选择最近两轮的所有图片（按指定顺序）
       const bindings = selectRecentTwoRoundsImages(metasNormalized, currentUrls)
 
-      // 给历史消息打标签
       const history = metasNormalized.map(m => {
         const labeled = applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings)
         return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
       })
 
-      // 当前指令也打标签
       const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
         ? currentCleanedText.trim()
         : '请继续生成/修改图片。'
 
-      const labeledUserInstruction = applyImageBindingsToCleanedText(
-        userInstructionBase,
-        currentUrls,
-        bindings,
-      )
+      const labeledUserInstruction = applyImageBindingsToCleanedText(userInstructionBase, currentUrls, bindings)
 
-      // 组装 Gemini 输入：先映射表，再按顺序逐张上传
       const inputParts: GeminiPart[] = []
-
       if (bindings.length) {
-        // 映射表仍输出 url，但现在是 /uploads/...（短），不会再爆 token
         const mapText = bindings
           .map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`)
           .join('\n')
@@ -911,55 +886,23 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         { role: 'user', parts: inputParts },
       ]
 
-      // ===== DEBUG: Gemini request summary =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Request Debug] ======')
-        debugLog('[model]', model)
-        debugLog('[baseUrl]', baseUrl ?? '(default)')
-        debugLog('[systemMessage]', systemMessage ? trunc(systemMessage) : '(none)')
+      // ✅ 关键修复2：Gemini 请求用 abortablePromise 包一层
+      // 这样点击 stop 会立刻让这里抛 AbortError，从而停止 job
+      const response = await abortablePromise(
+        ai.models.generateContent({
+          model,
+          contents,
+          config: {
+            responseModalities: ['TEXT', 'IMAGE'],
+            imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
+            ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
+          } as any,
+        } as any),
+        abort.signal,
+      )
 
-        debugLog('[normalizedCurrentSaved]', safeJson(normalizedCurrent.saved.map(s => ({
-          filename: s.filename, mime: s.mime, bytes: s.bytes,
-        }))))
-
-        debugLog('[bindings]', safeJson(bindings.map(b => ({
-          tag: b.tag,
-          source: b.source,
-          url: shortUrlForLog(b.url),
-        }))))
-        debugLog('[contentsSummary]', safeJson(summarizeGeminiContents(contents)))
-        debugLog('====== [Gemini Request Debug End] ======')
-      }
-      // ========================================
-
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: {
-            aspectRatio: '16:9',
-            imageSize: '4K',
-          },
-          ...(systemMessage ? { systemInstruction: systemMessage } as any : {}),
-        } as any,
-      } as any)
-
-      // ===== DEBUG: Gemini response summary =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Response Debug] ======')
-        debugLog('[candidatesCount]', response?.candidates?.length ?? 0)
-        const partsDbg = response?.candidates?.[0]?.content?.parts ?? []
-        debugLog('[firstCandidatePartsSummary]', safeJson(summarizeGeminiParts(partsDbg as any[])))
-        const usage = (response as any)?.usageMetadata
-        if (usage) debugLog('[usageMetadata]', usage)
-        debugLog('====== [Gemini Response Debug End] ======')
-      }
-      // =======================================
-
-      if (!response.candidates || response.candidates.length === 0) {
+      if (!response.candidates || response.candidates.length === 0)
         throw new Error('[Gemini] Empty candidates.')
-      }
 
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
@@ -973,7 +916,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         const inline = part?.inlineData
         const inlineB64 = inline?.data
         if (inlineB64) {
-          // save image...
           const mime = inline.mimeType || 'image/png'
           const base64 = inlineB64 as string
           const buffer = Buffer.from(base64, 'base64')
@@ -987,25 +929,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
-
-      const usageRes: any = (response as any).usageMetadata
-        ? {
-            prompt_tokens: (response as any).usageMetadata.promptTokenCount ?? 0,
-            completion_tokens: (response as any).usageMetadata.candidatesTokenCount ?? 0,
-            total_tokens: (response as any).usageMetadata.totalTokenCount ?? 0,
-            estimated: true,
-          }
-        : undefined
-
-      // ===== DEBUG: Final Gemini text =====
-      if (API_DEBUG) {
-        debugLog('====== [Gemini Final Output Debug] ======')
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('[finalUsage]', usageRes ?? '(none)')
-        debugLog('====== [Gemini Final Output Debug End] ======')
-      }
-      // ====================================
 
       process?.({
         id: customMessageId,
@@ -1031,12 +954,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           model,
           text,
           id: customMessageId,
-          detail: { usage: usageRes },
+          detail: {},
         },
       })
     }
 
+    // =========================
     // ② OpenAI
+    // =========================
     const api = await initApi(key, {
       model,
       maxContextCount,
@@ -1061,25 +986,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       modelRes = response.model
       usageRes = response.usage
 
-      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) {
+      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image')))
         text = `![Generated Image](${rawContent})`
-      }
-      else {
+      else
         text = rawContent
-      }
-
-      // ===== DEBUG: OpenAI non-stream response =====
-      if (API_DEBUG) {
-        debugLog('====== [OpenAI Response Debug] ======')
-        debugLog('[model]', modelRes)
-        debugLog('[usage]', usageRes ?? '(none)')
-        debugLog('[rawContentLen]', typeof rawContent === 'string' ? rawContent.length : -1)
-        debugLog('[rawContentPreview]', trunc(rawContent))
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('====== [OpenAI Response Debug End] ======')
-      }
-      // ============================================
 
       process?.({
         id: customMessageId,
@@ -1098,7 +1008,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
     else {
-      // Stream
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
         text += chunk.choices[0]?.delta.content ?? ''
         chatIdRes = customMessageId
@@ -1113,17 +1022,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           parentMessageId: lastContext.parentMessageId,
         })
       }
-
-      // ===== DEBUG: OpenAI stream final =====
-      if (API_DEBUG) {
-        debugLog('====== [OpenAI Stream Final Debug] ======')
-        debugLog('[model]', modelRes)
-        debugLog('[usage]', usageRes ?? '(none)')
-        debugLog('[finalTextLen]', typeof text === 'string' ? text.length : -1)
-        debugLog('[finalTextPreview]', trunc(text))
-        debugLog('====== [OpenAI Stream Final Debug End] ======')
-      }
-      // =====================================
     }
 
     return sendResponse({
@@ -1141,6 +1039,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     })
   }
   catch (error: any) {
+    // ✅ 关键修复3：取消/中断不要在这里转换成 sendResponse Fail
+    // 要把 AbortError 直接抛出去，让 runChatJobInBackground 识别为 abort
+    if (isAbortError(error, abort.signal))
+      throw error
+
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
       if (options.tryCount++ < 3) {
@@ -1151,20 +1054,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         return await chatReplyProcess(options)
       }
     }
-    globalThis.console.error(error)
 
-    // ===== DEBUG: Error =====
-    if (API_DEBUG) {
-      debugLog('====== [Chat Error Debug] ======')
-      debugLog('[statusCode]', code)
-      debugLog('[message]', error?.message)
-      debugLog('[stack]', error?.stack ? trunc(error.stack, 2000) : '(no stack)')
-      debugLog('====== [Chat Error Debug End] ======')
-    }
-    // =======================
+    globalThis.console.error(error)
 
     if (Reflect.has(ErrorCodeMessage, code))
       return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
+
     return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
   }
   finally {
