@@ -34,7 +34,7 @@ const { isMobile } = useBasicLayout()
 const { addChat, updateChat, updateChatSome } = useChat()
 const { scrollRef, scrollTo, scrollToBottom, scrollToBottomIfAtBottom } = useScroll()
 
-const routeUuid = (route.params as any)?.uuid as string | undefined
+const routeUuid = String((route.params as any)?.uuid ?? '')
 
 const currentChatHistory = computed(() => chatStore.getChatHistoryByCurrentActive)
 const usingContext = computed(() => currentChatHistory?.value?.usingContext ?? true)
