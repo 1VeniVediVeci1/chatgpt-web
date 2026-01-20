@@ -18,6 +18,8 @@ import { t } from '@/locales'
 import { debounce } from '@/utils/functions/debounce'
 import IconPrompt from '@/icons/Prompt.vue'
 import { get, post } from '@/utils/request'
+import { fetchChatStopResponding } from '@/api'
+
 
 const Prompt = defineAsyncComponent(() => import('@/components/common/Setting/Prompt.vue'))
 
@@ -350,20 +352,43 @@ async function onConversation() {
 }
 
 async function handleStop() {
-  if (!loading.value) return
-
-  controller.abort()
+  if (!loading.value)
+    return
 
   const roomId = getCurrentRoomId()
+  if (!roomId)
+    return
+
+  // 1) 先 abort 前端本次请求（如果还在请求中）
+  controller.abort()
+
+  // 2) 把当前 UI 里已有的文本传给后端落库（避免丢失已输出）
   const lastIndex = dataSources.value.length - 1
   const currentText = (lastIndex >= 0 && !dataSources.value[lastIndex].inversion)
     ? (dataSources.value[lastIndex].text ?? '')
     : ''
 
-  await post({
-    url: '/chat-abort',
-    data: { roomId, text: currentText },
-  }).catch(() => {})
+  try {
+    await fetchChatStopResponding(roomId, currentText)
+  }
+  catch (e) {
+    // 不吞异常，方便你定位后端返回 roomId required / 限流等问题
+    console.error('[StopResponding] abort failed:', e)
+  }
+  finally {
+    // 3) 立即停止轮询、结束 loading（用户体验：立刻停）
+    stopPolling()
+    loading.value = false
+    processingUuidRef.value = null
+
+    if (lastIndex >= 0 && !dataSources.value[lastIndex].inversion)
+      updateChatSome(roomId, lastIndex, { loading: false })
+
+    // 4) 稍后拉一次最新内容（如果后端有落库 partial）
+    setTimeout(() => {
+      void fetchLatestAndUpdateUI(roomId, true)
+    }, 300)
+  }
 }
 
 async function onRegenerate(index: number) {
