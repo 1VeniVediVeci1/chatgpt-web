@@ -393,22 +393,36 @@ async function runChatJobInBackground(params: {
       result.data.detail.usage.estimated = true
     }
   }
-  catch (error: any) {
+    catch (error: any) {
     const isAbort =
       String(error?.name).includes('Abort')
       || String(error?.message).toLowerCase().includes('aborted')
       || String(error?.message).toLowerCase().includes('canceled')
+      || String(error?.message).toLowerCase().includes('cancelled')
 
     console.error('[Job] chatReplyProcess error:', error?.message ?? error)
 
-    if (isAbort && lastResponse?.text) {
+    // ✅ 关键修复：只要是 abort，就按“成功结束”处理（即使 lastResponse.text 为空字符串）
+    if (isAbort && lastResponse) {
       result = {
         status: 'Success',
         data: {
-          text: lastResponse.text,
+          text: lastResponse.text ?? '',
           id: lastResponse.id,
           conversationId: lastResponse.conversationId,
           detail: lastResponse.detail,
+        },
+      }
+    }
+    else if (isAbort) {
+      // 极端情况：还没来得及触发 process() 就 abort（理论上已被后端“占位 process”修复）
+      result = {
+        status: 'Success',
+        data: {
+          text: '',
+          id: message._id?.toString(),
+          conversationId: options?.conversationId,
+          detail: undefined,
         },
       }
     }
@@ -603,17 +617,27 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
   }
 })
 
-router.post('/chat-abort', [auth, limiter], async (req, res) => {
+router.post('/chat-abort', auth, async (req, res) => {
   try {
     const userId = req.headers.userId.toString()
-    const { roomId, text } = req.body as { roomId: number; text: string }
+    const { roomId, text } = req.body as { roomId: number; text?: string }
 
     if (!roomId) {
       res.send({ status: 'Fail', message: 'roomId required', data: null })
       return
     }
 
+    // 1) 真正 abort（会触发 AbortController.abort）
     const chatId = await abortChatProcess(userId, Number(roomId))
+
+    // 2) 立刻把 jobStates 标记为 done，让前端轮询尽快结束
+    const key = jobKey(userId, Number(roomId))
+    const job = jobStates.get(key)
+    if (job?.status === 'running') {
+      jobStates.set(key, { ...job, status: 'done', updatedAt: Date.now() })
+    }
+
+    // 3) 把“当前已输出内容”落库（前端传过来的 text）
     if (chatId && typeof text === 'string') {
       try { await updateChatResponsePartial(chatId, text) } catch {}
     }
