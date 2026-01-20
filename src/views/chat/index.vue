@@ -134,7 +134,23 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
     })
 
     const d: any = r.data
-    const lastIndex = dataSources.value.length - 1
+
+    // ✅ 如果最后一条是用户消息，则补一个 assistant 占位（使用 u）
+    let lastIndex = dataSources.value.length - 1
+    if (lastIndex >= 0 && dataSources.value[lastIndex].inversion) {
+      addChat(roomId, {
+        uuid: u,
+        dateTime: new Date().toLocaleString(),
+        text: '',
+        loading: true,
+        inversion: false,
+        error: false,
+        conversationOptions: null,
+        requestOptions: { prompt: '...', options: null },
+      })
+      lastIndex = dataSources.value.length - 1
+    }
+
     if (lastIndex < 0) return
 
     if (!dataSources.value[lastIndex].inversion) {
@@ -163,39 +179,65 @@ async function checkProcessStatus() {
   try {
     stopPolling()
     loading.value = false // 切换前先重置
+
     const roomId = getCurrentRoomId()
     if (!roomId) return
 
     const { data } = await fetchRoomProcessStatus(roomId)
-    if (data.isProcessing) {
-      loading.value = true
-      processingUuidRef.value = data.uuid ?? inferLatestUuidFromUI()
 
-      const lastIndex = dataSources.value.length - 1
-      const lastItem = dataSources.value[lastIndex]
+    if (!data.isProcessing) {
+      loading.value = false
+      processingUuidRef.value = null
+      return
+    }
 
-      if (lastIndex < 0 || (lastItem && lastItem.inversion)) {
-        addChat(roomId, {
-          uuid: Date.now(),
-          dateTime: new Date().toLocaleString(),
-          text: '',
-          loading: true,
-          inversion: false,
-          error: false,
-          conversationOptions: null,
-          requestOptions: { prompt: '...', options: null },
-        })
-        scrollToBottom()
-      }
-      else {
-        // 如果是 old 消息，强制转 loading
-        if (!dataSources.value[lastIndex].loading)
-          updateChatSome(roomId, lastIndex, { loading: true })
-      }
+    // ✅ 后端给出的正在处理的 uuid（最可靠）
+    const jobUuid = data.uuid ?? inferLatestUuidFromUI()
+    processingUuidRef.value = jobUuid
+    loading.value = true
 
+    // ✅ 关键修复：如果当前房间消息还没加载出来（dataSources 为空），不要插入占位消息
+    // 否则很容易造成“占位 + 历史拉回来的空 response” => 两条空白连续出现
+    if (!dataSources.value.length) {
+      startPolling()
+      return
+    }
+
+    // ✅ 如果已经存在“本轮 job 的 assistant 消息”，就把它设为 loading，不要再 addChat
+    const existingAssistantIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === jobUuid)
+    if (existingAssistantIndex !== -1) {
+      if (!dataSources.value[existingAssistantIndex].loading)
+        updateChatSome(roomId, existingAssistantIndex, { loading: true })
       await fetchLatestAndUpdateUI(roomId, false)
       startPolling()
+      return
     }
+
+    const lastIndex = dataSources.value.length - 1
+    const lastItem = dataSources.value[lastIndex]
+
+    // ✅ 只有当最后一条是用户消息（且确实没有对应 assistant）才插入占位
+    if (lastItem?.inversion) {
+      addChat(roomId, {
+        uuid: jobUuid, // ✅ 用 jobUuid，别用 Date.now()
+        dateTime: new Date().toLocaleString(),
+        text: '',
+        loading: true,
+        inversion: false,
+        error: false,
+        conversationOptions: null,
+        requestOptions: { prompt: '...', options: null },
+      })
+      scrollToBottom()
+    }
+    else {
+      // 最后一条就是 assistant：只需要标记 loading
+      if (!lastItem?.loading)
+        updateChatSome(roomId, lastIndex, { loading: true })
+    }
+
+    await fetchLatestAndUpdateUI(roomId, false)
+    startPolling()
   }
   catch (e) {
     console.error(e)
