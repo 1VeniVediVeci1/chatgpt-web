@@ -16,6 +16,10 @@ export interface ChatMessage {
 
 export interface RequestOptions {
   message: string
+  /**
+   * ✅ 是否开启联网搜索（前端开关传入）
+   */
+  searchMode?: boolean
   uploadFileKeys?: string[]
   lastContext?: { conversationId?: string; parentMessageId?: string }
   process?: (chat: ChatMessage) => void
