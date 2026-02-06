@@ -140,7 +140,13 @@ async function runIterativeWebSearch(params: {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
       rounds.push({ query: q, items }); onProgress?.(`📄 第 ${i + 1} 轮搜索完成，获得 ${items.length} 条结果`)
-    } catch (e: any) { rounds.push({ query: q, items: [], note: e?.message ?? String(e) }); onProgress?.(`❌ 搜索失败：${e?.message ?? String(e)}`); break }
+    } catch (e: any) {
+      const errMsg = e?.message ?? String(e)
+      console.error(`[WebSearch][Round ${i + 1}] Search failed for query "${q}":`, errMsg)
+      rounds.push({ query: q, items: [], note: errMsg })
+      onProgress?.(`❌ 搜索失败：${errMsg}`)
+      break
+    }
   }
   if (!rounds.length) onProgress?.('ℹ️ 模型判断无需联网搜索，直接回答')
   else onProgress?.(`✅ 搜索全部完成（共 ${rounds.length} 轮），正在生成回答...`)
