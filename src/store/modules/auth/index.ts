@@ -28,6 +28,10 @@ interface SessionResponse {
   nonStreamChatModels: string[]
   usageCountLimit: boolean
   showWatermark: boolean
+  /**
+   * ✅ 后端管理员配置：是否启用联网搜索功能
+   */
+  webSearchEnabled: boolean
   userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; config: UserConfig }
 }
 
