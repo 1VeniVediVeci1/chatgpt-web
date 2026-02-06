@@ -141,6 +141,8 @@ export async function getOriginConfig() {
     config.siteConfig.webSearchMaxRounds = Number(process.env.WEB_SEARCH_MAX_ROUNDS || 3)
   if (config.siteConfig.webSearchPlannerModel === undefined)
     config.siteConfig.webSearchPlannerModel = process.env.WEB_SEARCH_PLANNER_MODEL || ''
+  if (config.siteConfig.hiddenModels === undefined)
+    config.siteConfig.hiddenModels = ''
 
   return config
 }
