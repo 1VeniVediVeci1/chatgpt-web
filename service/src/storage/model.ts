@@ -22,12 +22,12 @@ export enum UserRole {
   Tester = 7,
   Partner = 8,
 }
-// 新增一个兑换码的类
+
 export class GiftCard {
   _id: ObjectId
   cardno: string
   amount: number
-  redeemed: number // boolean
+  redeemed: number
   redeemed_by: string
   redeemed_date: string
   constructor(amount: number, redeemed: number) {
@@ -50,10 +50,10 @@ export class UserInfo {
   config?: UserConfig
   roles?: UserRole[]
   remark?: string
-  secretKey?: string // 2fa
+  secretKey?: string
   advanced?: AdvancedConfig
-  useAmount?: number // chat usage amount
-  limit_switch?: boolean // chat amount limit switch
+  useAmount?: number
+  limit_switch?: boolean
   constructor(email: string, password: string) {
     this.name = email
     this.email = email
@@ -81,7 +81,6 @@ export class ChatRoom {
   prompt: string
   usingContext: boolean
   status: Status = Status.Normal
-  // only access token used
   accountId?: string
   chatModel: string
   constructor(userId: string, title: string, roomId: number, chatModel: string) {
@@ -212,14 +211,14 @@ export class SiteConfig {
     // ===== 推理模型配置 =====
     public reasoningModels?: string,
     public reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh',
-
-    // ===== ✅ 联网搜索配置（管理员可在前端配置）=====
-    public webSearchEnabled?: boolean, // 是否允许使用联网搜索
+    // ===== ✅ 联网搜索配置 =====
+    public webSearchEnabled?: boolean,
     public webSearchProvider?: 'searxng' | 'tavily',
-    public searxngApiUrl?: string, // searxng base url，例如 http://localhost:8080
-    public webSearchMaxResults?: number, // 每轮最多条数
-    public webSearchMaxRounds?: number, // 最多搜索轮数
-    public webSearchPlannerModel?: string, // 用于“是否需要继续搜索/改关键词”的规划模型（可空）
+    public searxngApiUrl?: string,
+    public tavilyApiKey?: string,
+    public webSearchMaxResults?: number,
+    public webSearchMaxRounds?: number,
+    public webSearchPlannerModel?: string,
   ) { }
 }
 
@@ -263,9 +262,9 @@ export class AdvancedConfig {
 
 export enum TextAudioType {
   None = 0,
-  Request = 1 << 0, // 二进制 01
-  Response = 1 << 1, // 二进制 10
-  All = Request | Response, // 二进制 11
+  Request = 1 << 0,
+  Response = 1 << 1,
+  All = Request | Response,
 }
 
 export class KeyConfig {
