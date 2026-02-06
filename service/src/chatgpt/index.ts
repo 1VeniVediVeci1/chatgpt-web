@@ -19,9 +19,6 @@ import { generateMessageId } from '../utils/id-generator'
 import { abortablePromise, isAbortError } from './abortable'
 import { webSearch } from '../utils/webSearch'
 
-/**
- * 兼容 Gemini 构造的 parts
- */
 type GeminiPart = {
   text?: string
   inlineData?: {
@@ -90,16 +87,6 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
 
 dotenv.config()
 
-/**
- * ===================== DEBUG LOGGER (新增) =====================
- * 用环境变量开启：
- *   API_DEBUG=true
- *   API_DEBUG_MAX_TEXT=800
- *
- * 注意：
- * - 不打印 key
- * - 不打印 inlineData.data（base64），只打印长度
- */
 const API_DEBUG = process.env.API_DEBUG === 'true'
 const API_DEBUG_MAX_TEXT = Number(process.env.API_DEBUG_MAX_TEXT ?? 800)
 
@@ -110,22 +97,16 @@ function trunc(s: any, n = API_DEBUG_MAX_TEXT): string {
 }
 
 function safeJson(obj: any): string {
-  try {
-    return JSON.stringify(obj, null, 2)
-  }
-  catch (e: any) {
-    return `[Unserializable: ${e?.message ?? e}]`
-  }
+  try { return JSON.stringify(obj, null, 2) }
+  catch (e: any) { return `[Unserializable: ${e?.message ?? e}]` }
 }
 
-// 不打印 base64，仅打印长度
 function summarizeGeminiParts(parts: any[]) {
   return (parts ?? []).map((p, idx) => ({
     idx,
     hasText: typeof p?.text === 'string',
     textLen: typeof p?.text === 'string' ? p.text.length : 0,
     textPreview: typeof p?.text === 'string' ? trunc(p.text) : undefined,
-
     hasInlineData: !!p?.inlineData,
     inlineMime: p?.inlineData?.mimeType,
     inlineB64Len: typeof p?.inlineData?.data === 'string' ? p.inlineData.data.length : 0,
@@ -134,81 +115,39 @@ function summarizeGeminiParts(parts: any[]) {
 
 function summarizeGeminiContents(contents: any[]) {
   return (contents ?? []).map((c, idx) => ({
-    idx,
-    role: c?.role,
-    parts: summarizeGeminiParts(c?.parts),
+    idx, role: c?.role, parts: summarizeGeminiParts(c?.parts),
   }))
 }
 
 function summarizeOpenAIMessages(messages: any[]) {
   return (messages ?? []).map((m, idx) => {
     const content = m?.content
-
     let contentType: string = typeof content
     let contentLen = 0
     let contentPreview: string | undefined
-
-    if (typeof content === 'string') {
-      contentLen = content.length
-      contentPreview = trunc(content)
-    }
+    if (typeof content === 'string') { contentLen = content.length; contentPreview = trunc(content) }
     else if (Array.isArray(content)) {
-      contentType = 'array'
-      contentLen = content.length
+      contentType = 'array'; contentLen = content.length
       contentPreview = trunc(content.map((p: any) => ({
-        type: p?.type,
-        textLen: typeof p?.text === 'string' ? p.text.length : undefined,
+        type: p?.type, textLen: typeof p?.text === 'string' ? p.text.length : undefined,
         hasImageUrl: !!p?.image_url?.url,
         imageUrlType: typeof p?.image_url?.url === 'string'
           ? (p.image_url.url.startsWith('data:') ? 'dataUrl' : (p.image_url.url.startsWith('http') ? 'http' : 'other'))
           : undefined,
       })))
     }
-    else if (content === null) {
-      contentType = 'null'
-      contentLen = 0
-      contentPreview = 'null'
-    }
-    else {
-      contentType = 'object'
-      contentPreview = trunc(content)
-    }
-
-    return {
-      idx,
-      role: m?.role,
-      contentType,
-      contentLen,
-      contentPreview,
-    }
+    else if (content === null) { contentType = 'null'; contentLen = 0; contentPreview = 'null' }
+    else { contentType = 'object'; contentPreview = trunc(content) }
+    return { idx, role: m?.role, contentType, contentLen, contentPreview }
   })
 }
 
 function debugLog(...args: any[]) {
   if (!API_DEBUG) return
-  // eslint-disable-next-line no-console
   console.log(...args)
 }
-/**
- * ===================== DEBUG LOGGER END =====================
- */
 
-/**
- * ===================== ✅ 联网搜索（不使用 tool calling） =====================
- * 目标：
- * - 用户开启 searchMode 后：
- *   1) 先让“规划器模型”判断是否需要搜索
- *   2) 如果需要则搜索
- *   3) 把搜索结果回喂给规划器模型，让其判断是否需要调整关键词继续搜
- *   4) 直到达到次数上限 or 规划器认为停止
- *
- * 相关环境变量：
- * - WEB_SEARCH_MAX_ROUNDS=3
- * - WEB_SEARCH_PLANNER_MODEL=（可选，不填则用当前 room model）
- * - WEB_SEARCH_MAX_RESULTS=5
- * - WEB_SEARCH_PROVIDER=searxng|tavily（或 SEARCH_API）
- * - SEARXNG_API_URL / TAVILY_API_KEY
- */
+// ===================== 联网搜索 =====================
 type SearchPlan = {
   action: 'search' | 'stop'
   query?: string
@@ -224,34 +163,22 @@ type SearchRound = {
 function safeParseJsonFromText(text: string): any | null {
   if (!text) return null
   const s = String(text).trim()
-  try {
-    return JSON.parse(s)
-  }
-  catch { }
-
+  try { return JSON.parse(s) } catch { }
   const i = s.indexOf('{')
   const j = s.lastIndexOf('}')
   if (i >= 0 && j > i) {
-    try {
-      return JSON.parse(s.slice(i, j + 1))
-    }
-    catch { }
+    try { return JSON.parse(s.slice(i, j + 1)) } catch { }
   }
   return null
 }
 
 function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   if (!rounds.length) return '（无）'
-
   return rounds.map((r, idx) => {
     const top = (r.items || []).slice(0, 5).map((it, i) => {
       const n = `${idx + 1}.${i + 1}`
-      const title = String(it.title || '').trim()
-      const url = String(it.url || '').trim()
-      const content = String(it.content || '').replace(/\s+/g, ' ').trim()
-      return `- [${n}] ${title}\n  ${url}\n  ${content}`
+      return `- [${n}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  ${String(it.content || '').replace(/\s+/g, ' ').trim()}`
     }).join('\n')
-
     const note = r.note ? `\n（注：${r.note}）` : ''
     return `第${idx + 1}轮 query="${r.query}"\n${top || '（无结果）'}${note}`
   }).join('\n\n')
@@ -267,15 +194,12 @@ async function planNextSearchAction(params: {
   const { openai, model, userQuestion, rounds, abortSignal } = params
 
   const plannerSystem = [
-    '你是“联网搜索规划器”。你的任务是帮助回答用户问题，但只在必要时才联网搜索。',
-    '',
-    '你会看到：用户问题 + 已进行的搜索轮次与结果摘要。',
+    '你是"联网搜索规划器"。你的任务是帮助回答用户问题，但只在必要时才联网搜索。',
+    '', '你会看到：用户问题 + 已进行的搜索轮次与结果摘要。',
     '你需要输出严格 JSON（不要输出多余文字）。',
-    '',
-    'JSON schema：',
+    '', 'JSON schema：',
     '{ "action": "search" | "stop", "query": string, "reason": string }',
-    '',
-    '规则：',
+    '', '规则：',
     '- 如果已有信息足够支撑回答：action="stop"',
     '- 如果需要继续搜索：action="search"，给出更好的 query（更具体、包含关键实体/时间/限定词）',
     '- query 不要太长（建议 6~16 个词/中英文均可）',
@@ -284,19 +208,15 @@ async function planNextSearchAction(params: {
   ].join('\n')
 
   const plannerUser = [
-    `用户问题：${userQuestion}`,
-    '',
+    `用户问题：${userQuestion}`, '',
     '已进行的搜索与结果摘要：',
-    formatSearchRoundsForPlanner(rounds),
-    '',
+    formatSearchRoundsForPlanner(rounds), '',
     '现在请决定：是否需要继续搜索？如果需要，请给出新的 query。',
   ].join('\n')
 
-  // 优先尝试 response_format（部分兼容接口不支持，会抛错）
   try {
     const resp = await openai.chat.completions.create({
-      model,
-      temperature: 0,
+      model, temperature: 0,
       messages: [
         { role: 'system', content: plannerSystem },
         { role: 'user', content: plannerUser },
@@ -304,7 +224,6 @@ async function planNextSearchAction(params: {
       response_format: { type: 'json_object' } as any,
       stream: false,
     } as any, { signal: abortSignal })
-
     const text = resp.choices?.[0]?.message?.content ?? ''
     const obj = safeParseJsonFromText(text)
     if (!obj) return { action: 'stop', reason: 'planner json parse failed' }
@@ -312,15 +231,13 @@ async function planNextSearchAction(params: {
   }
   catch {
     const resp = await openai.chat.completions.create({
-      model,
-      temperature: 0,
+      model, temperature: 0,
       messages: [
         { role: 'system', content: plannerSystem },
         { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` },
       ],
       stream: false,
     } as any, { signal: abortSignal })
-
     const text = resp.choices?.[0]?.message?.content ?? ''
     const obj = safeParseJsonFromText(text)
     if (!obj) return { action: 'stop', reason: 'planner json parse failed' }
@@ -338,55 +255,57 @@ async function runIterativeWebSearch(params: {
   provider?: 'searxng' | 'tavily'
   searxngApiUrl?: string
   tavilyApiKey?: string
+  onProgress?: (status: string) => void
 }): Promise<SearchRound[]> {
-  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey } = params
+  const {
+    openai, plannerModels, userQuestion, maxRounds, maxResults,
+    abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress,
+  } = params
 
   const rounds: SearchRound[] = []
   const usedQueries = new Set<string>()
 
   for (let i = 0; i < maxRounds; i++) {
-    let plan: SearchPlan | null = null
+    onProgress?.(`🔍 搜索规划中（第 ${i + 1}/${maxRounds} 轮）...`)
 
-    // 规划器模型 fallback：优先 env 指定，否则用当前 model
+    let plan: SearchPlan | null = null
     for (const m of plannerModels) {
       try {
-        plan = await planNextSearchAction({
-          openai,
-          model: m,
-          userQuestion,
-          rounds,
-          abortSignal,
-        })
+        plan = await planNextSearchAction({ openai, model: m, userQuestion, rounds, abortSignal })
         break
       }
       catch (e) {
-        // 继续尝试下一个模型
         if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e)
       }
     }
 
-    if (!plan) break
-    if (plan.action !== 'search') break
+    if (!plan) { onProgress?.('✅ 搜索规划完成（无需搜索）'); break }
+    if (plan.action !== 'search') { onProgress?.(`✅ 搜索完成：${plan.reason || '信息已足够'}`); break }
 
     const q = String(plan.query || '').trim()
     if (!q) break
-    if (usedQueries.has(q)) break
+    if (usedQueries.has(q)) { onProgress?.('⚠️ 关键词重复，停止搜索'); break }
     usedQueries.add(q)
+
+    onProgress?.(`🌐 正在搜索：「${q}」...`)
 
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({
-        title: String(it.title || ''),
-        url: String(it.url || ''),
-        content: String(it.content || ''),
+        title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || ''),
       }))
       rounds.push({ query: q, items })
+      onProgress?.(`📄 第 ${i + 1} 轮搜索完成，获得 ${items.length} 条结果`)
     }
     catch (e: any) {
       rounds.push({ query: q, items: [], note: e?.message ?? String(e) })
+      onProgress?.(`❌ 搜索失败：${e?.message ?? String(e)}`)
       break
     }
   }
+
+  if (!rounds.length) onProgress?.('ℹ️ 模型判断无需联网搜索，直接回答')
+  else onProgress?.(`✅ 搜索全部完成（共 ${rounds.length} 轮），正在生成回答...`)
 
   return rounds
 }
@@ -396,8 +315,9 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
 
   let n = 0
   const lines: string[] = []
+  const refLines: string[] = []
 
-  lines.push('【联网搜索结果（多轮汇总，按编号引用）】')
+  lines.push('【联网搜索结果】')
 
   rounds.forEach((r, idx) => {
     lines.push(`（第${idx + 1}轮关键词：${r.query}）`)
@@ -407,51 +327,48 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
       lines.push('')
       return
     }
-
     for (const it of r.items) {
       n++
       lines.push(`[${n}] ${String(it.title || '').trim()}`)
       lines.push(`URL: ${String(it.url || '').trim()}`)
-      lines.push(`摘要: ${String(it.content || '').trim()}`)
+      lines.push(`内容: ${String(it.content || '').trim()}`)
       lines.push('')
+      refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`)
     }
-
-    if (r.note) {
-      lines.push(`（注：${r.note}）`)
-      lines.push('')
-    }
+    if (r.note) { lines.push(`（注：${r.note}）`); lines.push('') }
   })
 
+  lines.push('')
+  lines.push('【参考来源列表】')
+  lines.push(...refLines)
+  lines.push('')
   lines.push('【回答要求】')
-  lines.push('- 基于以上来源回答；涉及事实/数据/结论请在句末用 [编号] 引用（可多个）。')
-  lines.push('- 若来源不足以支持结论，请明确说明“不确定/需更多信息”。')
+  lines.push('- 基于以上来源回答用户问题。')
+  lines.push('- 引用格式必须为 markdown 链接：[编号](url)，例如 [1](https://example.com)。')
+  lines.push('- 可以同时引用多个来源，用逗号分隔：[1](url1), [2](url2)。')
+  lines.push('- 在回答末尾，列出所有引用过的参考来源，格式：')
+  lines.push('  ## 参考来源')
+  lines.push('  - [标题](url)')
+  lines.push('- 若来源不足以支持结论，请明确说明。')
 
   return lines.join('\n')
 }
 
 function appendTextToMessageContent(content: MessageContent, appendix: string): MessageContent {
   if (!appendix?.trim()) return content
-
-  if (typeof content === 'string')
-    return `${content}\n\n${appendix}`
-
+  if (typeof content === 'string') return `${content}\n\n${appendix}`
   if (Array.isArray(content)) {
     const idx = (content as any[]).findIndex(p => p?.type === 'text' && typeof p?.text === 'string')
     if (idx >= 0) {
-      const old = (content as any[])[idx].text
-      const next = `${old}\n\n${appendix}`
       const arr = [...(content as any[])]
-      arr[idx] = { ...(arr[idx] || {}), text: next }
+      arr[idx] = { ...(arr[idx] || {}), text: `${arr[idx].text}\n\n${appendix}` }
       return arr as any
     }
     return [{ type: 'text', text: appendix }, ...(content as any[])] as any
   }
-
   return content
 }
-/**
- * ===================== ✅ 联网搜索 END =====================
- */
+// ===================== 联网搜索 END =====================
 
 const ErrorCodeMessage: Record<string, string> = {
   401: '提供错误的API密钥',
@@ -465,51 +382,33 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// ===================== Helper: Extract Images =====================
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
-// ✅ 正确的 Markdown 图片：![alt](url "title")
 const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([^)]+?)\s*$/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 
-async function replaceDataUrlImagesWithUploads(text: string): Promise<{
-  text: string
-  saved: Array<{ mime: string; filename: string; bytes: number }>
-}> {
+async function replaceDataUrlImagesWithUploads(text: string): Promise<{ text: string; saved: Array<{ mime: string; filename: string; bytes: number }> }> {
   if (!text) return { text: '', saved: [] }
-
   const saved: Array<{ mime: string; filename: string; bytes: number }> = []
-  let out = ''
-  let lastIndex = 0
-
+  let out = ''; let lastIndex = 0
   const matches = text.matchAll(DATA_URL_IMAGE_CAPTURE_RE)
   for (const m of matches) {
-    const full = m[0]
-    const mime = m[1]
-    const base64 = m[2]
-    const idx = m.index ?? -1
+    const full = m[0]; const mime = m[1]; const base64 = m[2]; const idx = m.index ?? -1
     if (idx < 0) continue
-
     out += text.slice(lastIndex, idx)
-
     const buffer = Buffer.from(base64, 'base64')
     const ext = mime.split('/')[1] || 'png'
     const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
     const filePath = path.join(UPLOAD_DIR, filename)
     await fs.writeFile(filePath, buffer)
-
     saved.push({ mime, filename, bytes: buffer.length })
     out += `/uploads/${filename}`
-
     lastIndex = idx + full.length
   }
-
   out += text.slice(lastIndex)
   return { text: out, saved }
 }
-
-// ===================== Scheme B: Normalize dataURL -> /uploads =====================
 
 type SavedUpload = { mime: string; filename: string; bytes: number }
 type DataUrlCache = Map<string, string>
@@ -531,383 +430,141 @@ function mimeToExt(mime: string): string {
   if (t === 'image/gif') return 'gif'
   if (t === 'image/bmp') return 'bmp'
   if (t === 'image/heic') return 'heic'
-  const sub = t.split('/')[1]
-  return sub || 'png'
+  return t.split('/')[1] || 'png'
 }
 
-/**
- * 把 dataURL(image/*;base64,...) 落盘到 /uploads 并返回 /uploads/filename
- */
-async function saveDataUrlImageToUploads(
-  dataUrl: string,
-  cache?: DataUrlCache,
-): Promise<{ url: string; saved: SavedUpload } | null> {
+async function saveDataUrlImageToUploads(dataUrl: string, cache?: DataUrlCache): Promise<{ url: string; saved: SavedUpload } | null> {
   try {
     if (!dataUrl?.startsWith('data:image/')) return null
-
-    if (cache?.has(dataUrl)) {
-      const url = cache.get(dataUrl)!
-      return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } }
-    }
-
-    const parsed = parseDataUrlImage(dataUrl)
-    if (!parsed) return null
-
+    if (cache?.has(dataUrl)) { const url = cache.get(dataUrl)!; return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } } }
+    const parsed = parseDataUrlImage(dataUrl); if (!parsed) return null
     await ensureUploadDir()
-
     const buffer = Buffer.from(parsed.base64, 'base64')
     const ext = mimeToExt(parsed.mime)
     const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
     const filePath = path.join(UPLOAD_DIR, filename)
     await fs.writeFile(filePath, buffer)
-
     const url = `/uploads/${filename}`
     cache?.set(dataUrl, url)
-
-    return {
-      url,
-      saved: { mime: parsed.mime, filename, bytes: buffer.length },
-    }
+    return { url, saved: { mime: parsed.mime, filename, bytes: buffer.length } }
   }
-  catch (e) {
-    console.error('[saveDataUrlImageToUploads] failed:', e)
-    return null
-  }
+  catch (e) { console.error('[saveDataUrlImageToUploads] failed:', e); return null }
 }
 
-/**
- * 规范化 Gemini 输入用的 MessageContent：
- * - text part 里出现的 dataURL：落盘并替换为 /uploads/xxx
- * - image_url.url 如果是 dataURL：落盘并替换为 /uploads/xxx
- */
-async function normalizeMessageContentDataUrlsToUploads(
-  content: MessageContent,
-  cache?: DataUrlCache,
-): Promise<{ content: MessageContent; saved: SavedUpload[] }> {
+async function normalizeMessageContentDataUrlsToUploads(content: MessageContent, cache?: DataUrlCache): Promise<{ content: MessageContent; saved: SavedUpload[] }> {
   const savedAll: SavedUpload[] = []
-
-  if (typeof content === 'string') {
-    const replaced = await replaceDataUrlImagesWithUploads(content)
-    savedAll.push(...replaced.saved)
-    return { content: replaced.text, saved: savedAll }
-  }
-
+  if (typeof content === 'string') { const replaced = await replaceDataUrlImagesWithUploads(content); savedAll.push(...replaced.saved); return { content: replaced.text, saved: savedAll } }
   if (Array.isArray(content)) {
     const newParts: any[] = []
-
     for (const p of content as any[]) {
-      if (p?.type === 'text' && typeof p.text === 'string') {
-        const replaced = await replaceDataUrlImagesWithUploads(p.text)
-        savedAll.push(...replaced.saved)
-        newParts.push({ ...p, text: replaced.text })
-        continue
-      }
-
+      if (p?.type === 'text' && typeof p.text === 'string') { const replaced = await replaceDataUrlImagesWithUploads(p.text); savedAll.push(...replaced.saved); newParts.push({ ...p, text: replaced.text }); continue }
       if (p?.type === 'image_url' && typeof p.image_url?.url === 'string') {
         const u = p.image_url.url as string
-        if (u.startsWith('data:image/')) {
-          const r = await saveDataUrlImageToUploads(u, cache)
-          if (r?.url) {
-            savedAll.push(r.saved)
-            newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } })
-            continue
-          }
-        }
-        newParts.push(p)
-        continue
+        if (u.startsWith('data:image/')) { const r = await saveDataUrlImageToUploads(u, cache); if (r?.url) { savedAll.push(r.saved); newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } }); continue } }
+        newParts.push(p); continue
       }
-
       newParts.push(p)
     }
-
     return { content: newParts as any, saved: savedAll }
   }
-
   return { content, saved: savedAll }
 }
 
-/**
- * 把 urls[] 里的 dataURL 统一落盘成 /uploads，避免后续（映射表/日志）把 base64 放进 text
- */
 async function normalizeUrlsDataUrlsToUploads(urls: string[], cache?: DataUrlCache): Promise<{ urls: string[]; saved: SavedUpload[] }> {
-  const out: string[] = []
-  const savedAll: SavedUpload[] = []
-
+  const out: string[] = []; const savedAll: SavedUpload[] = []
   for (const u of urls || []) {
-    if (typeof u === 'string' && u.startsWith('data:image/')) {
-      const r = await saveDataUrlImageToUploads(u, cache)
-      if (r?.url) {
-        out.push(r.url)
-        savedAll.push(r.saved)
-      }
-      else {
-        out.push(u)
-      }
-    }
-    else {
-      out.push(u)
-    }
+    if (typeof u === 'string' && u.startsWith('data:image/')) { const r = await saveDataUrlImageToUploads(u, cache); if (r?.url) { out.push(r.url); savedAll.push(r.saved) } else { out.push(u) } }
+    else { out.push(u) }
   }
-
   return { urls: out, saved: savedAll }
 }
 
-/** 映射表/日志用：避免输出超长 dataURL */
 function shortUrlForLog(u: string): string {
   if (!u) return ''
-  if (u.startsWith('data:image/')) {
-    const mime = u.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/)?.[1] ?? 'image/*'
-    return `dataUrl(${mime},len=${u.length})`
-  }
+  if (u.startsWith('data:image/')) { const mime = u.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/)?.[1] ?? 'image/*'; return `dataUrl(${mime},len=${u.length})` }
   return u.length > 200 ? `${u.slice(0, 200)}...(len=${u.length})` : u
 }
 
-// ===================== Scheme B END =====================
-
 function extractImageUrlsFromText(text: string): { cleanedText: string; urls: string[] } {
   if (!text) return { cleanedText: '', urls: [] }
-
-  const urls: string[] = []
-  let cleaned = text
-
-  cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, inside) => {
-    const raw = String(inside ?? '').trim()
-    if (raw) {
-      const firstToken = raw.split(/\s+/)[0] || ''
-      const url = firstToken.replace(/^<|>$/g, '').trim()
-      if (url) urls.push(url)
-    }
-    return '[Image]'
-  })
-
-  cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => {
-    if (url) urls.push(url)
-    return '[Image]'
-  })
-
-  const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
-  if (rawDataUrls?.length) urls.push(...rawDataUrls)
-  cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
-
-  const uploadUrls = cleaned.match(UPLOADS_URL_RE)
-  if (uploadUrls?.length) urls.push(...uploadUrls)
-  cleaned = cleaned.replace(UPLOADS_URL_RE, '[Image]')
-
+  const urls: string[] = []; let cleaned = text
+  cleaned = cleaned.replace(MARKDOWN_IMAGE_RE, (_m, inside) => { const raw = String(inside ?? '').trim(); if (raw) { const firstToken = raw.split(/\s+/)[0] || ''; const url = firstToken.replace(/^<|>$/g, '').trim(); if (url) urls.push(url) }; return '[Image]' })
+  cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => { if (url) urls.push(url); return '[Image]' })
+  const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE); if (rawDataUrls?.length) urls.push(...rawDataUrls); cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
+  const uploadUrls = cleaned.match(UPLOADS_URL_RE); if (uploadUrls?.length) urls.push(...uploadUrls); cleaned = cleaned.replace(UPLOADS_URL_RE, '[Image]')
   return { cleanedText: cleaned, urls }
 }
 
 async function extractImageUrlsFromMessageContent(content: MessageContent): Promise<{ cleanedText: string; urls: string[] }> {
-  const urls: string[] = []
-  let cleanedText = ''
-
-  if (typeof content === 'string') {
-    const r = extractImageUrlsFromText(content)
-    cleanedText = r.cleanedText
-    urls.push(...r.urls)
-    if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'
-    return { cleanedText, urls }
-  }
-
+  const urls: string[] = []; let cleanedText = ''
+  if (typeof content === 'string') { const r = extractImageUrlsFromText(content); cleanedText = r.cleanedText; urls.push(...r.urls); if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'; return { cleanedText, urls } }
   if (Array.isArray(content)) {
     for (const p of content as any[]) {
-      if (p?.type === 'text' && p.text) {
-        const r = extractImageUrlsFromText(p.text)
-        if (r.cleanedText) cleanedText += (cleanedText ? '\n' : '') + r.cleanedText
-        if (r.urls.length) urls.push(...r.urls)
-      }
-      else if (p?.type === 'image_url' && p.image_url?.url) {
-        urls.push(p.image_url.url)
-        cleanedText += (cleanedText ? '\n' : '') + '[Image]'
-      }
+      if (p?.type === 'text' && p.text) { const r = extractImageUrlsFromText(p.text); if (r.cleanedText) cleanedText += (cleanedText ? '\n' : '') + r.cleanedText; if (r.urls.length) urls.push(...r.urls) }
+      else if (p?.type === 'image_url' && p.image_url?.url) { urls.push(p.image_url.url); cleanedText += (cleanedText ? '\n' : '') + '[Image]' }
     }
-    if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'
-    return { cleanedText, urls }
+    if (!cleanedText?.trim() && urls.length) cleanedText = '[Image]'; return { cleanedText, urls }
   }
-
   return { cleanedText: '', urls: [] }
 }
 
-function dedupeUrlsPreserveOrder(urls: string[]): string[] {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const u of urls) {
-    if (!u) continue
-    if (seen.has(u)) continue
-    seen.add(u)
-    out.push(u)
-  }
-  return out
-}
+function dedupeUrlsPreserveOrder(urls: string[]): string[] { const seen = new Set<string>(); const out: string[] = []; for (const u of urls) { if (!u) continue; if (seen.has(u)) continue; seen.add(u); out.push(u) }; return out }
 
 async function imageUrlToGeminiInlinePart(urlStr: string): Promise<GeminiPart | null> {
-  if (urlStr.startsWith('data:')) {
-    const [header, base64Data] = urlStr.split(',')
-    if (!header || !base64Data) return null
-    const mimeMatch = header.match(/:(.*?);/)
-    const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'
-    return { inlineData: { mimeType, data: base64Data } }
-  }
-
-  if (urlStr.includes('/uploads/')) {
-    const filename = path.basename(urlStr)
-    const fileData = await getFileBase64(filename)
-    if (!fileData) return null
-    return { inlineData: { mimeType: fileData.mime, data: fileData.data } }
-  }
-
-  // 目前不支持 http(s) 外链直传（如需支持，需自行下载后转 base64）
+  if (urlStr.startsWith('data:')) { const [header, base64Data] = urlStr.split(','); if (!header || !base64Data) return null; const mimeMatch = header.match(/:(.*?);/); const mimeType = mimeMatch ? mimeMatch[1] : 'image/png'; return { inlineData: { mimeType, data: base64Data } } }
+  if (urlStr.includes('/uploads/')) { const filename = path.basename(urlStr); const fileData = await getFileBase64(filename); if (!fileData) return null; return { inlineData: { mimeType: fileData.mime, data: fileData.data } } }
   return null
 }
 
-// ===== Image Binding Type =====
-type ImageBinding = {
-  tag: string
-  source: 'current_user' | 'last_ai' | 'prev_user' | 'prev_ai'
-  url: string
-}
-
-type HistoryMessageMeta = {
-  role: 'user' | 'model'
-  cleanedText: string
-  urls: string[]
-  messageId: string
-}
+type ImageBinding = { tag: string; source: 'current_user' | 'last_ai' | 'prev_user' | 'prev_ai'; url: string }
+type HistoryMessageMeta = { role: 'user' | 'model'; cleanedText: string; urls: string[]; messageId: string }
 
 function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bindings: ImageBinding[]): string {
-  const map = new Map<string, string>()
-  for (const b of bindings) map.set(b.url, b.tag)
-
-  let out = cleanedText || ''
-  for (const u of urls) {
-    const tag = map.get(u)
-    const token = tag ? `[${tag}]` : '[Image]'
-    out = out.replace('[Image]', token)
-  }
-
-  if (!out.trim() && urls.length) {
-    out = urls.map(u => (map.get(u) ? `[${map.get(u)}]` : '[Image]')).join(' ')
-  }
-
+  const map = new Map<string, string>(); for (const b of bindings) map.set(b.url, b.tag)
+  let out = cleanedText || ''; for (const u of urls) { const tag = map.get(u); const token = tag ? `[${tag}]` : '[Image]'; out = out.replace('[Image]', token) }
+  if (!out.trim() && urls.length) out = urls.map(u => (map.get(u) ? `[${map.get(u)}]` : '[Image]')).join(' ')
   return out
 }
 
-async function buildGeminiHistoryFromLastMessageId(params: {
-  lastMessageId?: string
-  maxContextCount: number
-  forGeminiImageModel: boolean
-}): Promise<{ metas: HistoryMessageMeta[]; allUrls: string[] }> {
+async function buildGeminiHistoryFromLastMessageId(params: { lastMessageId?: string; maxContextCount: number; forGeminiImageModel: boolean }): Promise<{ metas: HistoryMessageMeta[]; allUrls: string[] }> {
   const { lastMessageId: startId, maxContextCount, forGeminiImageModel } = params
-
-  const metasRev: HistoryMessageMeta[] = []
-  const urlsRev: string[] = []
-
+  const metasRev: HistoryMessageMeta[] = []; const urlsRev: string[] = []
   let lastMessageId = startId
   for (let i = 0; i < maxContextCount; i++) {
-    if (!lastMessageId) break
-    const msg = await getMessageById(lastMessageId)
-    if (!msg) break
-
+    if (!lastMessageId) break; const msg = await getMessageById(lastMessageId); if (!msg) break
     const role = (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model'
-
-    if (forGeminiImageModel) {
-      const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
-      if (urls.length) urlsRev.push(...urls)
-
-      metasRev.push({
-        role,
-        cleanedText: cleanedText?.trim() ? cleanedText : (urls.length ? '[Image]' : '[Empty]'),
-        urls,
-        messageId: msg.id,
-      })
-    }
-    else {
-      metasRev.push({
-        role,
-        cleanedText: typeof msg.text === 'string' ? msg.text : '[Complex Content]',
-        urls: [],
-        messageId: msg.id,
-      })
-    }
-
+    if (forGeminiImageModel) { const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text); if (urls.length) urlsRev.push(...urls); metasRev.push({ role, cleanedText: cleanedText?.trim() ? cleanedText : (urls.length ? '[Image]' : '[Empty]'), urls, messageId: msg.id }) }
+    else { metasRev.push({ role, cleanedText: typeof msg.text === 'string' ? msg.text : '[Complex Content]', urls: [], messageId: msg.id }) }
     lastMessageId = msg.parentMessageId
   }
-
-  const metas = metasRev.reverse()
-  const allUrls = dedupeUrlsPreserveOrder(urlsRev.reverse())
-  return { metas, allUrls }
+  return { metas: metasRev.reverse(), allUrls: dedupeUrlsPreserveOrder(urlsRev.reverse()) }
 }
 
-// ✅ 新增：取最近 N 条某角色消息（从后往前）
-function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: number): HistoryMessageMeta[] {
-  const out: HistoryMessageMeta[] = []
-  for (let i = metas.length - 1; i >= 0; i--) {
-    if (metas[i].role !== role) continue
-    out.push(metas[i]) // newest -> older
-    if (out.length >= n) break
-  }
-  return out
-}
+function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: number): HistoryMessageMeta[] { const out: HistoryMessageMeta[] = []; for (let i = metas.length - 1; i >= 0; i--) { if (metas[i].role !== role) continue; out.push(metas[i]); if (out.length >= n) break }; return out }
 
-// ✅ 新增：选择“最近两轮”的所有图片：
-// 本次用户(当前消息) + 最近一条AI + 上一次用户 + 倒数第二条AI
 function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: string[]): ImageBinding[] {
-  const lastModels = getLastNByRole(metas, 'model', 2) // [latest, prev]
-  const lastUsers = getLastNByRole(metas, 'user', 1) // 只需要“上一次用户”
-
+  const lastModels = getLastNByRole(metas, 'model', 2); const lastUsers = getLastNByRole(metas, 'user', 1)
   const groups = [
     { source: 'current_user' as const, tagPrefix: 'U0', urls: currentUrls },
     { source: 'last_ai' as const, tagPrefix: 'A0', urls: lastModels[0]?.urls ?? [] },
     { source: 'prev_user' as const, tagPrefix: 'U1', urls: lastUsers[0]?.urls ?? [] },
     { source: 'prev_ai' as const, tagPrefix: 'A1', urls: lastModels[1]?.urls ?? [] },
   ]
-
-  const seen = new Set<string>()
-  const bindings: ImageBinding[] = []
-
-  for (const g of groups) {
-    let idx = 0
-    for (const u of g.urls) {
-      if (!u) continue
-      if (seen.has(u)) continue
-      seen.add(u)
-
-      idx += 1
-      bindings.push({
-        tag: `${g.tagPrefix}_${idx}`,
-        source: g.source,
-        url: u,
-      })
-    }
-  }
-
+  const seen = new Set<string>(); const bindings: ImageBinding[] = []
+  for (const g of groups) { let idx = 0; for (const u of g.urls) { if (!u) continue; if (seen.has(u)) continue; seen.add(u); idx += 1; bindings.push({ tag: `${g.tagPrefix}_${idx}`, source: g.source, url: u }) } }
   return bindings
 }
 
 const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = {
-  current_user: '本次用户消息',
-  last_ai: '最近一条AI回复',
-  prev_user: '上一次用户消息',
-  prev_ai: '倒数第二条AI回复',
+  current_user: '本次用户消息', last_ai: '最近一条AI回复', prev_user: '上一次用户消息', prev_ai: '倒数第二条AI回复',
 }
-
 export async function initApi(key: KeyConfig, {
-  model,
-  maxContextCount,
-  temperature,
-  top_p,
-  abortSignal,
-  content,
-  systemMessage,
-  lastMessageId,
-  isImageModel,
+  model, maxContextCount, temperature, top_p, abortSignal, content, systemMessage, lastMessageId, isImageModel,
 }: any) {
   const config = await getCacheConfig()
   const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
   const openai = new OpenAI({
-    baseURL: OPENAI_API_BASE_URL,
-    apiKey: key.key,
-    maxRetries: 0,
-    timeout: config.timeoutMs,
+    baseURL: OPENAI_API_BASE_URL, apiKey: key.key, maxRetries: 0, timeout: config.timeoutMs,
   })
 
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
@@ -919,30 +576,18 @@ export async function initApi(key: KeyConfig, {
     if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
     if (!message) break
-
     let safeContent = message.text as string
-    if (typeof safeContent === 'string') {
-      safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
-    }
-
-    messages.push({
-      role: message.role as any,
-      content: safeContent,
-    })
+    if (typeof safeContent === 'string') safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
+    messages.push({ role: message.role as any, content: safeContent })
     lastMessageId = message.parentMessageId
   }
-  if (systemMessage) {
-    messages.push({ role: 'system', content: systemMessage })
-  }
+  if (systemMessage) messages.push({ role: 'system', content: systemMessage })
   messages.reverse()
   messages.push({ role: 'user', content })
 
   const enableStream = !isImageModel
   const options: OpenAI.ChatCompletionCreateParams = {
-    model,
-    stream: enableStream,
-    stream_options: enableStream ? { include_usage: true } : undefined,
-    messages,
+    model, stream: enableStream, stream_options: enableStream ? { include_usage: true } : undefined, messages,
   }
   options.temperature = finalTemperature
   if (shouldUseTopP) options.top_p = top_p
@@ -951,23 +596,13 @@ export async function initApi(key: KeyConfig, {
     const siteCfg = config.siteConfig
     const reasoningModelsStr = siteCfg?.reasoningModels || ''
     const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
-
-    const reasoningModelList = reasoningModelsStr
-      .split(/[,，]/)
-      .map(s => s.trim())
-      .filter(Boolean)
-
+    const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
     const isReasoningModel = reasoningModelList.includes(model)
-
-    if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none') {
-      ; (options as any).reasoning_effort = reasoningEffort
-    }
+    if (isReasoningModel && reasoningEffort && reasoningEffort !== 'none')
+      (options as any).reasoning_effort = reasoningEffort
   }
-  catch (e) {
-    console.error('[OpenAI] set reasoning_effort failed:', e)
-  }
+  catch (e) { console.error('[OpenAI] set reasoning_effort failed:', e) }
 
-  // ===== DEBUG: OpenAI Request Summary (新增) =====
   if (API_DEBUG) {
     debugLog('====== [OpenAI Request Debug] ======')
     debugLog('[baseURL]', OPENAI_API_BASE_URL)
@@ -976,35 +611,25 @@ export async function initApi(key: KeyConfig, {
     debugLog('[messagesSummary]', safeJson(summarizeOpenAIMessages(messages)))
     debugLog('====== [OpenAI Request Debug End] ======')
   }
-  // ============================================
 
-  const apiResponse = await openai.chat.completions.create(options, {
-    signal: abortSignal,
-  })
-
+  const apiResponse = await openai.chat.completions.create(options, { signal: abortSignal })
   return apiResponse
 }
 
-// ✅ 修改：ProcessThreads 支持 Key (userId:roomId)
 type ProcessThread = { key: string; userId: string; roomId: number; abort: AbortController; messageId: string }
 const processThreads: ProcessThread[] = []
 const makeThreadKey = (userId: string, roomId: number) => `${userId}:${roomId}`
+
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const userId = options.user._id.toString()
   const messageId = options.messageId
   const roomId = options.room.roomId
   const abort = new AbortController()
   const customMessageId = generateMessageId()
-
   const threadKey = makeThreadKey(userId, roomId)
 
-  // ✅ 只清除当前 Room 的旧任务
   const existingIdx = processThreads.findIndex(t => t.key === threadKey)
-  if (existingIdx > -1) {
-    processThreads[existingIdx].abort.abort()
-    processThreads.splice(existingIdx, 1)
-  }
-
+  if (existingIdx > -1) { processThreads[existingIdx].abort.abort(); processThreads.splice(existingIdx, 1) }
   processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
 
   await ensureUploadDir()
@@ -1020,19 +645,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
+  // ✅ 解构时把 process 改名为 processCb，避免遮蔽全局 process.env
   const { message, uploadFileKeys, lastContext, process: processCb, systemMessage, temperature, top_p } = options
 
-  // ✅ 关键修复1：无论什么模型，先把“占位响应”抛给 process
-  // 这样：
-  // - runChatJobInBackground 即使在真正返回前就 abort，也能拿到 lastResponse（包含 id/conversationId）
-  // - 不会再因为 lastResponse.text 为空导致 abort 被当 Fail
   processCb?.({
-    id: customMessageId,
-    text: '',
-    role: 'assistant',
-    conversationId: lastContext?.conversationId,
-    parentMessageId: lastContext?.parentMessageId,
-    detail: undefined,
+    id: customMessageId, text: '', role: 'assistant',
+    conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
   })
 
   let content: MessageContent = message
@@ -1040,13 +658,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const globalConfig = await getCacheConfig()
   const imageModelsStr = globalConfig.siteConfig.imageModels || ''
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
-
   const isImage = imageModelList.some(m => model.includes(m))
   const isGeminiImageModel = isImage && model.includes('gemini')
 
   if (uploadFileKeys && uploadFileKeys.length > 0) {
-    const textFiles = uploadFileKeys.filter(key => isTextFile(key))
-    const imageFiles = uploadFileKeys.filter(key => isImageFile(key))
+    const textFiles = uploadFileKeys.filter(k => isTextFile(k))
+    const imageFiles = uploadFileKeys.filter(k => isImageFile(k))
 
     if (textFiles.length > 0) {
       for (const fileKey of textFiles) {
@@ -1056,10 +673,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           const fileContent = await fs.readFile(filePath, 'utf-8')
           fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n`
         }
-        catch (e) {
-          console.error(`Error reading text file ${fileKey}`, e)
-          fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n`
-        }
+        catch (e) { console.error(`Error reading text file ${fileKey}`, e); fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n` }
       }
     }
 
@@ -1068,84 +682,83 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     if (imageFiles.length > 0) {
       content = [{ type: 'text', text: finalMessage }]
       for (const uploadFileKey of imageFiles) {
-        content.push({
-          type: 'image_url',
-          image_url: { url: await convertImageUrl(stripTypePrefix(uploadFileKey)) },
-        })
+        content.push({ type: 'image_url', image_url: { url: await convertImageUrl(stripTypePrefix(uploadFileKey)) } })
       }
     }
-    else {
-      content = finalMessage
+    else { content = finalMessage }
+  }
+
+  // =========================
+  // ✅ 联网搜索（多轮：模型决定是否搜索、是否调整关键词）
+  // =========================
+  const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
+  const finalSearchMode = allowSearch && options.searchMode === true && !isImage
+
+  if (finalSearchMode) {
+    try {
+      const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
+      const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
+      const plannerModelName = plannerModelCfg || plannerModelEnv || model
+
+      // ✅ planner 可以用独立的 key（从所有可用 key 里找能跑 plannerModel 的 key）
+      let plannerKey = key
+      if (plannerModelName !== model) {
+        const candidateKey = await getRandomApiKey(options.user, plannerModelName)
+        if (candidateKey) plannerKey = candidateKey
+      }
+
+      const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
+      const plannerOpenai = new OpenAI({
+        baseURL: PLANNER_BASE_URL, apiKey: plannerKey.key, maxRetries: 0, timeout: globalConfig.timeoutMs,
+      })
+
+      const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
+      const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
+
+      const plannerModels = [plannerModelName, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
+
+      const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
+      const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
+      const searchTavilyKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
+
+      // ✅ 进度推送
+      const progressMessages: string[] = []
+
+      const rounds = await runIterativeWebSearch({
+        openai: plannerOpenai,
+        plannerModels,
+        userQuestion: message,
+        maxRounds,
+        maxResults,
+        abortSignal: abort.signal,
+        provider: searchProvider,
+        searxngApiUrl: searchSearxngUrl,
+        tavilyApiKey: searchTavilyKey,
+        onProgress: (status: string) => {
+          progressMessages.push(status)
+          const progressText = progressMessages.join('\n')
+          processCb?.({
+            id: customMessageId, text: progressText, role: 'assistant',
+            conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
+          })
+        },
+      })
+
+      const ctx = formatAggregatedSearchForAnswer(rounds)
+      if (ctx) content = appendTextToMessageContent(content, ctx)
+
+      if (API_DEBUG) {
+        debugLog('====== [WebSearch Debug] ======')
+        debugLog('[enabled]', true, '[plannerModel]', plannerModelName, '[plannerKeyRemark]', plannerKey.remark ?? '(current)')
+        debugLog('[roundCount]', rounds.length)
+        debugLog('====== [WebSearch Debug End] ======')
+      }
+    }
+    catch (e: any) {
+      if (isAbortError(e, abort.signal)) throw e
+      console.error('[WebSearch] failed:', e?.message ?? e)
     }
   }
-
-// =========================
-// ✅ 联网搜索（多轮：模型决定是否搜索、是否调整关键词）
-// 管理员可在 SiteConfig 中配置：启用/禁用、provider、url、轮数、条数、planner 模型
-// =========================
-const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
-const finalSearchMode = allowSearch && options.searchMode === true && !isImage
-
-if (finalSearchMode) {
-  try {
-    const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : globalConfig.apiBaseUrl
-    const plannerOpenai = new OpenAI({
-      baseURL: OPENAI_API_BASE_URL,
-      apiKey: key.key,
-      maxRetries: 0,
-      timeout: globalConfig.timeoutMs,
-    })
-
-    const maxRounds = Math.max(
-      1,
-      Math.min(
-        6,
-        Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3),
-      ),
-    )
-
-    const maxResults = Math.max(
-      1,
-      Math.min(
-        10,
-        Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5),
-      ),
-    )
-
-    const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
-    const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
-    const plannerModels = [
-      plannerModelCfg || plannerModelEnv,
-      model,
-      'gpt-3.5-turbo',
-    ].filter(Boolean)
-
-    const provider = globalConfig.siteConfig?.webSearchProvider as any
-    const searxngApiUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
-    const tavilyApiKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
-    
-    const rounds = await runIterativeWebSearch({
-      openai: plannerOpenai,
-      plannerModels,
-      userQuestion: message,
-      maxRounds,
-      maxResults,
-      abortSignal: abort.signal,
-      provider,
-      searxngApiUrl,
-      tavilyApiKey,
-    })
-
-    // 关键：最终回答用的汇总上下文
-    const ctx = formatAggregatedSearchForAnswer(rounds)
-    if (ctx) {
-      content = appendTextToMessageContent(content, ctx)
-    }
-  }
-  catch (e: any) {
-    console.error('[WebSearch] failed:', e?.message ?? e)
-  }
-}
 
   try {
     // =========================
@@ -1153,22 +766,16 @@ if (finalSearchMode) {
     // =========================
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined
-
       const dataUrlCache: DataUrlCache = new Map()
       const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache)
       content = normalizedCurrent.content
 
       const { metas } = await buildGeminiHistoryFromLastMessageId({
-        lastMessageId: lastContext.parentMessageId,
-        maxContextCount,
-        forGeminiImageModel: true,
+        lastMessageId: lastContext.parentMessageId, maxContextCount, forGeminiImageModel: true,
       })
 
       const metasNormalized: HistoryMessageMeta[] = []
-      for (const m of metas) {
-        const nu = await normalizeUrlsDataUrlsToUploads(m.urls || [], dataUrlCache)
-        metasNormalized.push({ ...m, urls: nu.urls })
-      }
+      for (const m of metas) { const nu = await normalizeUrlsDataUrlsToUploads(m.urls || [], dataUrlCache); metasNormalized.push({ ...m, urls: nu.urls }) }
 
       const { cleanedText: currentCleanedText, urls: currentUrlsRaw } = await extractImageUrlsFromMessageContent(content)
       const currentUrlsNorm = await normalizeUrlsDataUrlsToUploads(currentUrlsRaw || [], dataUrlCache)
@@ -1181,45 +788,28 @@ if (finalSearchMode) {
         return { role: m.role, parts: [{ text: labeled || '[Empty]' }] }
       })
 
-      const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
-        ? currentCleanedText.trim()
-        : '请继续生成/修改图片。'
-
+      const userInstructionBase = (currentCleanedText && currentCleanedText.trim()) ? currentCleanedText.trim() : '请继续生成/修改图片。'
       const labeledUserInstruction = applyImageBindingsToCleanedText(userInstructionBase, currentUrls, bindings)
 
       const inputParts: GeminiPart[] = []
       if (bindings.length) {
-        const mapText = bindings
-          .map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`)
-          .join('\n')
+        const mapText = bindings.map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`).join('\n')
         inputParts.push({ text: `【最近两轮图片映射表】\n${mapText}\n` })
       }
-
       for (const b of bindings) {
         inputParts.push({ text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
         const imgPart = await imageUrlToGeminiInlinePart(b.url)
         if (imgPart) inputParts.push(imgPart)
         else inputParts.push({ text: `（该图片无法以内联方式上传：${shortUrlForLog(b.url)}）` })
       }
-
       inputParts.push({ text: `【编辑指令】${labeledUserInstruction}` })
 
-      const ai = new GoogleGenAI({
-        apiKey: key.key,
-        ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
-      })
+      const ai = new GoogleGenAI({ apiKey: key.key, ...(baseUrl ? { httpOptions: { baseUrl } } : {}) })
+      const contents = [...history, { role: 'user', parts: inputParts }]
 
-      const contents = [
-        ...history,
-        { role: 'user', parts: inputParts },
-      ]
-
-      // ✅ 关键修复2：Gemini 请求用 abortablePromise 包一层
-      // 这样点击 stop 会立刻让这里抛 AbortError，从而停止 job
       const response = await abortablePromise(
         ai.models.generateContent({
-          model,
-          contents,
+          model, contents,
           config: {
             responseModalities: ['TEXT', 'IMAGE'],
             imageConfig: { aspectRatio: '16:9', imageSize: '4K' },
@@ -1229,23 +819,16 @@ if (finalSearchMode) {
         abort.signal,
       )
 
-      if (!response.candidates || response.candidates.length === 0)
-        throw new Error('[Gemini] Empty candidates.')
+      if (!response.candidates || response.candidates.length === 0) throw new Error('[Gemini] Empty candidates.')
 
       let text = ''
       const parts = response.candidates?.[0]?.content?.parts ?? []
 
       for (const part of parts as any[]) {
-        if (part?.text) {
-          const rawText = part.text as string
-          const replaced = await replaceDataUrlImagesWithUploads(rawText)
-          text += replaced.text
-        }
-        const inline = part?.inlineData
-        const inlineB64 = inline?.data
+        if (part?.text) { const rawText = part.text as string; const replaced = await replaceDataUrlImagesWithUploads(rawText); text += replaced.text }
+        const inline = part?.inlineData; const inlineB64 = inline?.data
         if (inlineB64) {
-          const mime = inline.mimeType || 'image/png'
-          const base64 = inlineB64 as string
+          const mime = inline.mimeType || 'image/png'; const base64 = inlineB64 as string
           const buffer = Buffer.from(base64, 'base64')
           const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
@@ -1259,30 +842,16 @@ if (finalSearchMode) {
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
       processCb?.({
-        id: customMessageId,
-        text,
-        role: 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
-        detail: undefined,
+        id: customMessageId, text, role: 'assistant',
+        conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: undefined,
       })
 
       return sendResponse({
         type: 'Success',
         data: {
           object: 'chat.completion',
-          choices: [{
-            message: { role: 'assistant', content: text },
-            finish_reason: 'stop',
-            index: 0,
-            logprobs: null,
-          }],
-          created: Date.now(),
-          conversationId: lastContext.conversationId,
-          model,
-          text,
-          id: customMessageId,
-          detail: {},
+          choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
+          created: Date.now(), conversationId: lastContext.conversationId, model, text, id: customMessageId, detail: {},
         },
       })
     }
@@ -1291,15 +860,8 @@ if (finalSearchMode) {
     // ② OpenAI
     // =========================
     const api = await initApi(key, {
-      model,
-      maxContextCount,
-      temperature,
-      top_p,
-      content,
-      abortSignal: abort.signal,
-      systemMessage,
-      lastMessageId: lastContext.parentMessageId,
-      isImageModel: isImage,
+      model, maxContextCount, temperature, top_p, content,
+      abortSignal: abort.signal, systemMessage, lastMessageId: lastContext.parentMessageId, isImageModel: isImage,
     })
 
     let text = ''
@@ -1311,43 +873,28 @@ if (finalSearchMode) {
       const response = api as any
       const choice = response.choices[0]
       let rawContent = choice.message?.content || ''
-      modelRes = response.model
-      usageRes = response.usage
+      modelRes = response.model; usageRes = response.usage
 
       if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image')))
         text = `![Generated Image](${rawContent})`
-      else
-        text = rawContent
+      else text = rawContent
 
       processCb?.({
-        id: customMessageId,
-        text,
-        role: choice.message.role || 'assistant',
-        conversationId: lastContext.conversationId,
-        parentMessageId: lastContext.parentMessageId,
+        id: customMessageId, text, role: choice.message.role || 'assistant',
+        conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId,
         detail: {
           choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }],
-          created: response.created,
-          id: response.id,
-          model: response.model,
-          object: 'chat.completion',
-          usage: response.usage,
+          created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage,
         } as any,
       })
     }
     else {
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
         text += chunk.choices[0]?.delta.content ?? ''
-        chatIdRes = customMessageId
-        modelRes = chunk.model
-        usageRes = usageRes || chunk.usage
+        chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage
         processCb?.({
-          ...chunk,
-          id: customMessageId,
-          text,
-          role: chunk.choices[0]?.delta.role || 'assistant',
-          conversationId: lastContext.conversationId,
-          parentMessageId: lastContext.parentMessageId,
+          ...chunk, id: customMessageId, text, role: chunk.choices[0]?.delta.role || 'assistant',
+          conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId,
         })
       }
     }
@@ -1357,20 +904,13 @@ if (finalSearchMode) {
       data: {
         object: 'chat.completion',
         choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }],
-        created: Date.now(),
-        conversationId: lastContext.conversationId,
-        model: modelRes,
-        text,
-        id: chatIdRes,
+        created: Date.now(), conversationId: lastContext.conversationId, model: modelRes, text, id: chatIdRes,
         detail: { usage: usageRes && { ...usageRes, estimated: false } },
       },
     })
   }
   catch (error: any) {
-    // ✅ 关键修复3：取消/中断不要在这里转换成 sendResponse Fail
-    // 要把 AbortError 直接抛出去，让 runChatJobInBackground 识别为 abort
-    if (isAbortError(error, abort.signal))
-      throw error
+    if (isAbortError(error, abort.signal)) throw error
 
     const code = error.statusCode
     if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) {
@@ -1437,7 +977,6 @@ async function chatConfig() {
   const config = await getOriginConfig() as ModelConfig
   return sendResponse<ModelConfig>({ type: 'Success', data: config })
 }
-
 async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   const isPrompt = id.startsWith('prompt_')
   const chatInfo = await getChatByMessageId(isPrompt ? id.substring(7) : id)
@@ -1527,6 +1066,9 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   }
 }
 
+/**
+ * ===== Key 选择相关函数 =====
+ */
 async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
   if (keys.length <= 0) return null
   _lockedKeys
