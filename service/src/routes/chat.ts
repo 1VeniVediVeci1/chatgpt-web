@@ -317,6 +317,10 @@ async function runChatJobInBackground(params: {
   uuid: number
   regenerate: boolean
   prompt: string
+  /**
+   * ✅ 前端传入：是否开启联网搜索
+   */
+  searchMode?: boolean
   uploadFileKeys?: string[]
   options: any
   systemMessage?: string
@@ -333,6 +337,7 @@ async function runChatJobInBackground(params: {
     uuid,
     regenerate,
     prompt,
+    searchMode,
     uploadFileKeys,
     options,
     systemMessage,
@@ -358,6 +363,7 @@ async function runChatJobInBackground(params: {
   try {
     result = await chatReplyProcess({
       message: prompt,
+      searchMode,
       uploadFileKeys,
       lastContext: options,
       process: (chat: any) => {
@@ -393,12 +399,12 @@ async function runChatJobInBackground(params: {
       result.data.detail.usage.estimated = true
     }
   }
-    catch (error: any) {
-    const isAbort =
-      String(error?.name).includes('Abort')
-      || String(error?.message).toLowerCase().includes('aborted')
-      || String(error?.message).toLowerCase().includes('canceled')
-      || String(error?.message).toLowerCase().includes('cancelled')
+  catch (error: any) {
+    const isAbort
+      = String(error?.name).includes('Abort')
+        || String(error?.message).toLowerCase().includes('aborted')
+        || String(error?.message).toLowerCase().includes('canceled')
+        || String(error?.message).toLowerCase().includes('cancelled')
 
     console.error('[Job] chatReplyProcess error:', error?.message ?? error)
 
@@ -461,7 +467,8 @@ async function runChatJobInBackground(params: {
     try {
       if (typeof resultData.text === 'string')
         await updateChatResponsePartial(message._id.toString(), resultData.text)
-    } catch {}
+    }
+    catch {}
 
     try {
       if (regenerate && message.options?.messageId) {
@@ -527,7 +534,7 @@ async function runChatJobInBackground(params: {
 }
 
 router.post('/chat-process', [auth, limiter], async (req, res) => {
-  let { roomId, uuid, regenerate, prompt, uploadFileKeys, options = {}, systemMessage, temperature, top_p } = req.body as RequestProps
+  let { roomId, uuid, regenerate, prompt, searchMode, uploadFileKeys, options = {}, systemMessage, temperature, top_p } = req.body as RequestProps
   const userId = req.headers.userId.toString()
   const config = await getCacheConfig()
 
@@ -600,6 +607,7 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
       uuid,
       regenerate,
       prompt,
+      searchMode,
       uploadFileKeys,
       options,
       systemMessage,
