@@ -192,15 +192,17 @@ onMounted(() => {
         </div>
 
         <div class="flex items-center space-x-4">
-          <span class="flex-shrink-0 w-[100px]">Planner 模型</span>
+          <span class="flex-shrink-0 w-[100px]">隐藏模型</span>
           <div class="flex-1">
             <NInput
-              :value="config && config.webSearchPlannerModel"
-              placeholder="可空（使用当前对话模型）。填写模型名如 gpt-4o-mini，需在 Key 配置中有对应可用 Key"
-              @input="(val) => { if (config) config.webSearchPlannerModel = val }"
+              :value="config && config.hiddenModels"
+              placeholder="英文逗号分隔。这些模型不会出现在用户的模型选择列表中，但仍可用于 Planner 等内部用途。"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              @input="(val) => { if (config) config.hiddenModels = val }"
             />
             <p class="text-xs text-[#b4bbc4] mt-1">
-              留空则使用当前对话模型。若填写的模型名在 Key 配置中有对应可用的 API Key，将自动使用该 Key 调用（无需和对话模型相同）。
+              例如：gpt-4o-mini。填写后该模型不会在聊天页的模型下拉中出现，但 Key 配置中有对应 Key 时仍可被搜索 Planner 使用。
             </p>
           </div>
         </div>
