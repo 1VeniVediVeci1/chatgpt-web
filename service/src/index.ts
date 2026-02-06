@@ -226,19 +226,22 @@ router.post('/session', async (req, res) => {
     const userId = await getUserId(req)
     const chatModels: { label; key: string; value: string }[] = []
 
+    // ✅ 所有模型选项（包含隐藏模型）—— 给管理员 Key 配置页用
     const chatModelOptions = config.siteConfig.chatModels.split(',').map((model: string) => {
       let label = model
       if (model === 'text-davinci-002-render-sha-mobile') label = 'gpt-3.5-mobile'
       return { label, key: model, value: model }
     })
 
-    // ✅ 过滤掉隐藏模型（hiddenModels 里的模型不出现在用户可选列表中）
+    // ✅ 隐藏模型集合
     const hiddenModelSet = new Set(
       (config.siteConfig?.hiddenModels || '')
         .split(/[,，]/)
         .map(s => s.trim())
         .filter(Boolean),
     )
+
+    // ✅ 用户可见的模型选项（过滤掉隐藏模型）—— 给聊天页下拉用
     const visibleChatModelOptions = chatModelOptions.filter(
       (opt: any) => !hiddenModelSet.has(opt.value),
     )
@@ -257,7 +260,10 @@ router.post('/session', async (req, res) => {
         res.send({
           status: 'Success', message: '', data: {
             auth: hasAuth, allowRegister, model: config.apiModel, title: config.siteConfig.siteTitle,
-            chatModels, allChatModels: visibleChatModelOptions, showWatermark: config.siteConfig?.showWatermark, webSearchEnabled,
+            chatModels,
+            // ✅ allChatModels 不过滤（管理员 Key 配置页需要看到全部模型）
+            allChatModels: chatModelOptions,
+            showWatermark: config.siteConfig?.showWatermark, webSearchEnabled,
           },
         })
         return
@@ -271,8 +277,8 @@ router.post('/session', async (req, res) => {
 
       const keys = (await getCacheApiKeys()).filter(d => hasAnyRole(d.userRoles, user.roles))
 
+      // ✅ 构建用户可见的 chatModels 列表时，只用 visibleChatModelOptions
       const count: { key: string; count: number }[] = []
-      // ✅ 用 visibleChatModelOptions 构建用户可见列表
       visibleChatModelOptions.forEach((chatModel) => {
         keys.forEach((key) => {
           if (key.chatModels.includes(chatModel.value)) {
@@ -295,7 +301,11 @@ router.post('/session', async (req, res) => {
       res.send({
         status: 'Success', message: '', data: {
           auth: hasAuth, authProxyEnabled, allowRegister, model: config.apiModel,
-          title: config.siteConfig.siteTitle, chatModels, allChatModels: visibleChatModelOptions,
+          title: config.siteConfig.siteTitle,
+          // ✅ chatModels：用户聊天页看到的（已过滤隐藏模型）
+          chatModels,
+          // ✅ allChatModels：管理员 Key 配置页看到的（不过滤，包含隐藏模型）
+          allChatModels: chatModelOptions,
           geminiChatModels, nonStreamChatModels,
           usageCountLimit: config.siteConfig?.usageCountLimit, showWatermark: config.siteConfig?.showWatermark,
           webSearchEnabled, userInfo,
@@ -313,7 +323,9 @@ router.post('/session', async (req, res) => {
       status: 'Success', message: '', data: {
         auth: hasAuth, authProxyEnabled, allowRegister, model: config.apiModel,
         title: config.siteConfig.siteTitle,
-        chatModels: visibleChatModelOptions, allChatModels: visibleChatModelOptions,
+        // ✅ 未登录用户：chatModels 过滤，allChatModels 不过滤
+        chatModels: visibleChatModelOptions,
+        allChatModels: chatModelOptions,
         geminiChatModels, nonStreamChatModels,
         showWatermark: config.siteConfig?.showWatermark, webSearchEnabled, userInfo,
       },
