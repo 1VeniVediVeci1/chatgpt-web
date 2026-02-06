@@ -209,9 +209,17 @@ export class SiteConfig {
     public usageCountLimit?: boolean,
     public showWatermark?: boolean,
     public imageModels?: string,
-    // ===== 新增: 推理模型配置 =====
-    public reasoningModels?: string, // 哪些模型启用推理参数，逗号分隔
-    public reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh', // 推理强度
+    // ===== 推理模型配置 =====
+    public reasoningModels?: string,
+    public reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh',
+
+    // ===== ✅ 联网搜索配置（管理员可在前端配置）=====
+    public webSearchEnabled?: boolean, // 是否允许使用联网搜索
+    public webSearchProvider?: 'searxng' | 'tavily',
+    public searxngApiUrl?: string, // searxng base url，例如 http://localhost:8080
+    public webSearchMaxResults?: number, // 每轮最多条数
+    public webSearchMaxRounds?: number, // 最多搜索轮数
+    public webSearchPlannerModel?: string, // 用于“是否需要继续搜索/改关键词”的规划模型（可空）
   ) { }
 }
 
