@@ -246,8 +246,7 @@ router.post('/user-register', authLimiter, async (req, res) => {
       for (let index = 0; index < emailSuffixs.length; index++) {
         const element = emailSuffixs[index]
         allowSuffix = username.toLowerCase().endsWith(element)
-        if (allowSuffix)
-          break
+        if (allowSuffix) break
       }
       if (!allowSuffix) {
         res.send({ status: 'Fail', message: '该邮箱后缀不支持 | The email service provider is not allowed', data: null })
@@ -288,7 +287,6 @@ router.post('/config', rootAuth, async (req, res) => {
     const userId = req.headers.userId.toString()
     if (!isAdmin(userId))
       throw new Error('无权限 | No permission.')
-
     const response = await chatConfig()
     res.send(response)
   }
@@ -296,7 +294,6 @@ router.post('/config', rootAuth, async (req, res) => {
     res.send(error)
   }
 })
-
 router.post('/session', async (req, res) => {
   try {
     const config = await getCacheConfig()
@@ -330,6 +327,9 @@ router.post('/session', async (req, res) => {
       .map(s => s.trim())
       .filter(Boolean)
 
+    // ✅ 联网搜索全局开关（管理员配置）
+    const webSearchEnabled = config.siteConfig?.webSearchEnabled === true
+
     let userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; roles: UserRole[]; config: UserConfig; advanced: AdvancedConfig }
     if (userId != null) {
       const user = await getUserById(userId)
@@ -346,6 +346,7 @@ router.post('/session', async (req, res) => {
             chatModels,
             allChatModels: chatModelOptions,
             showWatermark: config.siteConfig?.showWatermark,
+            webSearchEnabled,
           },
         })
         return
@@ -409,6 +410,7 @@ router.post('/session', async (req, res) => {
           nonStreamChatModels,
           usageCountLimit: config.siteConfig?.usageCountLimit,
           showWatermark: config.siteConfig?.showWatermark,
+          webSearchEnabled,
           userInfo,
         },
       })
@@ -429,11 +431,12 @@ router.post('/session', async (req, res) => {
         allowRegister,
         model: config.apiModel,
         title: config.siteConfig.siteTitle,
-        chatModels: chatModelOptions, // if userId is null which means in nologin mode, open all model options
+        chatModels: chatModelOptions,
         allChatModels: chatModelOptions,
         geminiChatModels,
         nonStreamChatModels,
         showWatermark: config.siteConfig?.showWatermark,
+        webSearchEnabled,
         userInfo,
       },
     })
@@ -547,7 +550,6 @@ router.post('/user-info', auth, async (req, res) => {
   }
 })
 
-// 使用兑换码后更新用户用量
 router.post('/user-updateamtinfo', auth, async (req, res) => {
   try {
     const { useAmount } = req.body as { useAmount: number }
@@ -564,7 +566,6 @@ router.post('/user-updateamtinfo', auth, async (req, res) => {
   }
 })
 
-// 获取用户对话额度
 router.get('/user-getamtinfo', auth, async (req, res) => {
   try {
     const userId = req.headers.userId as string
@@ -581,7 +582,6 @@ router.get('/user-getamtinfo', auth, async (req, res) => {
   }
 })
 
-// 兑换对话额度
 router.post('/redeem-card', auth, async (req, res) => {
   try {
     const { redeemCardNo } = req.body as { redeemCardNo: string }
@@ -608,10 +608,9 @@ router.post('/redeem-card', auth, async (req, res) => {
   }
 })
 
-// update giftcard database
 router.post('/giftcard-update', rootAuth, async (req, res) => {
   try {
-    const { data, overRideSwitch } = req.body as { data: GiftCard[];overRideSwitch: boolean }
+    const { data, overRideSwitch } = req.body as { data: GiftCard[]; overRideSwitch: boolean }
     await updateGiftCards(data, overRideSwitch)
     res.send({ status: 'Success', message: '更新成功 | Update successfully' })
   }
@@ -662,7 +661,6 @@ router.post('/user-status', rootAuth, async (req, res) => {
   }
 })
 
-// 函数中加入useAmount limit_switch
 router.post('/user-edit', rootAuth, async (req, res) => {
   try {
     const { userId, email, password, roles, remark, useAmount, limit_switch } = req.body as { userId?: string; email: string; password: string; roles: UserRole[]; remark?: string; useAmount?: number; limit_switch?: boolean }
