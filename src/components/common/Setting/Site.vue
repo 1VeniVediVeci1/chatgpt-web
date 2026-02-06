@@ -191,6 +191,21 @@ onMounted(() => {
           </div>
         </div>
 
+        <!-- ✅ 新增：联网搜索 Planner 模型 -->
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">搜索 Planner 模型</span>
+          <div class="flex-1">
+            <NInput
+              :value="config && config.webSearchPlannerModel"
+              placeholder="例如：gpt-5-mini（留空则使用当前对话模型；需在 Key 配置中勾选该模型）"
+              @input="(val) => { if (config) config.webSearchPlannerModel = val }"
+            />
+            <p class="text-xs text-[#b4bbc4] mt-1">
+              用于“是否继续搜索/下一轮关键词”的规划；若未配置或找不到对应 Key，会自动回退到当前对话模型。
+            </p>
+          </div>
+        </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">隐藏模型</span>
           <div class="flex-1">
