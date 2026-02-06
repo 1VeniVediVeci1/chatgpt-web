@@ -29,15 +29,6 @@ export interface WebSearchResults {
 const CACHE_TTL_MS = Number(process.env.WEB_SEARCH_CACHE_TTL_MS ?? 60 * 60 * 1000)
 const memCache = new Map<string, { expiresAt: number; data: WebSearchResults }>()
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n))
-}
-
-function truncText(s: string, max = 1500) {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
-  return t.length > max ? `${t.slice(0, max)}...` : t
-}
-
 function cacheKey(provider: string, query: string, opts: WebSearchOptions) {
   return [
     provider,
@@ -64,9 +55,15 @@ function setCached(k: string, data: WebSearchResults) {
   memCache.set(k, { expiresAt: Date.now() + CACHE_TTL_MS, data })
 }
 
+function normalizeMaxResults(maxResults?: number): number | undefined {
+  if (maxResults == null) return undefined
+  const n = Number(maxResults)
+  if (!Number.isFinite(n) || n <= 0) return undefined
+  return n
+}
+
 async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptions): Promise<WebSearchResults> {
-  if (!apiUrl)
-    throw new Error('SearXNG API URL is not configured.')
+  if (!apiUrl) throw new Error('SearXNG API URL is not configured.')
 
   const base = apiUrl.replace(/\/+$/, '')
   const url = new URL(`${base}/search`)
@@ -94,7 +91,7 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
     .map(r => ({
       title: String(r.title || ''),
       url: String(r.url || ''),
-      content: String(r.content || ''),
+      content: String(r.content || ''), // 不截断
     }))
 
   if (opts.excludeDomains?.length) {
@@ -107,8 +104,8 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
     })
   }
 
-  const max = clamp(Number(opts.maxResults ?? 5), 1, 20)
-  results = results.slice(0, max).map(r => ({ ...r, content: truncText(r.content, 1500) }))
+  const max = normalizeMaxResults(opts.maxResults)
+  if (max != null) results = results.slice(0, max) // 不做上限 clamp，只按用户给的 maxResults 截取
 
   return {
     query: data?.query || query,
@@ -119,24 +116,28 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
 }
 
 async function tavilySearch(query: string, apiKey: string, opts: WebSearchOptions): Promise<WebSearchResults> {
-  const max = clamp(Number(opts.maxResults ?? 5), 1, 10)
+  const max = normalizeMaxResults(opts.maxResults)
   const filledQuery = query.length < 5 ? query + ' '.repeat(5 - query.length) : query
+
+  const body: any = {
+    api_key: apiKey,
+    query: filledQuery,
+    search_depth: opts.searchDepth ?? 'advanced',
+    include_images: false,
+    include_answers: false,
+    include_raw_content: true,
+    include_domains: opts.includeDomains ?? [],
+    exclude_domains: opts.excludeDomains ?? [],
+  }
+
+  // 不再把 max_results clamp 到 10，也不强行 >= 5；交给用户/服务端规则决定
+  if (max != null) body.max_results = max
 
   const resp = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal: opts.signal as any,
-    body: JSON.stringify({
-      api_key: apiKey,
-      query: filledQuery,
-      max_results: Math.max(max, 5),
-      search_depth: opts.searchDepth ?? 'advanced',
-      include_images: false,
-      include_answers: false,
-      include_raw_content: true,
-      include_domains: opts.includeDomains ?? [],
-      exclude_domains: opts.excludeDomains ?? [],
-    }),
+    body: JSON.stringify(body),
   })
 
   if (!resp.ok)
@@ -150,17 +151,32 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
     return {
       title: String(r.title || ''),
       url: String(r.url || ''),
-      content: truncText(bestContent, 2000),
+      content: bestContent, // 不截断
     }
   })
 
-  return { query, results: results.slice(0, max), images: [], number_of_results: results.length }
+  const finalResults = (max != null) ? results.slice(0, max) : results
+
+  return {
+    query,
+    results: finalResults,
+    images: [],
+    number_of_results: finalResults.length,
+  }
 }
 
 export async function webSearch(query: string, opts: WebSearchOptions = {}): Promise<WebSearchResults> {
-  const provider = (opts.provider ?? (process.env.WEB_SEARCH_PROVIDER || process.env.SEARCH_API || 'searxng')).toLowerCase() as WebSearchProvider
-  const maxResults = opts.maxResults ?? Number(process.env.WEB_SEARCH_MAX_RESULTS ?? 5)
-  const finalOpts: WebSearchOptions = { ...opts, maxResults }
+  const provider = (opts.provider ?? (process.env.WEB_SEARCH_PROVIDER || process.env.SEARCH_API || 'searxng'))
+    .toLowerCase() as WebSearchProvider
+
+  // 不再默认强制 maxResults=5；只有用户传了或环境变量显式配置才会限制
+  const envMax = normalizeMaxResults(Number(process.env.WEB_SEARCH_MAX_RESULTS))
+  const resolvedMaxResults = normalizeMaxResults(opts.maxResults) ?? envMax
+
+  const finalOpts: WebSearchOptions = {
+    ...opts,
+    ...(resolvedMaxResults != null ? { maxResults: resolvedMaxResults } : {}),
+  }
 
   const k = cacheKey(provider, query, finalOpts)
   const cached = getCached(k)
