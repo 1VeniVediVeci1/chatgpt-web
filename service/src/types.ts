@@ -6,6 +6,12 @@ export interface RequestProps {
   uuid: number
   regenerate: boolean
   prompt: string
+  /**
+   * ✅ 是否开启联网搜索（前端开关传入）
+   * - true：先让模型判断要不要搜，并可多轮调整 query 后再回答
+   * - false：不搜
+   */
+  searchMode?: boolean
   uploadFileKeys?: string[]
   options?: ChatContext
   systemMessage: string
