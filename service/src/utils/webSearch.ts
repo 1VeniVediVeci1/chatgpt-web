@@ -8,7 +8,6 @@ export interface WebSearchOptions {
   includeDomains?: string[]
   excludeDomains?: string[]
   signal?: AbortSignal
-  /** 来自 SiteConfig 的 override */
   provider?: WebSearchProvider
   searxngApiUrl?: string
   tavilyApiKey?: string
@@ -34,7 +33,7 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n))
 }
 
-function truncText(s: string, max = 600) {
+function truncText(s: string, max = 1500) {
   const t = String(s ?? '').replace(/\s+/g, ' ').trim()
   return t.length > max ? `${t.slice(0, max)}...` : t
 }
@@ -109,7 +108,7 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
   }
 
   const max = clamp(Number(opts.maxResults ?? 5), 1, 20)
-  results = results.slice(0, max).map(r => ({ ...r, content: truncText(r.content, 700) }))
+  results = results.slice(0, max).map(r => ({ ...r, content: truncText(r.content, 1500) }))
 
   return {
     query: data?.query || query,
@@ -131,9 +130,10 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
       api_key: apiKey,
       query: filledQuery,
       max_results: Math.max(max, 5),
-      search_depth: opts.searchDepth ?? 'basic',
+      search_depth: opts.searchDepth ?? 'advanced',
       include_images: false,
       include_answers: false,
+      include_raw_content: true,
       include_domains: opts.includeDomains ?? [],
       exclude_domains: opts.excludeDomains ?? [],
     }),
@@ -143,21 +143,20 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
     throw new Error(`[tavily] ${resp.status} ${resp.statusText}`)
 
   const data = await resp.json() as any
-  const results: WebSearchResultItem[] = (data?.results || []).map((r: any) => ({
-    title: String(r.title || ''),
-    url: String(r.url || ''),
-    content: truncText(String(r.content || ''), 900),
-  }))
+  const results: WebSearchResultItem[] = (data?.results || []).map((r: any) => {
+    const rawContent = String(r.raw_content || '').trim()
+    const snippet = String(r.content || '').trim()
+    const bestContent = rawContent.length > snippet.length ? rawContent : snippet
+    return {
+      title: String(r.title || ''),
+      url: String(r.url || ''),
+      content: truncText(bestContent, 2000),
+    }
+  })
 
   return { query, results: results.slice(0, max), images: [], number_of_results: results.length }
 }
 
-/**
- * 执行一次联网搜索：
- * - provider 优先取 opts.provider（SiteConfig），fallback 到环境变量
- * - searxngApiUrl 优先取 opts.searxngApiUrl（SiteConfig），fallback 到环境变量
- * - tavilyApiKey 优先取 opts.tavilyApiKey（SiteConfig），fallback 到环境变量
- */
 export async function webSearch(query: string, opts: WebSearchOptions = {}): Promise<WebSearchResults> {
   const provider = (opts.provider ?? (process.env.WEB_SEARCH_PROVIDER || process.env.SEARCH_API || 'searxng')).toLowerCase() as WebSearchProvider
   const maxResults = opts.maxResults ?? Number(process.env.WEB_SEARCH_MAX_RESULTS ?? 5)
@@ -170,7 +169,7 @@ export async function webSearch(query: string, opts: WebSearchOptions = {}): Pro
   let data: WebSearchResults
   if (provider === 'tavily') {
     const key = finalOpts.tavilyApiKey || process.env.TAVILY_API_KEY || ''
-    if (!key) throw new Error('Tavily API Key is not configured (neither in SiteConfig nor env TAVILY_API_KEY).')
+    if (!key) throw new Error('Tavily API Key is not configured.')
     data = await tavilySearch(query, key, finalOpts)
   }
   else {
