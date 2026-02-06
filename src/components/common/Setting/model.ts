@@ -20,7 +20,6 @@ export class UserConfig {
   chatModel?: string
 }
 
-// https://platform.openai.com/docs/models/overview
 export class SiteConfig {
   siteTitle?: string
   loginEnabled?: boolean
@@ -37,11 +36,11 @@ export class SiteConfig {
   // ===== 推理模型配置 =====
   reasoningModels?: string
   reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh'
-
   // ===== ✅ 联网搜索配置 =====
   webSearchEnabled?: boolean
   webSearchProvider?: 'searxng' | 'tavily'
   searxngApiUrl?: string
+  tavilyApiKey?: string
   webSearchMaxResults?: number
   webSearchMaxRounds?: number
   webSearchPlannerModel?: string
@@ -55,7 +54,7 @@ export class MailConfig {
   smtpPassword?: string
   smtpFrom?: string
 }
-export type TextAuditServiceProvider = 'baidu' //  | 'ali'
+export type TextAuditServiceProvider = 'baidu'
 
 export interface TextAuditServiceOptions {
   apiKey: string
@@ -64,9 +63,9 @@ export interface TextAuditServiceOptions {
 }
 export enum TextAudioType {
   None = 0,
-  Request = 1 << 0, // 二进制 01
-  Response = 1 << 1, // 二进制 10
-  All = Request | Response, // 二进制 11
+  Request = 1 << 0,
+  Response = 1 << 1,
+  All = Request | Response,
 }
 
 export class AuditConfig {
@@ -137,19 +136,11 @@ export class UserPrompt {
 export type APIMODEL = 'ChatGPTAPI' | 'ChatGPTUnofficialProxyAPI' | undefined
 
 export const apiModelOptions = ['ChatGPTAPI', 'ChatGPTUnofficialProxyAPI'].map((model: string) => {
-  return {
-    label: model,
-    key: model,
-    value: model,
-  }
+  return { label: model, key: model, value: model }
 })
 
 export const userRoleOptions = Object.values(UserRole).filter(d => Number.isNaN(Number(d))).map((role) => {
-  return {
-    label: role as string,
-    key: role as string,
-    value: UserRole[role as keyof typeof UserRole],
-  }
+  return { label: role as string, key: role as string, value: UserRole[role as keyof typeof UserRole] }
 })
 
 export class UserInfo {
@@ -159,7 +150,6 @@ export class UserInfo {
   roles: UserRole[]
   remark?: string
   useAmount?: number
-  // 配合改造，增加额度信息 and it's switch
   limit_switch?: boolean
   constructor(roles: UserRole[]) {
     this.roles = roles
