@@ -1121,7 +1121,8 @@ if (finalSearchMode) {
 
     const provider = globalConfig.siteConfig?.webSearchProvider as any
     const searxngApiUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
-
+    const tavilyApiKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
+    
     const rounds = await runIterativeWebSearch({
       openai: plannerOpenai,
       plannerModels,
@@ -1131,6 +1132,7 @@ if (finalSearchMode) {
       abortSignal: abort.signal,
       provider,
       searxngApiUrl,
+      tavilyApiKey,
     })
 
     // 关键：最终回答用的汇总上下文
