@@ -335,8 +335,10 @@ async function runIterativeWebSearch(params: {
   maxRounds: number
   maxResults: number
   abortSignal?: AbortSignal
+  provider?: 'searxng' | 'tavily'
+  searxngApiUrl?: string
 }): Promise<SearchRound[]> {
-  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal } = params
+  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl } = params
 
   const rounds: SearchRound[] = []
   const usedQueries = new Set<string>()
@@ -371,7 +373,7 @@ async function runIterativeWebSearch(params: {
     usedQueries.add(q)
 
     try {
-      const r = await webSearch(q, { maxResults, signal: abortSignal })
+      const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl })
       const items = (r.results || []).slice(0, maxResults).map(it => ({
         title: String(it.title || ''),
         url: String(it.url || ''),
@@ -1076,59 +1078,71 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
-  // =========================
-  // ✅ 联网搜索（多轮：模型决定是否搜索、是否调整关键词）
-  // - 仅当 options.searchMode=true
-  // - 图片/非流式模型不启用（避免影响图片生成提示）
-  // =========================
-  if (options.searchMode === true && !isImage) {
-    try {
-      const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : globalConfig.apiBaseUrl
-      const plannerOpenai = new OpenAI({
-        baseURL: OPENAI_API_BASE_URL,
-        apiKey: key.key,
-        maxRetries: 0,
-        timeout: globalConfig.timeoutMs,
-      })
+// =========================
+// ✅ 联网搜索（多轮：模型决定是否搜索、是否调整关键词）
+// 管理员可在 SiteConfig 中配置：启用/禁用、provider、url、轮数、条数、planner 模型
+// =========================
+const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
+const finalSearchMode = allowSearch && options.searchMode === true && !isImage
 
-      const maxRounds = Math.max(1, Math.min(6, Number(process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
-      const maxResults = Math.max(1, Math.min(10, Number(process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
+if (finalSearchMode) {
+  try {
+    const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : globalConfig.apiBaseUrl
+    const plannerOpenai = new OpenAI({
+      baseURL: OPENAI_API_BASE_URL,
+      apiKey: key.key,
+      maxRetries: 0,
+      timeout: globalConfig.timeoutMs,
+    })
 
-      const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL || '').trim()
-      // plannerModels：按顺序尝试，尽量提高兼容性
-      const plannerModels = [
-        plannerModelEnv,
-        model,
-        'gpt-3.5-turbo',
-      ].filter(Boolean)
+    const maxRounds = Math.max(
+      1,
+      Math.min(
+        6,
+        Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3),
+      ),
+    )
 
-      const rounds = await runIterativeWebSearch({
-        openai: plannerOpenai,
-        plannerModels,
-        userQuestion: message,
-        maxRounds,
-        maxResults,
-        abortSignal: abort.signal,
-      })
+    const maxResults = Math.max(
+      1,
+      Math.min(
+        10,
+        Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5),
+      ),
+    )
 
-      const ctx = formatAggregatedSearchForAnswer(rounds)
-      if (ctx) {
-        content = appendTextToMessageContent(content, ctx)
+    const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
+    const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
+    const plannerModels = [
+      plannerModelCfg || plannerModelEnv,
+      model,
+      'gpt-3.5-turbo',
+    ].filter(Boolean)
 
-        if (API_DEBUG) {
-          debugLog('====== [WebSearch Debug] ======')
-          debugLog('[enabled]', true)
-          debugLog('[roundCount]', rounds.length)
-          debugLog('[ctxPreview]', trunc(ctx))
-          debugLog('====== [WebSearch Debug End] ======')
-        }
-      }
-    }
-    catch (e: any) {
-      // 搜索失败不阻塞对话：降级为普通问答
-      console.error('[WebSearch] failed:', e?.message ?? e)
+    const provider = globalConfig.siteConfig?.webSearchProvider as any
+    const searxngApiUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
+
+    const rounds = await runIterativeWebSearch({
+      openai: plannerOpenai,
+      plannerModels,
+      userQuestion: message,
+      maxRounds,
+      maxResults,
+      abortSignal: abort.signal,
+      provider,
+      searxngApiUrl,
+    })
+
+    // 关键：最终回答用的汇总上下文
+    const ctx = formatAggregatedSearchForAnswer(rounds)
+    if (ctx) {
+      content = appendTextToMessageContent(content, ctx)
     }
   }
+  catch (e: any) {
+    console.error('[WebSearch] failed:', e?.message ?? e)
+  }
+}
 
   try {
     // =========================
