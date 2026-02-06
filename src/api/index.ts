@@ -113,7 +113,7 @@ export function fetchLogin<T = any>(username: string, password: string, token?: 
 export function fetchLogout<T = any>() {
   return post<T>({
     url: '/user-logout',
-    data: { },
+    data: {},
   })
 }
 
@@ -152,12 +152,14 @@ export function fetchUpdateUserAmt<T = any>(useAmount: number) {
     data: { useAmount },
   })
 }
-// 获取用户目前额度（因为兑换加总在前端完成，因此先查询一次实际额度）
+
+// 获取用户目前额度
 export function fetchUserAmt<T = any>() {
   return get<T>({
     url: '/user-getamtinfo',
   })
 }
+
 // 获取兑换码对应的额度
 export function decode_redeemcard<T = any>(redeemCardNo: string) {
   return post<T>({
@@ -300,7 +302,7 @@ export function fetchGetChatHistory<T = any>(roomId: number, lastId?: number, al
 export function fetchClearAllChat<T = any>() {
   return post<T>({
     url: '/chat-clear-all',
-    data: { },
+    data: {},
   })
 }
 
@@ -353,13 +355,6 @@ export function fetchUpdateAnnounce<T = any>(announce: AnnounceConfig) {
   })
 }
 
-export function fetchTestAudit<T = any>(text: string, audit: AuditConfig) {
-  return post<T>({
-    url: '/audit-test',
-    data: { audit, text },
-  })
-}
-
 export function fetchUpdateAdvanced<T = any>(sync: boolean, advanced: SettingsState) {
   const data = { sync, ...advanced }
   return post<T>({
@@ -373,6 +368,7 @@ export function fetchResetAdvanced<T = any>() {
     url: '/setting-reset-advanced',
   })
 }
+
 export function fetchUpdateSite<T = any>(config: SiteConfig) {
   return post<T>({
     url: '/setting-site',
