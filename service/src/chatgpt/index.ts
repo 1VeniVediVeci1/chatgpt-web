@@ -308,33 +308,77 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
+
+      // ✅ 为 planner 找独立 key；找不到则 fallback 到当前对话模型+key
       let plannerKey = key
-      if (plannerModelName !== model) { const candidateKey = await getRandomApiKey(options.user, plannerModelName); if (candidateKey) plannerKey = candidateKey }
+      let actualPlannerModel = plannerModelName
+      if (plannerModelName !== model) {
+        const candidateKey = await getRandomApiKey(options.user, plannerModelName)
+        if (candidateKey) {
+          plannerKey = candidateKey
+        }
+        else {
+          console.warn(`[WebSearch] No key found for planner model "${plannerModelName}", falling back to current model "${model}"`)
+          actualPlannerModel = model
+          plannerKey = key
+        }
+      }
+
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
       const plannerOpenai = new OpenAI({ baseURL: PLANNER_BASE_URL, apiKey: plannerKey.key, maxRetries: 0, timeout: globalConfig.timeoutMs })
+
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
-      const plannerModels = [plannerModelName, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
+
+      // ✅ 用 actualPlannerModel（而非原始配置名）
+      const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
+
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
       const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
       const searchTavilyKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
 
       const progressMessages: string[] = []
-      const onProgressLocal = (status: string) => { progressMessages.push(status); processCb?.({ id: customMessageId, text: progressMessages.join('\n'), role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined }) }
+      const onProgressLocal = (status: string) => {
+        progressMessages.push(status)
+        processCb?.({
+          id: customMessageId, text: progressMessages.join('\n'), role: 'assistant',
+          conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
+        })
+      }
 
-      const rounds = await runIterativeWebSearch({ openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults, abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey, onProgress: onProgressLocal })
+      const rounds = await runIterativeWebSearch({
+        openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
+        abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
+        onProgress: onProgressLocal,
+      })
 
+      // ✅ 筛选/压缩
       const maxItemsForAnswer = Math.max(3, Math.min(8, maxResults))
       let filteredRounds = rounds
       const totalItems = rounds.reduce((sum, r) => sum + (r.items?.length ?? 0), 0)
       if (totalItems > maxItemsForAnswer) {
         onProgressLocal(`🔎 正在筛选最相关的 ${maxItemsForAnswer} 条结果...`)
-        try { filteredRounds = await filterAndSummarizeSearchResults({ openai: plannerOpenai, model: plannerModels[0] || model, userQuestion: message, rounds, maxItems: maxItemsForAnswer, abortSignal: abort.signal }); onProgressLocal(`✅ 筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`) }
+        try {
+          filteredRounds = await filterAndSummarizeSearchResults({
+            openai: plannerOpenai, model: plannerModels[0] || model, userQuestion: message,
+            rounds, maxItems: maxItemsForAnswer, abortSignal: abort.signal,
+          })
+          onProgressLocal(`✅ 筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`)
+        }
         catch (e: any) { if (isAbortError(e, abort.signal)) throw e; filteredRounds = rounds }
       }
-      const ctx = formatAggregatedSearchForAnswer(filteredRounds); if (ctx) content = appendTextToMessageContent(content, ctx)
-      if (API_DEBUG) { debugLog('====== [WebSearch Debug] ======'); debugLog('[plannerModel]', plannerModelName, '[rounds]', rounds.length, '[filteredItems]', filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)); debugLog('====== [WebSearch Debug End] ======') }
-    } catch (e: any) { if (isAbortError(e, abort.signal)) throw e; console.error('[WebSearch] failed:', e?.message ?? e) }
+
+      const ctx = formatAggregatedSearchForAnswer(filteredRounds)
+      if (ctx) content = appendTextToMessageContent(content, ctx)
+
+      if (API_DEBUG) {
+        debugLog('====== [WebSearch Debug] ======')
+        debugLog('[configuredPlanner]', plannerModelName, '[actualPlanner]', actualPlannerModel)
+        debugLog('[rounds]', rounds.length, '[filteredItems]', filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0))
+        debugLog('====== [WebSearch Debug End] ======')
+      }
+    }
+    catch (e: any) { if (isAbortError(e, abort.signal)) throw e; console.error('[WebSearch] failed:', e?.message ?? e) }
   }
 
   try {
