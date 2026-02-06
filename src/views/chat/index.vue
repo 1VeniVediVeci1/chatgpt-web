@@ -86,6 +86,13 @@ const groupedChatModelOptions = computed(() => {
 const currentNavIndexRef = ref<number>(-1)
 const isVisionModel = ref(true)
 
+/**
+ * ✅ 联网搜索开关（前端控制）
+ * - true：后端会做“模型判断是否需要搜索 + 多轮调整关键词搜索”
+ * - false：不启用
+ */
+const searchMode = ref(false)
+
 let loadingms: MessageReactive
 let allmsg: MessageReactive
 let prevScrollTop: number
@@ -424,6 +431,7 @@ async function onConversation() {
       uuid: chatUuid,
       regenerate: false,
       prompt: message,
+      searchMode: searchMode.value,
       uploadFileKeys,
       options,
       signal: controller.signal,
@@ -537,6 +545,7 @@ async function onRegenerate(index: number) {
       uuid: chatUuid,
       regenerate: true,
       prompt: message,
+      searchMode: searchMode.value,
       uploadFileKeys,
       options,
       signal: controller.signal,
@@ -805,7 +814,6 @@ watch(
 
 onUnmounted(() => stopPolling())
 </script>
-
 <template>
   <div class="flex flex-col w-full h-full">
     <HeaderComponent
@@ -918,6 +926,17 @@ onUnmounted(() => stopPolling())
                 </div>
               </NUpload>
             </div>
+
+            <!-- ✅ 联网搜索开关 -->
+            <HoverButton
+              :tooltip="searchMode ? '联网搜索：开（模型将自动决定是否搜索并可多轮调整关键词）' : '联网搜索：关'"
+              :class="{ 'text-[#4b9e5f]': searchMode }"
+              @click="searchMode = !searchMode"
+            >
+              <span class="text-xl text-[#4f555e] dark:text-white">
+                <SvgIcon icon="ri:globe-line" />
+              </span>
+            </HoverButton>
 
             <HoverButton @click="handleClear">
               <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:delete-bin-line" /></span>
