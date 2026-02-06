@@ -22,10 +22,15 @@ export function fetchChatAPIProcess<T = any>(
     uuid: number
     regenerate?: boolean
     prompt: string
+    /**
+     * ✅ 是否开启联网搜索（后端将做“模型判断是否需要搜索 + 多轮调整关键词”）
+     */
+    searchMode?: boolean
     uploadFileKeys?: string[]
     options?: { conversationId?: string; parentMessageId?: string }
     signal?: GenericAbortSignal
-    onDownloadProgress?: (progressEvent: AxiosProgressEvent) => void },
+    onDownloadProgress?: (progressEvent: AxiosProgressEvent) => void
+  },
 ) {
   const userStore = useUserStore()
   const authStore = useAuthStore()
@@ -35,6 +40,7 @@ export function fetchChatAPIProcess<T = any>(
     uuid: params.uuid,
     regenerate: params.regenerate || false,
     prompt: params.prompt,
+    searchMode: params.searchMode ?? false,
     uploadFileKeys: params.uploadFileKeys,
     options: params.options,
   }
@@ -344,6 +350,13 @@ export function fetchUpdateAnnounce<T = any>(announce: AnnounceConfig) {
   return post<T>({
     url: '/setting-announce',
     data: announce,
+  })
+}
+
+export function fetchTestAudit<T = any>(text: string, audit: AuditConfig) {
+  return post<T>({
+    url: '/audit-test',
+    data: { audit, text },
   })
 }
 
