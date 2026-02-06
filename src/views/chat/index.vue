@@ -92,6 +92,12 @@ const isVisionModel = ref(true)
  * - false：不启用
  */
 const searchMode = ref(false)
+/**
+ * ✅ 后台是否允许联网搜索（管理员配置）
+ * - true：用户可以使用地球按钮
+ * - false：地球按钮禁用
+ */
+const webSearchAllowed = computed(() => authStore.session?.webSearchEnabled === true)
 
 let loadingms: MessageReactive
 let allmsg: MessageReactive
@@ -927,13 +933,21 @@ onUnmounted(() => stopPolling())
               </NUpload>
             </div>
 
-            <!-- ✅ 联网搜索开关 -->
+            <!-- ✅ 联网搜索开关（高亮逻辑同"上下文"按钮；后台未启用则禁用） -->
             <HoverButton
-              :tooltip="searchMode ? '联网搜索：开（模型将自动决定是否搜索并可多轮调整关键词）' : '联网搜索：关'"
-              :class="{ 'text-[#4b9e5f]': searchMode }"
-              @click="searchMode = !searchMode"
+              :tooltip="!webSearchAllowed
+                ? '联网搜索：管理员未启用'
+                : searchMode
+                  ? '联网搜索：开（模型将自动决定是否搜索并可多轮调整关键词）'
+                  : '联网搜索：关'"
+              :class="{
+                'text-[#4b9e5f]': searchMode && webSearchAllowed,
+                'text-[#a8071a]': !searchMode && webSearchAllowed,
+                'opacity-40 cursor-not-allowed': !webSearchAllowed,
+              }"
+              @click="webSearchAllowed && (searchMode = !searchMode)"
             >
-              <span class="text-xl text-[#4f555e] dark:text-white">
+              <span class="text-xl">
                 <SvgIcon icon="ri:globe-line" />
               </span>
             </HoverButton>
