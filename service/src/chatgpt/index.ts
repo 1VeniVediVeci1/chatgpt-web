@@ -17,6 +17,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
 import { abortablePromise, isAbortError } from './abortable'
+import { webSearch } from '../utils/webSearch'
 
 /**
  * 兼容 Gemini 构造的 parts
@@ -190,6 +191,263 @@ function debugLog(...args: any[]) {
 }
 /**
  * ===================== DEBUG LOGGER END =====================
+ */
+
+/**
+ * ===================== ✅ 联网搜索（不使用 tool calling） =====================
+ * 目标：
+ * - 用户开启 searchMode 后：
+ *   1) 先让“规划器模型”判断是否需要搜索
+ *   2) 如果需要则搜索
+ *   3) 把搜索结果回喂给规划器模型，让其判断是否需要调整关键词继续搜
+ *   4) 直到达到次数上限 or 规划器认为停止
+ *
+ * 相关环境变量：
+ * - WEB_SEARCH_MAX_ROUNDS=3
+ * - WEB_SEARCH_PLANNER_MODEL=（可选，不填则用当前 room model）
+ * - WEB_SEARCH_MAX_RESULTS=5
+ * - WEB_SEARCH_PROVIDER=searxng|tavily（或 SEARCH_API）
+ * - SEARXNG_API_URL / TAVILY_API_KEY
+ */
+type SearchPlan = {
+  action: 'search' | 'stop'
+  query?: string
+  reason?: string
+}
+
+type SearchRound = {
+  query: string
+  items: Array<{ title: string; url: string; content: string }>
+  note?: string
+}
+
+function safeParseJsonFromText(text: string): any | null {
+  if (!text) return null
+  const s = String(text).trim()
+  try {
+    return JSON.parse(s)
+  }
+  catch { }
+
+  const i = s.indexOf('{')
+  const j = s.lastIndexOf('}')
+  if (i >= 0 && j > i) {
+    try {
+      return JSON.parse(s.slice(i, j + 1))
+    }
+    catch { }
+  }
+  return null
+}
+
+function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
+  if (!rounds.length) return '（无）'
+
+  return rounds.map((r, idx) => {
+    const top = (r.items || []).slice(0, 5).map((it, i) => {
+      const n = `${idx + 1}.${i + 1}`
+      const title = String(it.title || '').trim()
+      const url = String(it.url || '').trim()
+      const content = String(it.content || '').replace(/\s+/g, ' ').trim()
+      return `- [${n}] ${title}\n  ${url}\n  ${content}`
+    }).join('\n')
+
+    const note = r.note ? `\n（注：${r.note}）` : ''
+    return `第${idx + 1}轮 query="${r.query}"\n${top || '（无结果）'}${note}`
+  }).join('\n\n')
+}
+
+async function planNextSearchAction(params: {
+  openai: OpenAI
+  model: string
+  userQuestion: string
+  rounds: SearchRound[]
+  abortSignal?: AbortSignal
+}): Promise<SearchPlan> {
+  const { openai, model, userQuestion, rounds, abortSignal } = params
+
+  const plannerSystem = [
+    '你是“联网搜索规划器”。你的任务是帮助回答用户问题，但只在必要时才联网搜索。',
+    '',
+    '你会看到：用户问题 + 已进行的搜索轮次与结果摘要。',
+    '你需要输出严格 JSON（不要输出多余文字）。',
+    '',
+    'JSON schema：',
+    '{ "action": "search" | "stop", "query": string, "reason": string }',
+    '',
+    '规则：',
+    '- 如果已有信息足够支撑回答：action="stop"',
+    '- 如果需要继续搜索：action="search"，给出更好的 query（更具体、包含关键实体/时间/限定词）',
+    '- query 不要太长（建议 6~16 个词/中英文均可）',
+    '- 如果上一轮结果无关，请显式换一个角度或加入更强限定词',
+    '- 匹配用户语言输出（query 可中英混合）',
+  ].join('\n')
+
+  const plannerUser = [
+    `用户问题：${userQuestion}`,
+    '',
+    '已进行的搜索与结果摘要：',
+    formatSearchRoundsForPlanner(rounds),
+    '',
+    '现在请决定：是否需要继续搜索？如果需要，请给出新的 query。',
+  ].join('\n')
+
+  // 优先尝试 response_format（部分兼容接口不支持，会抛错）
+  try {
+    const resp = await openai.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: plannerSystem },
+        { role: 'user', content: plannerUser },
+      ],
+      response_format: { type: 'json_object' } as any,
+      stream: false,
+    } as any, { signal: abortSignal })
+
+    const text = resp.choices?.[0]?.message?.content ?? ''
+    const obj = safeParseJsonFromText(text)
+    if (!obj) return { action: 'stop', reason: 'planner json parse failed' }
+    return obj as SearchPlan
+  }
+  catch {
+    const resp = await openai.chat.completions.create({
+      model,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: plannerSystem },
+        { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` },
+      ],
+      stream: false,
+    } as any, { signal: abortSignal })
+
+    const text = resp.choices?.[0]?.message?.content ?? ''
+    const obj = safeParseJsonFromText(text)
+    if (!obj) return { action: 'stop', reason: 'planner json parse failed' }
+    return obj as SearchPlan
+  }
+}
+
+async function runIterativeWebSearch(params: {
+  openai: OpenAI
+  plannerModels: string[]
+  userQuestion: string
+  maxRounds: number
+  maxResults: number
+  abortSignal?: AbortSignal
+}): Promise<SearchRound[]> {
+  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal } = params
+
+  const rounds: SearchRound[] = []
+  const usedQueries = new Set<string>()
+
+  for (let i = 0; i < maxRounds; i++) {
+    let plan: SearchPlan | null = null
+
+    // 规划器模型 fallback：优先 env 指定，否则用当前 model
+    for (const m of plannerModels) {
+      try {
+        plan = await planNextSearchAction({
+          openai,
+          model: m,
+          userQuestion,
+          rounds,
+          abortSignal,
+        })
+        break
+      }
+      catch (e) {
+        // 继续尝试下一个模型
+        if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e)
+      }
+    }
+
+    if (!plan) break
+    if (plan.action !== 'search') break
+
+    const q = String(plan.query || '').trim()
+    if (!q) break
+    if (usedQueries.has(q)) break
+    usedQueries.add(q)
+
+    try {
+      const r = await webSearch(q, { maxResults, signal: abortSignal })
+      const items = (r.results || []).slice(0, maxResults).map(it => ({
+        title: String(it.title || ''),
+        url: String(it.url || ''),
+        content: String(it.content || ''),
+      }))
+      rounds.push({ query: q, items })
+    }
+    catch (e: any) {
+      rounds.push({ query: q, items: [], note: e?.message ?? String(e) })
+      break
+    }
+  }
+
+  return rounds
+}
+
+function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
+  if (!rounds.length) return ''
+
+  let n = 0
+  const lines: string[] = []
+
+  lines.push('【联网搜索结果（多轮汇总，按编号引用）】')
+
+  rounds.forEach((r, idx) => {
+    lines.push(`（第${idx + 1}轮关键词：${r.query}）`)
+    if (!r.items?.length) {
+      lines.push('（无结果）')
+      if (r.note) lines.push(`（注：${r.note}）`)
+      lines.push('')
+      return
+    }
+
+    for (const it of r.items) {
+      n++
+      lines.push(`[${n}] ${String(it.title || '').trim()}`)
+      lines.push(`URL: ${String(it.url || '').trim()}`)
+      lines.push(`摘要: ${String(it.content || '').trim()}`)
+      lines.push('')
+    }
+
+    if (r.note) {
+      lines.push(`（注：${r.note}）`)
+      lines.push('')
+    }
+  })
+
+  lines.push('【回答要求】')
+  lines.push('- 基于以上来源回答；涉及事实/数据/结论请在句末用 [编号] 引用（可多个）。')
+  lines.push('- 若来源不足以支持结论，请明确说明“不确定/需更多信息”。')
+
+  return lines.join('\n')
+}
+
+function appendTextToMessageContent(content: MessageContent, appendix: string): MessageContent {
+  if (!appendix?.trim()) return content
+
+  if (typeof content === 'string')
+    return `${content}\n\n${appendix}`
+
+  if (Array.isArray(content)) {
+    const idx = (content as any[]).findIndex(p => p?.type === 'text' && typeof p?.text === 'string')
+    if (idx >= 0) {
+      const old = (content as any[])[idx].text
+      const next = `${old}\n\n${appendix}`
+      const arr = [...(content as any[])]
+      arr[idx] = { ...(arr[idx] || {}), text: next }
+      return arr as any
+    }
+    return [{ type: 'text', text: appendix }, ...(content as any[])] as any
+  }
+
+  return content
+}
+/**
+ * ===================== ✅ 联网搜索 END =====================
  */
 
 const ErrorCodeMessage: Record<string, string> = {
@@ -728,7 +986,6 @@ export async function initApi(key: KeyConfig, {
 type ProcessThread = { key: string; userId: string; roomId: number; abort: AbortController; messageId: string }
 const processThreads: ProcessThread[] = []
 const makeThreadKey = (userId: string, roomId: number) => `${userId}:${roomId}`
-
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const userId = options.user._id.toString()
   const messageId = options.messageId
@@ -816,6 +1073,60 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     else {
       content = finalMessage
+    }
+  }
+
+  // =========================
+  // ✅ 联网搜索（多轮：模型决定是否搜索、是否调整关键词）
+  // - 仅当 options.searchMode=true
+  // - 图片/非流式模型不启用（避免影响图片生成提示）
+  // =========================
+  if (options.searchMode === true && !isImage) {
+    try {
+      const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : globalConfig.apiBaseUrl
+      const plannerOpenai = new OpenAI({
+        baseURL: OPENAI_API_BASE_URL,
+        apiKey: key.key,
+        maxRetries: 0,
+        timeout: globalConfig.timeoutMs,
+      })
+
+      const maxRounds = Math.max(1, Math.min(6, Number(process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
+      const maxResults = Math.max(1, Math.min(10, Number(process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
+
+      const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL || '').trim()
+      // plannerModels：按顺序尝试，尽量提高兼容性
+      const plannerModels = [
+        plannerModelEnv,
+        model,
+        'gpt-3.5-turbo',
+      ].filter(Boolean)
+
+      const rounds = await runIterativeWebSearch({
+        openai: plannerOpenai,
+        plannerModels,
+        userQuestion: message,
+        maxRounds,
+        maxResults,
+        abortSignal: abort.signal,
+      })
+
+      const ctx = formatAggregatedSearchForAnswer(rounds)
+      if (ctx) {
+        content = appendTextToMessageContent(content, ctx)
+
+        if (API_DEBUG) {
+          debugLog('====== [WebSearch Debug] ======')
+          debugLog('[enabled]', true)
+          debugLog('[roundCount]', rounds.length)
+          debugLog('[ctxPreview]', trunc(ctx))
+          debugLog('====== [WebSearch Debug End] ======')
+        }
+      }
+    }
+    catch (e: any) {
+      // 搜索失败不阻塞对话：降级为普通问答
+      console.error('[WebSearch] failed:', e?.message ?? e)
     }
   }
 
@@ -1199,9 +1510,6 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
   }
 }
 
-/**
- * ===== 以下三个函数是你之前丢失导致 TS2304 的根源：必须存在且只能存在一次 =====
- */
 async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
   if (keys.length <= 0) return null
   _lockedKeys
