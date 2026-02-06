@@ -44,6 +44,8 @@ export class SiteConfig {
   webSearchMaxResults?: number
   webSearchMaxRounds?: number
   webSearchPlannerModel?: string
+  hiddenModels?: string
+
 }
 
 export class MailConfig {
