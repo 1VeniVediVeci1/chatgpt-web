@@ -211,7 +211,7 @@ export class SiteConfig {
     // ===== 推理模型配置 =====
     public reasoningModels?: string,
     public reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh',
-    // ===== ✅ 联网搜索配置 =====
+    // ===== 联网搜索配置 =====
     public webSearchEnabled?: boolean,
     public webSearchProvider?: 'searxng' | 'tavily',
     public searxngApiUrl?: string,
@@ -219,6 +219,8 @@ export class SiteConfig {
     public webSearchMaxResults?: number,
     public webSearchMaxRounds?: number,
     public webSearchPlannerModel?: string,
+    // ===== ✅ 隐藏模型（不在用户列表中显示，但后端可用于 planner 等内部用途）=====
+    public hiddenModels?: string,
   ) { }
 }
 
