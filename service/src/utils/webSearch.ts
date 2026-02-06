@@ -8,12 +8,10 @@ export interface WebSearchOptions {
   includeDomains?: string[]
   excludeDomains?: string[]
   signal?: AbortSignal
-
-  /**
-   * ✅ 来自 SiteConfig 的 override（管理员可配置）
-   */
+  /** 来自 SiteConfig 的 override */
   provider?: WebSearchProvider
   searxngApiUrl?: string
+  tavilyApiKey?: string
 }
 
 export interface WebSearchResultItem {
@@ -69,7 +67,7 @@ function setCached(k: string, data: WebSearchResults) {
 
 async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptions): Promise<WebSearchResults> {
   if (!apiUrl)
-    throw new Error('SEARXNG_API_URL is not configured (or SiteConfig.searxngApiUrl empty).')
+    throw new Error('SearXNG API URL is not configured.')
 
   const base = apiUrl.replace(/\/+$/, '')
   const url = new URL(`${base}/search`)
@@ -106,9 +104,7 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
         const host = new URL(r.url).hostname
         return !opts.excludeDomains!.some(d => host.includes(d))
       }
-      catch {
-        return true
-      }
+      catch { return true }
     })
   }
 
@@ -158,9 +154,9 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
 
 /**
  * 执行一次联网搜索：
- * - provider 优先取 opts.provider（来自 SiteConfig）
- * - searxngApiUrl 优先取 opts.searxngApiUrl（来自 SiteConfig）
- * - key 仍从环境变量读取（避免把 key 存 DB）
+ * - provider 优先取 opts.provider（SiteConfig），fallback 到环境变量
+ * - searxngApiUrl 优先取 opts.searxngApiUrl（SiteConfig），fallback 到环境变量
+ * - tavilyApiKey 优先取 opts.tavilyApiKey（SiteConfig），fallback 到环境变量
  */
 export async function webSearch(query: string, opts: WebSearchOptions = {}): Promise<WebSearchResults> {
   const provider = (opts.provider ?? (process.env.WEB_SEARCH_PROVIDER || process.env.SEARCH_API || 'searxng')).toLowerCase() as WebSearchProvider
@@ -173,8 +169,8 @@ export async function webSearch(query: string, opts: WebSearchOptions = {}): Pro
 
   let data: WebSearchResults
   if (provider === 'tavily') {
-    const key = process.env.TAVILY_API_KEY
-    if (!key) throw new Error('TAVILY_API_KEY is not configured.')
+    const key = finalOpts.tavilyApiKey || process.env.TAVILY_API_KEY || ''
+    if (!key) throw new Error('Tavily API Key is not configured (neither in SiteConfig nor env TAVILY_API_KEY).')
     data = await tavilySearch(query, key, finalOpts)
   }
   else {
