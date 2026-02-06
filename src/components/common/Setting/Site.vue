@@ -52,70 +52,52 @@ onMounted(() => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.siteTitle') }}</span>
           <div class="flex-1">
-            <NInput
-              :value="config && config.siteTitle" placeholder=""
-              @input="(val) => { if (config) config.siteTitle = val }"
-            />
+            <NInput :value="config && config.siteTitle" placeholder="" @input="(val) => { if (config) config.siteTitle = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.siteDomain') }}</span>
           <div class="flex-1">
-            <NInput
-              :value="config && config.siteDomain" placeholder=""
-              @input="(val) => { if (config) config.siteDomain = val }"
-            />
+            <NInput :value="config && config.siteDomain" placeholder="" @input="(val) => { if (config) config.siteDomain = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.loginEnabled') }}</span>
           <div class="flex-1">
-            <NSwitch
-              :round="false"
-              :disabled="config && config.loginEnabled"
-              :value="config && config.loginEnabled"
-              @update:value="(val) => { if (config) config.loginEnabled = val }"
-            />
+            <NSwitch :round="false" :disabled="config && config.loginEnabled" :value="config && config.loginEnabled" @update:value="(val) => { if (config) config.loginEnabled = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.loginSalt') }}</span>
           <div class="flex-1">
-            <NInput
-              :value="config && config.loginSalt" :placeholder="$t('setting.loginSaltTip')"
-              @input="(val) => { if (config) config.loginSalt = val }"
-            />
+            <NInput :value="config && config.loginSalt" :placeholder="$t('setting.loginSaltTip')" @input="(val) => { if (config) config.loginSalt = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.registerEnabled') }}</span>
           <div class="flex-1">
-            <NSwitch
-              :round="false"
-              :value="config && config.registerEnabled"
-              @update:value="(val) => { if (config) config.registerEnabled = val }"
-            />
+            <NSwitch :round="false" :value="config && config.registerEnabled" @update:value="(val) => { if (config) config.registerEnabled = val }" />
           </div>
         </div>
+
         <div v-show="config && config.registerEnabled" class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.registerReview') }}</span>
           <div class="flex-1">
-            <NSwitch
-              :round="false"
-              :value="config && config.registerReview"
-              @update:value="(val) => { if (config) config.registerReview = val }"
-            />
+            <NSwitch :round="false" :value="config && config.registerReview" @update:value="(val) => { if (config) config.registerReview = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.registerMails') }}</span>
           <div class="flex-1">
-            <NInput
-              :value="config && config.registerMails" :placeholder="$t('setting.registerReviewTip')"
-              @input="(val) => { if (config) config.registerMails = val }"
-            />
+            <NInput :value="config && config.registerMails" :placeholder="$t('setting.registerReviewTip')" @input="(val) => { if (config) config.registerMails = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.chatModels') }}</span>
           <div class="flex-1">
@@ -128,6 +110,7 @@ onMounted(() => {
             />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">图片/非流式模型</span>
           <div class="flex-1">
@@ -141,7 +124,7 @@ onMounted(() => {
           </div>
         </div>
 
-        <!-- ===== 新增 Reasoning 配置 UI ===== -->
+        <!-- ===== 推理配置 ===== -->
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">推理模型列表</span>
           <div class="flex-1">
@@ -171,37 +154,91 @@ onMounted(() => {
             />
           </div>
         </div>
-        <!-- ================================== -->
 
-        <!-- 增加新注册用户的全局数量设置 -->
+        <!-- ===== ✅ 联网搜索配置（新增）===== -->
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">联网搜索启用</span>
+          <div class="flex-1">
+            <NSwitch
+              :round="false"
+              :value="config && config.webSearchEnabled"
+              @update:value="(val) => { if (config) config.webSearchEnabled = val }"
+            />
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">搜索提供方</span>
+          <div class="flex-1">
+            <NSelect
+              :value="config && config.webSearchProvider"
+              :options="[
+                { label: 'SearXNG', key: 'searxng', value: 'searxng' },
+                { label: 'Tavily（key 仍需用环境变量）', key: 'tavily', value: 'tavily' },
+              ]"
+              @update-value="(val) => { if (config) config.webSearchProvider = val as any }"
+            />
+          </div>
+        </div>
+
+        <div v-if="config && config.webSearchProvider === 'searxng'" class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">SearXNG URL</span>
+          <div class="flex-1">
+            <NInput
+              :value="config && config.searxngApiUrl"
+              placeholder="例如：http://localhost:8080"
+              @input="(val) => { if (config) config.searxngApiUrl = val }"
+            />
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">每轮结果数</span>
+          <div class="flex-1">
+            <NInputNumber v-model:value="config.webSearchMaxResults" :min="1" :max="10" />
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">最大搜索轮数</span>
+          <div class="flex-1">
+            <NInputNumber v-model:value="config.webSearchMaxRounds" :min="1" :max="6" />
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <span class="flex-shrink-0 w-[100px]">Planner 模型</span>
+          <div class="flex-1">
+            <NInput
+              :value="config && config.webSearchPlannerModel"
+              placeholder="可空；如 gpt-4o-mini。为空则用当前对话模型。"
+              @input="(val) => { if (config) config.webSearchPlannerModel = val }"
+            />
+          </div>
+        </div>
+
+        <!-- ===== 其它开关 ===== -->
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.globalAmount') }}</span>
           <div class="flex-1">
-            <NInputNumber
-              v-model:value="config.globalAmount" placeholder=""
-            />
+            <NInputNumber v-model:value="config.globalAmount" placeholder="" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.usageCountLimit') }}</span>
           <div class="flex-1">
-            <NSwitch
-              :round="false"
-              :value="config && config.usageCountLimit"
-              @update:value="(val) => { if (config) config.usageCountLimit = val }"
-            />
+            <NSwitch :round="false" :value="config && config.usageCountLimit" @update:value="(val) => { if (config) config.usageCountLimit = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.showWatermark') }}</span>
           <div class="flex-1">
-            <NSwitch
-              :round="false"
-              :value="config && config.showWatermark"
-              @update:value="(val) => { if (config) config.showWatermark = val }"
-            />
+            <NSwitch :round="false" :value="config && config.showWatermark" @update:value="(val) => { if (config) config.showWatermark = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]" />
           <NButton :loading="saving" type="primary" @click="updateSiteInfo(config)">
