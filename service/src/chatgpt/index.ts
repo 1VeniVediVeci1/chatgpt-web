@@ -337,8 +337,9 @@ async function runIterativeWebSearch(params: {
   abortSignal?: AbortSignal
   provider?: 'searxng' | 'tavily'
   searxngApiUrl?: string
+  tavilyApiKey?: string
 }): Promise<SearchRound[]> {
-  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl } = params
+  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey } = params
 
   const rounds: SearchRound[] = []
   const usedQueries = new Set<string>()
@@ -373,7 +374,7 @@ async function runIterativeWebSearch(params: {
     usedQueries.add(q)
 
     try {
-      const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl })
+      const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({
         title: String(it.title || ''),
         url: String(it.url || ''),
