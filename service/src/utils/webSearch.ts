@@ -74,24 +74,41 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
   if (opts.includeDomains?.length)
     url.searchParams.set('site', opts.includeDomains.join(','))
 
-  const resp = await fetch(url.toString(), {
+  console.log(`[WebSearch][SearXNG] Fetching: ${url.toString()}`)
+
+  const fetchOpts: any = {
     method: 'GET',
     headers: { Accept: 'application/json' },
-    signal: opts.signal as any,
-  })
+  }
 
-  if (!resp.ok)
-    throw new Error(`[searxng] ${resp.status} ${resp.statusText}`)
+  // ✅ 只在 signal 存在且未 aborted 时传入（避免 node-fetch 兼容性问题）
+  if (opts.signal && !opts.signal.aborted) {
+    try {
+      fetchOpts.signal = opts.signal
+    }
+    catch {
+      // 某些 node-fetch 版本不支持 AbortSignal，忽略
+    }
+  }
+
+  const resp = await fetch(url.toString(), fetchOpts)
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '')
+    throw new Error(`[searxng] HTTP ${resp.status} ${resp.statusText}: ${body.slice(0, 200)}`)
+  }
 
   const data = await resp.json() as any
   const rawResults: any[] = Array.isArray(data?.results) ? data.results : []
+
+  console.log(`[WebSearch][SearXNG] Got ${rawResults.length} raw results for query: "${query}"`)
 
   let results: WebSearchResultItem[] = rawResults
     .filter(r => r && !r.img_src && typeof r.url === 'string')
     .map(r => ({
       title: String(r.title || ''),
       url: String(r.url || ''),
-      content: String(r.content || ''), // 不截断
+      content: String(r.content || ''),
     }))
 
   if (opts.excludeDomains?.length) {
@@ -105,7 +122,7 @@ async function searxngSearch(query: string, apiUrl: string, opts: WebSearchOptio
   }
 
   const max = normalizeMaxResults(opts.maxResults)
-  if (max != null) results = results.slice(0, max) // 不做上限 clamp，只按用户给的 maxResults 截取
+  if (max != null) results = results.slice(0, max)
 
   return {
     query: data?.query || query,
@@ -130,18 +147,31 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
     exclude_domains: opts.excludeDomains ?? [],
   }
 
-  // 不再把 max_results clamp 到 10，也不强行 >= 5；交给用户/服务端规则决定
   if (max != null) body.max_results = max
 
-  const resp = await fetch('https://api.tavily.com/search', {
+  console.log(`[WebSearch][Tavily] Searching: "${filledQuery}", max_results: ${max ?? 'default'}`)
+
+  const fetchOpts: any = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    signal: opts.signal as any,
     body: JSON.stringify(body),
-  })
+  }
 
-  if (!resp.ok)
-    throw new Error(`[tavily] ${resp.status} ${resp.statusText}`)
+  if (opts.signal && !opts.signal.aborted) {
+    try {
+      fetchOpts.signal = opts.signal
+    }
+    catch {
+      // 忽略
+    }
+  }
+
+  const resp = await fetch('https://api.tavily.com/search', fetchOpts)
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => '')
+    throw new Error(`[tavily] HTTP ${resp.status} ${resp.statusText}: ${errBody.slice(0, 300)}`)
+  }
 
   const data = await resp.json() as any
   const results: WebSearchResultItem[] = (data?.results || []).map((r: any) => {
@@ -151,11 +181,13 @@ async function tavilySearch(query: string, apiKey: string, opts: WebSearchOption
     return {
       title: String(r.title || ''),
       url: String(r.url || ''),
-      content: bestContent, // 不截断
+      content: bestContent,
     }
   })
 
   const finalResults = (max != null) ? results.slice(0, max) : results
+
+  console.log(`[WebSearch][Tavily] Got ${finalResults.length} results for query: "${filledQuery}"`)
 
   return {
     query,
@@ -169,7 +201,6 @@ export async function webSearch(query: string, opts: WebSearchOptions = {}): Pro
   const provider = (opts.provider ?? (process.env.WEB_SEARCH_PROVIDER || process.env.SEARCH_API || 'searxng'))
     .toLowerCase() as WebSearchProvider
 
-  // 不再默认强制 maxResults=5；只有用户传了或环境变量显式配置才会限制
   const envMax = normalizeMaxResults(Number(process.env.WEB_SEARCH_MAX_RESULTS))
   const resolvedMaxResults = normalizeMaxResults(opts.maxResults) ?? envMax
 
@@ -180,17 +211,32 @@ export async function webSearch(query: string, opts: WebSearchOptions = {}): Pro
 
   const k = cacheKey(provider, query, finalOpts)
   const cached = getCached(k)
-  if (cached) return cached
+  if (cached) {
+    console.log(`[WebSearch] Cache hit for: "${query}"`)
+    return cached
+  }
+
+  console.log(`[WebSearch] Provider: ${provider}, Query: "${query}", MaxResults: ${resolvedMaxResults ?? 'default'}`)
 
   let data: WebSearchResults
-  if (provider === 'tavily') {
-    const key = finalOpts.tavilyApiKey || process.env.TAVILY_API_KEY || ''
-    if (!key) throw new Error('Tavily API Key is not configured.')
-    data = await tavilySearch(query, key, finalOpts)
+  try {
+    if (provider === 'tavily') {
+      const key = finalOpts.tavilyApiKey || process.env.TAVILY_API_KEY || ''
+      if (!key) throw new Error('Tavily API Key is not configured (neither in SiteConfig nor env TAVILY_API_KEY).')
+      data = await tavilySearch(query, key, finalOpts)
+    }
+    else {
+      const apiUrl = finalOpts.searxngApiUrl ?? process.env.SEARXNG_API_URL ?? ''
+      data = await searxngSearch(query, apiUrl, finalOpts)
+    }
   }
-  else {
-    const apiUrl = finalOpts.searxngApiUrl ?? process.env.SEARXNG_API_URL ?? ''
-    data = await searxngSearch(query, apiUrl, finalOpts)
+  catch (e: any) {
+    console.error(`[WebSearch] ERROR for query "${query}":`, e?.message ?? e)
+    throw e
+  }
+
+  if (data.results.length === 0) {
+    console.warn(`[WebSearch] WARNING: 0 results for query "${query}" (provider: ${provider})`)
   }
 
   setCached(k, data)
