@@ -133,6 +133,8 @@ export async function getOriginConfig() {
     config.siteConfig.webSearchProvider = (process.env.WEB_SEARCH_PROVIDER as any) || (process.env.SEARCH_API as any) || 'searxng'
   if (config.siteConfig.searxngApiUrl === undefined)
     config.siteConfig.searxngApiUrl = process.env.SEARXNG_API_URL || ''
+  if (config.siteConfig.tavilyApiKey === undefined)
+    config.siteConfig.tavilyApiKey = process.env.TAVILY_API_KEY || ''
   if (config.siteConfig.webSearchMaxResults === undefined)
     config.siteConfig.webSearchMaxResults = Number(process.env.WEB_SEARCH_MAX_RESULTS || 5)
   if (config.siteConfig.webSearchMaxRounds === undefined)
