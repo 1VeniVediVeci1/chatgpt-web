@@ -1017,13 +1017,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   updateRoomChatModel(userId, options.room.roomId, model)
 
-  const { message, uploadFileKeys, lastContext, process, systemMessage, temperature, top_p } = options
+  const { message, uploadFileKeys, lastContext, process: processCb, systemMessage, temperature, top_p } = options
 
   // ✅ 关键修复1：无论什么模型，先把“占位响应”抛给 process
   // 这样：
   // - runChatJobInBackground 即使在真正返回前就 abort，也能拿到 lastResponse（包含 id/conversationId）
   // - 不会再因为 lastResponse.text 为空导致 abort 被当 Fail
-  process?.({
+  processCb?.({
     id: customMessageId,
     text: '',
     role: 'assistant',
@@ -1241,7 +1241,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
 
-      process?.({
+      processCb?.({
         id: customMessageId,
         text,
         role: 'assistant',
@@ -1302,7 +1302,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       else
         text = rawContent
 
-      process?.({
+      processCb?.({
         id: customMessageId,
         text,
         role: choice.message.role || 'assistant',
@@ -1324,7 +1324,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         chatIdRes = customMessageId
         modelRes = chunk.model
         usageRes = usageRes || chunk.usage
-        process?.({
+        processCb?.({
           ...chunk,
           id: customMessageId,
           text,
