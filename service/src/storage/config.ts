@@ -120,11 +120,25 @@ export async function getOriginConfig() {
   if (!isNotEmptyString(config.siteConfig.chatModels))
     config.siteConfig.chatModels = 'gpt-3.5-turbo,gpt-4-turbo-preview,gpt-4-vision-preview'
 
-  // ===== 新增：Init Reasoning Configuration Default Values =====
+  // ===== 推理默认值 =====
   if (config.siteConfig.reasoningModels === undefined)
     config.siteConfig.reasoningModels = ''
   if (config.siteConfig.reasoningEffort === undefined)
     config.siteConfig.reasoningEffort = 'medium'
+
+  // ===== ✅ 联网搜索默认值 =====
+  if (config.siteConfig.webSearchEnabled === undefined)
+    config.siteConfig.webSearchEnabled = false
+  if (config.siteConfig.webSearchProvider === undefined)
+    config.siteConfig.webSearchProvider = (process.env.WEB_SEARCH_PROVIDER as any) || (process.env.SEARCH_API as any) || 'searxng'
+  if (config.siteConfig.searxngApiUrl === undefined)
+    config.siteConfig.searxngApiUrl = process.env.SEARXNG_API_URL || ''
+  if (config.siteConfig.webSearchMaxResults === undefined)
+    config.siteConfig.webSearchMaxResults = Number(process.env.WEB_SEARCH_MAX_RESULTS || 5)
+  if (config.siteConfig.webSearchMaxRounds === undefined)
+    config.siteConfig.webSearchMaxRounds = Number(process.env.WEB_SEARCH_MAX_ROUNDS || 3)
+  if (config.siteConfig.webSearchPlannerModel === undefined)
+    config.siteConfig.webSearchPlannerModel = process.env.WEB_SEARCH_PLANNER_MODEL || ''
 
   return config
 }
