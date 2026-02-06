@@ -34,9 +34,17 @@ export class SiteConfig {
   usageCountLimit?: boolean
   showWatermark?: boolean
   imageModels?: string
-  // ===== 新增: 推理模型配置 =====
+  // ===== 推理模型配置 =====
   reasoningModels?: string
   reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh'
+
+  // ===== ✅ 联网搜索配置 =====
+  webSearchEnabled?: boolean
+  webSearchProvider?: 'searxng' | 'tavily'
+  searxngApiUrl?: string
+  webSearchMaxResults?: number
+  webSearchMaxRounds?: number
+  webSearchPlannerModel?: string
 }
 
 export class MailConfig {
