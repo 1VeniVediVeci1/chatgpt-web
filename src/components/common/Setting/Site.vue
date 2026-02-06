@@ -194,7 +194,14 @@ onMounted(() => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">Planner 模型</span>
           <div class="flex-1">
-            <NInput :value="config && config.webSearchPlannerModel" placeholder="可空；如 gpt-4o-mini。为空则用当前对话模型。" @input="(val) => { if (config) config.webSearchPlannerModel = val }" />
+            <NInput
+              :value="config && config.webSearchPlannerModel"
+              placeholder="可空（使用当前对话模型）。填写模型名如 gpt-4o-mini，需在 Key 配置中有对应可用 Key"
+              @input="(val) => { if (config) config.webSearchPlannerModel = val }"
+            />
+            <p class="text-xs text-[#b4bbc4] mt-1">
+              留空则使用当前对话模型。若填写的模型名在 Key 配置中有对应可用的 API Key，将自动使用该 Key 调用（无需和对话模型相同）。
+            </p>
           </div>
         </div>
 
