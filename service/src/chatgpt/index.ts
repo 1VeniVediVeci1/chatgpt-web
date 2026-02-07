@@ -51,7 +51,7 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
     else if (ext === 'heic') mime = 'image/heic'
     else if (ext === 'bmp') mime = 'image/bmp'
     return { mime, data: buffer.toString('base64') }
-  } catch (e) { console.error(`[File Read Error] ${filename}:`, e); return null }
+  } catch (e) { globalThis.console.error(`[File Read Error] ${filename}:`, e); return null }
 }
 
 dotenv.config()
@@ -74,7 +74,13 @@ function summarizeOpenAIMessages(messages: any[]) {
 function debugLog(...args: any[]) { if (!API_DEBUG) return; console.log(...args) }
 
 // ===================== 联网搜索 =====================
-type SearchPlan = { action: 'search' | 'stop'; query?: string; reason?: string }
+type SearchPlan = {
+  action: 'search' | 'stop'
+  query?: string
+  reason?: string
+  selected_ids?: string[] // e.g. ["1.1", "2.3"]
+  context_summary?: string // 对上下文的总结
+}
 type SearchRound = { query: string; items: Array<{ title: string; url: string; content: string }>; note?: string }
 
 function safeParseJsonFromText(text: string): any | null {
@@ -85,31 +91,101 @@ function safeParseJsonFromText(text: string): any | null {
   return null
 }
 
+async function buildConversationContext(lastMessageId: string | undefined, maxCount: number): Promise<string> {
+  if (!lastMessageId) return ''
+  const messages: string[] = []
+  let currentId = lastMessageId
+  for (let i = 0; i < maxCount; i++) {
+    if (!currentId) break
+    const msg = await getMessageById(currentId)
+    if (!msg) break
+    const role = msg.role === 'assistant' ? 'AI' : 'User'
+    let content = ''
+    if (typeof msg.text === 'string') content = msg.text
+    else if (Array.isArray(msg.text)) content = msg.text.map((p: any) => p?.type === 'text' ? p.text : '[Image]').join('')
+    else content = '[Complex Content]'
+    messages.push(`${role}: ${content}`)
+    currentId = msg.parentMessageId
+  }
+  return messages.reverse().join('\n')
+}
+
+// 修改：展示全部条目，不做 slice(0,5)，确保模型看到完整结果来判断完整性
 function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   if (!rounds.length) return '（无）'
   return rounds.map((r, idx) => {
-    const top = (r.items || []).slice(0, 5).map((it, i) => `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  ${String(it.content || '').replace(/\s+/g, ' ').trim()}`).join('\n')
+    // 这里的 content 保留完整文本，只做基本清洗
+    const items = (r.items || []).map((it, i) =>
+      `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  内容: ${String(it.content || '').replace(/\s+/g, ' ').trim()}`
+    ).join('\n\n')
     const note = r.note ? `\n（注：${r.note}）` : ''
-    return `第${idx + 1}轮 query="${r.query}"\n${top || '（无结果）'}${note}`
+    // [1.1] means Round 1 Item 1
+    return `### 第${idx + 1}轮 query="${r.query}"\n${items || '（无结果）'}${note}`
   }).join('\n\n')
 }
 
-async function planNextSearchAction(params: { openai: OpenAI; model: string; userQuestion: string; rounds: SearchRound[]; abortSignal?: AbortSignal }): Promise<SearchPlan> {
-  const { openai, model, userQuestion, rounds, abortSignal } = params
+async function planNextSearchAction(params: {
+  openai: OpenAI
+  model: string
+  userQuestion: string
+  rounds: SearchRound[]
+  fullContext: string
+  priorContextSummary: string | null
+  date: string
+  abortSignal?: AbortSignal
+}): Promise<SearchPlan> {
+  const { openai, model, userQuestion, rounds, fullContext, priorContextSummary, date, abortSignal } = params
+
+  const isFirstRound = !priorContextSummary // 如果没有之前的总结，说明是第一轮或需要新建
+
   const plannerSystem = [
-    '你是"联网搜索规划器"。你的任务是帮助回答用户问题，但只在必要时才联网搜索。',
-    '', '你会看到：用户问题 + 已进行的搜索轮次与结果摘要。',
-    '你需要输出严格 JSON（不要输出多余文字）。',
-    '', 'JSON schema：', '{ "action": "search" | "stop", "query": string, "reason": string }',
-    '', '规则：',
-    '- 如果已有信息足够支撑回答：action="stop"',
-    '- 如果需要继续搜索：action="search"，给出更好的 query（更具体、包含关键实体/时间/限定词）',
-    '- query 不要太长（建议 6~16 个词/中英文均可）',
-    '- 如果上一轮结果无关，请显式换一个角度或加入更强限定词',
-    '- 匹配用户语言输出（query 可中英混合）',
+    '你是"联网搜索规划器 & 结果筛选器"。你的任务是协助回答用户问题，决定是否继续搜索，并从已有结果中挑选高质量条目。',
+    '',
+    `当前时间：${date}`,
+    '',
+    '任务：',
+    '1. 评估"已进行的搜索与结果"，选出对回答问题有价值的条目ID (格式如 "1.1", "2.3")。',
+    '2. 决定接下来的行动：',
+    '   - 如果信息已足够：action="stop"',
+    '   - 如果信息不足：action="search"，并给出新的 query（更具体、补充缺失视角）。',
+    isFirstRound
+      ? '3. 请务必阅读完整的对话上下文，并生成一个精炼的"context_summary"（100-200字），概括历史对话的核心意图和关键信息，以便后续轮次使用。'
+      : '3. 参考提供的 "context_summary" 来理解用户意图（不再提供完整上下文）。',
+    '',
+    '输出严格 JSON：',
+    '{',
+    '  "action": "search" | "stop",',
+    '  "query": string, // 如果 action=search',
+    '  "reason": string,',
+    '  "selected_ids": string[], // 选出的高质量结果ID列表，例如 ["1.1", "2.1"]',
+    isFirstRound ? '  "context_summary": string // 对历史上下文的精炼总结' : null,
+    '}'.replace(/, null/g, ''),
+    '',
+    '规则：',
+    '- 仔细阅读每一条搜索结果的内容。',
+    '- 优先放入高质量ID到 selected_ids。',
+    '- 如果无需新搜索，action="stop"，但依然要返回 selected_ids。',
+    '- query 建议 6~16 个词，可中英混合。',
+  ].filter(Boolean).join('\n')
+
+  // 如果有之前的总结，就用总结；否则用完整上下文
+  const contextBlock = isFirstRound
+    ? `【完整对话上下文（请总结生成 context_summary）】\n${fullContext || '（无）'}`
+    : `【历史上下文总结 (context_summary)】\n${priorContextSummary}`
+
+  const plannerUser = [
+    '【用户问题】', userQuestion,
+    '',
+    contextBlock,
+    '',
+    '【已进行的搜索与结果（内容未摘要）】',
+    formatSearchRoundsForPlanner(rounds),
+    '',
+    '现在请决定：selected_ids 是哪些？是否需要继续搜索？' + (isFirstRound ? ' 记得生成 context_summary。' : '')
   ].join('\n')
-  const plannerUser = [`用户问题：${userQuestion}`, '', '已进行的搜索与结果摘要：', formatSearchRoundsForPlanner(rounds), '', '现在请决定：是否需要继续搜索？如果需要，请给出新的 query。'].join('\n')
+
   try {
+    // 增加 max_tokens 防止被大量输入截断响应，但通常 planner 输出不会很长
     const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }], response_format: { type: 'json_object' } as any, stream: false } as any, { signal: abortSignal })
     const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
     return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed' }
@@ -124,17 +200,56 @@ async function runIterativeWebSearch(params: {
   openai: OpenAI; plannerModels: string[]; userQuestion: string; maxRounds: number; maxResults: number
   abortSignal?: AbortSignal; provider?: 'searxng' | 'tavily'; searxngApiUrl?: string; tavilyApiKey?: string
   onProgress?: (status: string) => void
-}): Promise<SearchRound[]> {
-  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress } = params
-  const rounds: SearchRound[] = []; const usedQueries = new Set<string>()
+  fullContext: string; date: string
+}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string> }> {
+  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress, fullContext, date } = params
+  const rounds: SearchRound[] = []
+  const usedQueries = new Set<string>()
+  const selectedIds = new Set<string>()
+  
+  // 存储第一轮生成的上下文总结，供后续使用
+  let currentContextSummary: string | null = null
+
   for (let i = 0; i < maxRounds; i++) {
     onProgress?.(`🔍 搜索规划中（第 ${i + 1}/${maxRounds} 轮）...`)
+    
     let plan: SearchPlan | null = null
-    for (const m of plannerModels) { try { plan = await planNextSearchAction({ openai, model: m, userQuestion, rounds, abortSignal }); break } catch (e) { if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e) } }
+    for (const m of plannerModels) {
+      try {
+        plan = await planNextSearchAction({ 
+          openai, 
+          model: m, 
+          userQuestion, 
+          rounds, 
+          abortSignal, 
+          fullContext, 
+          priorContextSummary: currentContextSummary, 
+          date 
+        })
+        break 
+      } catch (e) {
+        if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e) 
+      } 
+    }
+    
     if (!plan) { onProgress?.('✅ 搜索规划完成（无需搜索）'); break }
+
+    // 更新总结
+    if (plan.context_summary && typeof plan.context_summary === 'string') {
+      currentContextSummary = plan.context_summary
+      if (API_DEBUG) debugLog('[WebSearch] Context Summary updated:', currentContextSummary)
+    }
+
+    // 累积选中的 ID
+    if (Array.isArray(plan.selected_ids)) {
+      plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
+    }
+
     if (plan.action !== 'search') { onProgress?.(`✅ 搜索完成：${plan.reason || '信息已足够'}`); break }
+    
     const q = String(plan.query || '').trim()
     if (!q) break; if (usedQueries.has(q)) { onProgress?.('⚠️ 关键词重复，停止搜索'); break }; usedQueries.add(q)
+    
     onProgress?.(`🌐 正在搜索：「${q}」...`)
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
@@ -148,51 +263,35 @@ async function runIterativeWebSearch(params: {
       break
     }
   }
+  
   if (!rounds.length) onProgress?.('ℹ️ 模型判断无需联网搜索，直接回答')
-  else onProgress?.(`✅ 搜索全部完成（共 ${rounds.length} 轮），正在生成回答...`)
-  return rounds
-}
-
-async function filterAndSummarizeSearchResults(params: {
-  openai: OpenAI; model: string; userQuestion: string; rounds: SearchRound[]; maxItems: number; abortSignal?: AbortSignal
-}): Promise<SearchRound[]> {
-  const { openai, model, userQuestion, rounds, maxItems, abortSignal } = params
-  const allItems: Array<{ roundIdx: number; itemIdx: number; title: string; url: string; content: string }> = []
-  for (let ri = 0; ri < rounds.length; ri++) { for (let ii = 0; ii < (rounds[ri].items || []).length; ii++) { const it = rounds[ri].items[ii]; allItems.push({ roundIdx: ri, itemIdx: ii, title: it.title, url: it.url, content: it.content }) } }
-  if (allItems.length <= maxItems) return rounds
-  const itemList = allItems.map((it, idx) => { const sc = it.content.length > 800 ? `${it.content.slice(0, 800)}...` : it.content; return `[${idx + 1}] ${it.title}\nURL: ${it.url}\n${sc}` }).join('\n\n')
-  const filterSystem = ['你是"搜索结果筛选器"。用户问了一个问题，系统搜索到了多条结果。', '你的任务是：从中挑出最相关、最有价值的条目编号，并为每条输出一段精炼摘要（100~300字）。', '', '输出严格 JSON（不要输出多余文字）：', '{ "selected": [ { "index": number, "summary": string } ] }', '', '规则：', `- 最多选 ${maxItems} 条`, '- index 是条目编号（从1开始）', '- summary 是你对该条内容的精炼摘要，保留关键事实、数据、结论', '- 优先选与用户问题直接相关的条目', '- 丢弃明显无关、重复、低质量的条目'].join('\n')
-  const filterUser = [`用户问题：${userQuestion}`, '', `搜索结果（共 ${allItems.length} 条）：`, itemList].join('\n')
-  try {
-    let respText = ''
-    try { const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: filterSystem }, { role: 'user', content: filterUser }], response_format: { type: 'json_object' } as any, stream: false } as any, { signal: abortSignal }); respText = resp.choices?.[0]?.message?.content ?? '' }
-    catch { const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: filterSystem }, { role: 'user', content: `${filterUser}\n\n只输出 JSON，不要输出其它文本。` }], stream: false } as any, { signal: abortSignal }); respText = resp.choices?.[0]?.message?.content ?? '' }
-    const obj = safeParseJsonFromText(respText)
-    if (!obj?.selected || !Array.isArray(obj.selected)) return rounds
-    const selectedSet = new Map<number, string>()
-    for (const sel of obj.selected) { const idx = Number(sel.index); const summary = String(sel.summary || '').trim(); if (idx >= 1 && idx <= allItems.length && summary) selectedSet.set(idx, summary) }
-    if (selectedSet.size === 0) return rounds
-    const newRounds: SearchRound[] = []
-    for (let ri = 0; ri < rounds.length; ri++) {
-      const newItems: SearchRound['items'] = []
-      for (let ii = 0; ii < (rounds[ri].items || []).length; ii++) { const globalIdx = allItems.findIndex(a => a.roundIdx === ri && a.itemIdx === ii) + 1; if (selectedSet.has(globalIdx)) { const original = rounds[ri].items[ii]; newItems.push({ title: original.title, url: original.url, content: selectedSet.get(globalIdx)! }) } }
-      if (newItems.length > 0) newRounds.push({ query: rounds[ri].query, items: newItems, note: rounds[ri].note })
-    }
-    return newRounds.length > 0 ? newRounds : rounds
-  } catch (e) { if (API_DEBUG) debugLog('[SearchFilter] failed:', (e as any)?.message ?? e); return rounds }
+  else onProgress?.(`✅ 搜索全部完成，筛选出 ${selectedIds.size} 条高质量结果，正在生成回答...`)
+  
+  return { rounds, selectedIds }
 }
 
 function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
   if (!rounds.length) return ''
   let n = 0; const lines: string[] = []; const refLines: string[] = []
-  lines.push('【联网搜索结果】')
+  lines.push('【联网搜索结果（已筛选）】')
   rounds.forEach((r, idx) => {
-    lines.push(`（第${idx + 1}轮关键词：${r.query}）`)
-    if (!r.items?.length) { lines.push('（无结果）'); if (r.note) lines.push(`（注：${r.note}）`); lines.push(''); return }
-    for (const it of r.items) { n++; lines.push(`[${n}] ${String(it.title || '').trim()}`); lines.push(`URL: ${String(it.url || '').trim()}`); lines.push(`内容: ${String(it.content || '').trim()}`); lines.push(''); refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`) }
-    if (r.note) { lines.push(`（注：${r.note}）`); lines.push('') }
+    if (!r.items?.length) return 
+    lines.push(`（相关来源：${r.query}）`)
+    for (const it of r.items) {
+      n++
+      lines.push(`[${n}] ${String(it.title || '').trim()}`)
+      lines.push(`URL: ${String(it.url || '').trim()}`)
+      lines.push(`内容: ${String(it.content || '').trim()}`)
+      lines.push('')
+      refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`)
+    }
   })
-  lines.push(''); lines.push('【参考来源列表】'); lines.push(...refLines); lines.push('')
+  if (n === 0) return '' 
+
+  lines.push('')
+  lines.push('【参考来源列表】')
+  lines.push(...refLines)
+  lines.push('')
   lines.push('【回答要求】')
   lines.push('- 基于以上来源回答用户问题。')
   lines.push('- 引用格式必须为 markdown 链接：[编号](url)，例如 [1](https://example.com)。')
@@ -238,7 +337,7 @@ type SavedUpload = { mime: string; filename: string; bytes: number }
 type DataUrlCache = Map<string, string>
 function parseDataUrlImage(dataUrl: string): { mime: string; base64: string } | null { const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(dataUrl); if (!m) return null; return { mime: m[1] || 'image/png', base64: (m[2] || '').replace(/\s+/g, '') || null } as any }
 function mimeToExt(mime: string): string { const t = (mime || '').toLowerCase(); if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg'; if (t === 'image/png') return 'png'; if (t === 'image/webp') return 'webp'; if (t === 'image/gif') return 'gif'; if (t === 'image/bmp') return 'bmp'; if (t === 'image/heic') return 'heic'; return t.split('/')[1] || 'png' }
-async function saveDataUrlImageToUploads(dataUrl: string, cache?: DataUrlCache): Promise<{ url: string; saved: SavedUpload } | null> { try { if (!dataUrl?.startsWith('data:image/')) return null; if (cache?.has(dataUrl)) { const url = cache.get(dataUrl)!; return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } } }; const parsed = parseDataUrlImage(dataUrl); if (!parsed) return null; await ensureUploadDir(); const buffer = Buffer.from(parsed.base64, 'base64'); const ext = mimeToExt(parsed.mime); const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`; const filePath = path.join(UPLOAD_DIR, filename); await fs.writeFile(filePath, buffer); const url = `/uploads/${filename}`; cache?.set(dataUrl, url); return { url, saved: { mime: parsed.mime, filename, bytes: buffer.length } } } catch (e) { console.error('[saveDataUrlImageToUploads] failed:', e); return null } }
+async function saveDataUrlImageToUploads(dataUrl: string, cache?: DataUrlCache): Promise<{ url: string; saved: SavedUpload } | null> { try { if (!dataUrl?.startsWith('data:image/')) return null; if (cache?.has(dataUrl)) { const url = cache.get(dataUrl)!; return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } } }; const parsed = parseDataUrlImage(dataUrl); if (!parsed) return null; await ensureUploadDir(); const buffer = Buffer.from(parsed.base64, 'base64'); const ext = mimeToExt(parsed.mime); const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`; const filePath = path.join(UPLOAD_DIR, filename); await fs.writeFile(filePath, buffer); const url = `/uploads/${filename}`; cache?.set(dataUrl, url); return { url, saved: { mime: parsed.mime, filename, bytes: buffer.length } } } catch (e) { globalThis.console.error('[saveDataUrlImageToUploads] failed:', e); return null } }
 async function normalizeMessageContentDataUrlsToUploads(content: MessageContent, cache?: DataUrlCache): Promise<{ content: MessageContent; saved: SavedUpload[] }> { const savedAll: SavedUpload[] = []; if (typeof content === 'string') { const replaced = await replaceDataUrlImagesWithUploads(content); savedAll.push(...replaced.saved); return { content: replaced.text, saved: savedAll } }; if (Array.isArray(content)) { const newParts: any[] = []; for (const p of content as any[]) { if (p?.type === 'text' && typeof p.text === 'string') { const replaced = await replaceDataUrlImagesWithUploads(p.text); savedAll.push(...replaced.saved); newParts.push({ ...p, text: replaced.text }); continue }; if (p?.type === 'image_url' && typeof p.image_url?.url === 'string') { const u = p.image_url.url as string; if (u.startsWith('data:image/')) { const r = await saveDataUrlImageToUploads(u, cache); if (r?.url) { savedAll.push(r.saved); newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } }); continue } }; newParts.push(p); continue }; newParts.push(p) }; return { content: newParts as any, saved: savedAll } }; return { content, saved: savedAll } }
 async function normalizeUrlsDataUrlsToUploads(urls: string[], cache?: DataUrlCache): Promise<{ urls: string[]; saved: SavedUpload[] }> { const out: string[] = []; const savedAll: SavedUpload[] = []; for (const u of urls || []) { if (typeof u === 'string' && u.startsWith('data:image/')) { const r = await saveDataUrlImageToUploads(u, cache); if (r?.url) { out.push(r.url); savedAll.push(r.saved) } else { out.push(u) } } else { out.push(u) } }; return { urls: out, saved: savedAll } }
 function shortUrlForLog(u: string): string { if (!u) return ''; if (u.startsWith('data:image/')) { return `dataUrl(${u.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/)?.[1] ?? 'image/*'},len=${u.length})` }; return u.length > 200 ? `${u.slice(0, 200)}...(len=${u.length})` : u }
@@ -268,7 +367,7 @@ export async function initApi(key: KeyConfig, { model, maxContextCount, temperat
   const enableStream = !isImageModel
   const options: OpenAI.ChatCompletionCreateParams = { model, stream: enableStream, stream_options: enableStream ? { include_usage: true } : undefined, messages }
   options.temperature = finalTemperature; if (shouldUseTopP) options.top_p = top_p
-  try { const siteCfg = config.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') (options as any).reasoning_effort = reasoningEffort } catch (e) { console.error('[OpenAI] set reasoning_effort failed:', e) }
+  try { const siteCfg = config.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') (options as any).reasoning_effort = reasoningEffort } catch (e) { globalThis.console.error('[OpenAI] set reasoning_effort failed:', e) }
   if (API_DEBUG) { debugLog('====== [OpenAI Request Debug] ======'); debugLog('[baseURL]', OPENAI_API_BASE_URL); debugLog('[model]', model); debugLog('[messagesSummary]', safeJson(summarizeOpenAIMessages(messages))); debugLog('====== [OpenAI Request Debug End] ======') }
   return await openai.chat.completions.create(options, { signal: abortSignal })
 }
@@ -293,7 +392,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(k => isTextFile(k)); const imageFiles = uploadFileKeys.filter(k => isImageFile(k))
-    if (textFiles.length > 0) { for (const fileKey of textFiles) { try { const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey)); await fs.access(filePath); const fileContent = await fs.readFile(filePath, 'utf-8'); fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n` } catch (e) { console.error(`Error reading text file ${fileKey}`, e); fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n` } } }
+    if (textFiles.length > 0) { for (const fileKey of textFiles) { try { const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey)); await fs.access(filePath); const fileContent = await fs.readFile(filePath, 'utf-8'); fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n` } catch (e) { globalThis.console.error(`Error reading text file ${fileKey}`, e); fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n` } } }
     const finalMessage = message + (fileContext ? `\n\nAttached Files content:\n${fileContext}` : '')
     if (imageFiles.length > 0) { content = [{ type: 'text', text: finalMessage }]; for (const uploadFileKey of imageFiles) { content.push({ type: 'image_url', image_url: { url: await convertImageUrl(stripTypePrefix(uploadFileKey)) } }) } }
     else { content = finalMessage }
@@ -346,27 +445,25 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         })
       }
 
-      const rounds = await runIterativeWebSearch({
+      // ✅ Build Context and Date
+      const historyContext = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
+      const currentDate = new Date().toLocaleString()
+
+      const { rounds, selectedIds } = await runIterativeWebSearch({
         openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
         abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
         onProgress: onProgressLocal,
+        fullContext: historyContext, date: currentDate
       })
 
-      // ✅ 筛选/压缩
-      const maxItemsForAnswer = Math.max(3, Math.min(8, maxResults))
-      let filteredRounds = rounds
-      const totalItems = rounds.reduce((sum, r) => sum + (r.items?.length ?? 0), 0)
-      if (totalItems > maxItemsForAnswer) {
-        onProgressLocal(`🔎 正在筛选最相关的 ${maxItemsForAnswer} 条结果...`)
-        try {
-          filteredRounds = await filterAndSummarizeSearchResults({
-            openai: plannerOpenai, model: plannerModels[0] || model, userQuestion: message,
-            rounds, maxItems: maxItemsForAnswer, abortSignal: abort.signal,
-          })
-          onProgressLocal(`✅ 筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`)
-        }
-        catch (e: any) { if (isAbortError(e, abort.signal)) throw e; filteredRounds = rounds }
-      }
+      // ✅ Filter results based on selectedIds, NO quantity limits
+      const filteredRounds = rounds.map((r, rIdx) => ({
+        query: r.query,
+        note: r.note,
+        items: r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
+      })).filter(r => r.items.length > 0 || r.note)
+
+      onProgressLocal(`✅ 筛选筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`)
 
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
       if (ctx) content = appendTextToMessageContent(content, ctx)
@@ -378,7 +475,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         debugLog('====== [WebSearch Debug End] ======')
       }
     }
-    catch (e: any) { if (isAbortError(e, abort.signal)) throw e; console.error('[WebSearch] failed:', e?.message ?? e) }
+    catch (e: any) { if (isAbortError(e, abort.signal)) throw e; globalThis.console.error('[WebSearch] failed:', e?.message ?? e) }
   }
 
   try {
