@@ -215,8 +215,8 @@ async function runIterativeWebSearch(params: {
 
   for (let i = 0; i < maxRounds; i++) {
     // 状态更新：开始分析
-    const stepLabel = `⏳ 第 ${i + 1}/${maxRounds} 轮规划`;
-    onProgress?.(`${stepLabel}：正在分析用户意图与上下文...`)
+    // 使用 emoji 和更自然的语言，减轻用户的等待焦虑
+    onProgress?.(`⏳ 第 ${i + 1}/${maxRounds} 轮规划：正在仔细分析您的意图与上下文...`)
     
     let plan: SearchPlan | null = null
     for (const m of plannerModels) {
@@ -238,7 +238,7 @@ async function runIterativeWebSearch(params: {
     }
     
     if (!plan) { 
-        onProgress?.('❌ 规划模型未返回有效计划，流程结束。'); 
+        onProgress?.('❌ 规划服务暂时不可用，流程结束。'); 
         break 
     }
 
@@ -253,9 +253,9 @@ async function runIterativeWebSearch(params: {
       plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
     }
 
-    const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
-
     // ✅ 如果第一轮 decide stop，说明不需要搜
+    const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
+    
     if (plan.action !== 'search') { 
         if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
         else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
@@ -272,7 +272,7 @@ async function runIterativeWebSearch(params: {
     usedQueries.add(q)
     
     // 状态更新：开始搜索
-    onProgress?.(`🔍 决定搜索：「${q}」\n   🧠 ${reasonText}`)
+    onProgress?.(`🔍 正在搜索：「${q}」\n   🧠 ${reasonText}`)
     
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
@@ -280,7 +280,7 @@ async function runIterativeWebSearch(params: {
       rounds.push({ query: q, items }); 
       
       // 状态更新：搜索返回
-      onProgress?.(`📄 搜索响应成功，获取到 ${items.length} 个页面，正在阅读内容...`)
+      onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在提取关键信息...`)
     } catch (e: any) {
       const errMsg = e?.message ?? String(e)
       console.error(`[WebSearch][Round ${i + 1}] Search failed for query "${q}":`, errMsg)
@@ -291,7 +291,7 @@ async function runIterativeWebSearch(params: {
   }
   
   if (rounds.length > 0) {
-      onProgress?.(`📚 搜索任务全部完成，从 ${rounds.reduce((a,b)=>a+(b.items?.length||0), 0)} 条记录中整理精华...`)
+      onProgress?.(`📚 搜索任务结束，正在从 ${rounds.reduce((a,b)=>a+(b.items?.length||0), 0)} 条记录中整理精华...`)
   }
   
   return { rounds, selectedIds }
@@ -459,7 +459,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
 
-      // ✅ 用 actualPlannerModel（而非原始配置名）
+      // ✅ diff plannerModels
       const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
 
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
@@ -472,7 +472,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         const displayLog = progressMessages.join('\n')
         // 实时推送到前端，让用户看到“思考中...”
         processCb?.({
-          id: customMessageId, text: displayLog + '\n\n⏳ ...', role: 'assistant',
+          id: customMessageId, text: displayLog + '\n\n⏳ 正在执行...', role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
         })
       }
@@ -501,18 +501,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })).filter(r => r.items.length > 0 || r.note)
       
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
-      if (ctx) {
-        content = appendTextToMessageContent(content, ctx)
-        // 搜索结束，给一个信号
-        processCb?.({
-          id: customMessageId, 
-          text: searchProcessLog + '✅ 资料整理完毕，正在生成精彩回答...', 
-          role: 'assistant',
-          conversationId: lastContext?.conversationId, 
-          parentMessageId: lastContext?.parentMessageId, 
-          detail: undefined,
-        })
-      }
+      
+      // 核心修改：明确告知用户正在生成最终回答
+      let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...' 
+      if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
+
+      processCb?.({
+        id: customMessageId, 
+        text: searchProcessLog + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`, 
+        role: 'assistant',
+        conversationId: lastContext?.conversationId, 
+        parentMessageId: lastContext?.parentMessageId, 
+        detail: undefined,
+      })
+
+      if (ctx) content = appendTextToMessageContent(content, ctx)
 
       if (API_DEBUG) {
         debugLog('====== [WebSearch Debug] ======')
@@ -524,7 +527,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     catch (e: any) { 
        if (isAbortError(e, abort.signal)) throw e; 
        globalThis.console.error('[WebSearch] failed:', e?.message ?? e);
-       // 搜索失败不阻断，只是记录错误
        searchProcessLog += `\n❌ 联网搜索模块遇到问题：${e?.message ?? '未知错误'}\n\n---\n\n`
        processCb?.({
           id: customMessageId, text: searchProcessLog + '尝试使用已有知识回答...', role: 'assistant',
