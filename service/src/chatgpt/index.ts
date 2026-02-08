@@ -18,7 +18,6 @@ import * as path from 'node:path'
 import { generateMessageId } from '../utils/id-generator'
 import { abortablePromise, isAbortError } from './abortable'
 import { webSearch } from '../utils/webSearch'
-import { ChatCompletionTool } from 'openai/resources'
 
 type GeminiPart = { text?: string; inlineData?: { mimeType: string; data: string } }
 
@@ -74,24 +73,22 @@ function summarizeOpenAIMessages(messages: any[]) {
 }
 function debugLog(...args: any[]) { if (!API_DEBUG) return; console.log(...args) }
 
-// ===================== Tool Function 定义 =====================
+// ===================== 联网搜索 =====================
+type SearchPlan = {
+  action: 'search' | 'stop'
+  query?: string
+  reason?: string
+  selected_ids?: string[] // e.g. ["1.1", "2.3"]
+  context_summary?: string // 对上下文的总结
+}
+type SearchRound = { query: string; items: Array<{ title: string; url: string; content: string }>; note?: string }
 
-const WEB_SEARCH_TOOL: ChatCompletionTool = {
-  type: 'function',
-  function: {
-    name: 'web_search',
-    description: 'Call this tool when you need real-time information, news, or fact-checking that is not in your knowledge base. You can specific which info you need by query.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'The search query string. Keep it specific and concise.',
-        },
-      },
-      required: ['query'],
-    },
-  },
+function safeParseJsonFromText(text: string): any | null {
+  if (!text) return null; const s = String(text).trim()
+  try { return JSON.parse(s) } catch { }
+  const i = s.indexOf('{'); const j = s.lastIndexOf('}')
+  if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)) } catch { } }
+  return null
 }
 
 async function buildConversationContext(lastMessageId: string | undefined, maxCount: number): Promise<string> {
@@ -113,6 +110,210 @@ async function buildConversationContext(lastMessageId: string | undefined, maxCo
   return messages.reverse().join('\n')
 }
 
+// 修改：展示全部条目，不做 slice(0,5)，确保模型看到完整结果来判断完整性
+function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
+  if (!rounds.length) return '（无）'
+  return rounds.map((r, idx) => {
+    // 这里的 content 保留完整文本，只做基本清洗
+    const items = (r.items || []).map((it, i) =>
+      `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  内容: ${String(it.content || '').replace(/\s+/g, ' ').trim()}`
+    ).join('\n\n')
+    const note = r.note ? `\n（注：${r.note}）` : ''
+    // [1.1] means Round 1 Item 1
+    return `### 第${idx + 1}轮 query="${r.query}"\n${items || '（无结果）'}${note}`
+  }).join('\n\n')
+}
+
+async function planNextSearchAction(params: {
+  openai: OpenAI
+  model: string
+  userQuestion: string
+  rounds: SearchRound[]
+  fullContext: string
+  priorContextSummary: string | null
+  date: string
+  abortSignal?: AbortSignal
+}): Promise<SearchPlan> {
+  const { openai, model, userQuestion, rounds, fullContext, priorContextSummary, date, abortSignal } = params
+
+  const isFirstRound = !priorContextSummary 
+
+  const plannerSystem = [
+    '你是"联网搜索规划器 & 结果筛选器"。你的任务是协助回答用户问题。',
+    '',
+    `当前时间：${date}`,
+    '',
+    '任务：',
+    '1. 首先判断是否需要联网搜索。**这是最重要的决策。**',
+    '2. 评估"已进行的搜索与结果"，选出对回答问题有价值的条目ID (格式如 "1.1", "2.3")。',
+    '',
+    '【决策逻辑】',
+    '- **必须搜索**：问题涉及近期新闻、特定事实查证（天气、股价等）、非常识性具体数据，且上下文中没有。',
+    '- **禁止搜索 (action="stop")**：',
+    '  - 纯闲聊（如“你好”、“你是谁”）。',
+    '  - 常识性问题（如“太阳从哪升起”、“1+1等于几”）。',
+    '  - 逻辑推理、数学计算、代码编写、翻译、润色任务。',
+    '  - **上下文已包含答案**：用户问题是针对历史对话的追问，且历史信息已足够回答。',
+    '',
+    '如果决定搜索：action="search"，并给出 query。',
+    '如果无需搜索或信息已足：action="stop"（此时 selected_ids 依然可以返回已有结果的ID，如果没有结果则为空数组）。',
+    '',
+    isFirstRound
+      ? '3. 请务必阅读完整的对话上下文，并生成一个精炼的"context_summary"（100-200字），概括历史对话的核心意图和关键信息，以便后续轮次使用。'
+      : '3. 参考提供的 "context_summary" 来理解用户意图（不再提供完整上下文）。',
+    '',
+    '输出严格 JSON：',
+    '{',
+    '  "action": "search" | "stop",',
+    '  "query": string, // 如果 action=search',
+    '  "reason": string,',
+    '  "selected_ids": string[], // 选出的高质量结果ID列表，例如 ["1.1", "2.1"]',
+    isFirstRound ? '  "context_summary": string // 对历史上下文的精炼总结' : null,
+    '}'.replace(/, null/g, ''),
+  ].filter(Boolean).join('\n')
+
+  // 如果有之前的总结，就用总结；否则用完整上下文
+  const contextBlock = isFirstRound
+    ? `【完整对话上下文（请总结生成 context_summary）】\n${fullContext || '（无）'}`
+    : `【历史上下文总结 (context_summary)】\n${priorContextSummary}`
+
+  const plannerUser = [
+    '【用户问题】', userQuestion,
+    '',
+    contextBlock,
+    '',
+    '【已进行的搜索与结果】',
+    formatSearchRoundsForPlanner(rounds),
+    '',
+    '现在请决定：selected_ids 是哪些？是否需要继续搜索？' + (isFirstRound ? ' 记得生成 context_summary。' : '')
+  ].join('\n')
+
+  try {
+    const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }], response_format: { type: 'json_object' } as any, stream: false } as any, { signal: abortSignal })
+    const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
+    return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed' }
+  } catch {
+    const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` }], stream: false } as any, { signal: abortSignal })
+    const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
+    return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed' }
+  }
+}
+
+async function runIterativeWebSearch(params: {
+  openai: OpenAI; plannerModels: string[]; userQuestion: string; maxRounds: number; maxResults: number
+  abortSignal?: AbortSignal; provider?: 'searxng' | 'tavily'; searxngApiUrl?: string; tavilyApiKey?: string
+  onProgress?: (status: string) => void
+  fullContext: string; date: string
+}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string> }> {
+  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress, fullContext, date } = params
+  const rounds: SearchRound[] = []
+  const usedQueries = new Set<string>()
+  const selectedIds = new Set<string>()
+  
+  // 存储第一轮生成的上下文总结，供后续使用
+  let currentContextSummary: string | null = null
+
+  for (let i = 0; i < maxRounds; i++) {
+    onProgress?.(`🔍 搜索规划中（第 ${i + 1}/${maxRounds} 轮）...`)
+    
+    let plan: SearchPlan | null = null
+    for (const m of plannerModels) {
+      try {
+        plan = await planNextSearchAction({ 
+          openai, 
+          model: m, 
+          userQuestion, 
+          rounds, 
+          abortSignal, 
+          fullContext, 
+          priorContextSummary: currentContextSummary, 
+          date 
+        })
+        break 
+      } catch (e) {
+        if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e) 
+      } 
+    }
+    
+    if (!plan) { onProgress?.('✅ 搜索规划完成（无需搜索）'); break }
+
+    // 更新总结
+    if (plan.context_summary && typeof plan.context_summary === 'string') {
+      currentContextSummary = plan.context_summary
+      if (API_DEBUG) debugLog('[WebSearch] Context Summary updated:', currentContextSummary)
+    }
+
+    // 累积选中的 ID
+    if (Array.isArray(plan.selected_ids)) {
+      plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
+    }
+
+    // ✅ 如果第一轮就 decide stop，说明不需要搜
+    if (plan.action !== 'search') { 
+        if (i === 0) onProgress?.(`✅ 模型判断无需搜索：${plan.reason || '常识/闲聊/已有信息已足够'}`)
+        else onProgress?.(`✅ 搜索完成：${plan.reason || '信息已足够'}`)
+        break
+    }
+    
+    const q = String(plan.query || '').trim()
+    if (!q) break; if (usedQueries.has(q)) { onProgress?.('⚠️ 关键词重复，停止搜索'); break }; usedQueries.add(q)
+    
+    onProgress?.(`🌐 正在搜索：「${q}」...`)
+    try {
+      const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
+      const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
+      rounds.push({ query: q, items }); onProgress?.(`📄 第 ${i + 1} 轮搜索完成，获得 ${items.length} 条结果`)
+    } catch (e: any) {
+      const errMsg = e?.message ?? String(e)
+      console.error(`[WebSearch][Round ${i + 1}] Search failed for query "${q}":`, errMsg)
+      rounds.push({ query: q, items: [], note: errMsg })
+      onProgress?.(`❌ 搜索失败：${errMsg}`)
+      break
+    }
+  }
+  
+  if (!rounds.length) {
+      // 这里的文案已在上面处理（如果 i=0 break）
+  } else {
+      onProgress?.(`✅ 搜索全部完成，筛选出 ${selectedIds.size} 条高质量结果，正在生成回答...`)
+  }
+  
+  return { rounds, selectedIds }
+}
+
+function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
+  if (!rounds.length) return ''
+  let n = 0; const lines: string[] = []; const refLines: string[] = []
+  lines.push('【联网搜索结果（已筛选）】')
+  rounds.forEach((r, idx) => {
+    if (!r.items?.length) return 
+    lines.push(`（相关来源：${r.query}）`)
+    for (const it of r.items) {
+      n++
+      lines.push(`[${n}] ${String(it.title || '').trim()}`)
+      lines.push(`URL: ${String(it.url || '').trim()}`)
+      lines.push(`内容: ${String(it.content || '').trim()}`)
+      lines.push('')
+      refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`)
+    }
+  })
+  if (n === 0) return '' 
+
+  lines.push('')
+  lines.push('【参考来源列表】')
+  lines.push(...refLines)
+  lines.push('')
+  lines.push('【回答要求】')
+  lines.push('- 基于以上来源回答用户问题。')
+  lines.push('- 引用格式必须为 markdown 链接：[编号](url)，例如 [1](https://example.com)。')
+  lines.push('- 可以同时引用多个来源，用逗号分隔：[1](url1), [2](url2)。')
+  lines.push('- 在回答末尾，列出所有引用过的参考来源，格式：')
+  lines.push('  ## 参考来源')
+  lines.push('  - [标题](url)')
+  lines.push('- 若来源不足以支持结论，请明确说明。')
+  return lines.join('\n')
+}
+
 function appendTextToMessageContent(content: MessageContent, appendix: string): MessageContent {
   if (!appendix?.trim()) return content
   if (typeof content === 'string') return `${content}\n\n${appendix}`
@@ -123,125 +324,10 @@ function appendTextToMessageContent(content: MessageContent, appendix: string): 
   }
   return content
 }
-
-// -----------------------------------------------------------------------
-// Tool Loop: 带有工具调用的迭代搜索
-// -----------------------------------------------------------------------
-async function executeToolSearchLoop(params: {
-  openai: OpenAI
-  model: string
-  userQuestion: string
-  fullContext: string
-  date: string
-  maxRounds: number
-  maxResults: number
-  abortSignal?: AbortSignal
-  provider?: 'searxng' | 'tavily'
-  searxngApiUrl?: string
-  tavilyApiKey?: string
-  onProgress?: (status: string) => void
-}): Promise<string> {
-  const { openai, model, userQuestion, fullContext, date, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress } = params
-
-  const messages: OpenAI.ChatCompletionMessageParam[] = [
-    {
-      role: 'system',
-      content: `Current Date: ${date}.\nYou are a helpful AI assistant with access to a web search tool. \n\n[Context]\n${fullContext}\n\n[User Question]\n${userQuestion}\n\nStrict Rules:\n1. ONLY call 'web_search' if the user's question requires real-time/external info (e.g. news, weather, specific facts not in context).\n2. DO NOT search if the answer is general knowledge, code, logic, or already in the [Context].\n3. You can call the tool multiple times if needed, but stop when you have enough info.\n4. If no search is needed, just reply directly.`,
-    },
-    { role: 'user', content: userQuestion }
-  ]
-
-  let roundCount = 0
-  const accumulatedResults: any[] = []
-
-  // 循环直到模型不再调用工具，或达到最大轮数
-  while (roundCount < maxRounds) {
-    if (abortSignal?.aborted) throw new Error('Aborted by user')
-
-    // 1. 调用模型规划
-    onProgress?.(roundCount === 0 ? '🤔 思考是否需要搜索...' : `🔄 分析第 ${roundCount} 轮结果...`)
-    
-    // 注意：这里 tool_choice: "auto" 让模型自己决定用不用
-    const completion = await openai.chat.completions.create({
-      model,
-      messages,
-      tools: [WEB_SEARCH_TOOL],
-      tool_choice: 'auto', 
-      temperature: 0,
-    } as any, { signal: abortSignal })
-
-    const choice = completion.choices[0]
-    const message = choice.message
-
-    // 2. 如果模型不调用工具，说明它认为信息够了，或者是可以在这里停止
-    if (!message.tool_calls || message.tool_calls.length === 0) {
-      if (roundCount === 0) onProgress?.('✅ 模型判断无需搜索')
-      else onProgress?.('✅ 搜索结束，开始生成回答...')
-      break
-    }
-
-    // 3. 执行工具调用
-    // 将助手的"意图"加入历史，这是 OpenAI 对话协议要求的
-    messages.push(message) 
-
-    for (const toolCall of message.tool_calls) {
-      if (toolCall.function.name === 'web_search') {
-        const args = JSON.parse(toolCall.function.arguments)
-        const query = args.query
-        onProgress?.(`🌐 正在搜索: "${query}"...`)
-
-        let searchContent = ''
-        try {
-          const res = await webSearch(query, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
-          
-          // 记录结果用于最后展示（可选）
-          accumulatedResults.push({ query, count: res.results.length })
-
-          // 格式化搜索结果给模型看
-          if (res.results.length === 0) {
-            searchContent = `No results found for query: "${query}"`
-          } else {
-            searchContent = res.results.map((item, idx) => `[${idx+1}] Title: ${item.title}\nURL: ${item.url}\nContent: ${item.content}`).join('\n\n')
-          }
-        } catch (e: any) {
-          searchContent = `Search Error: ${e.message}`
-          onProgress?.(`❌ 搜索出错: ${e.message}`)
-        }
-
-        // 4. 将工具执行结果作为 'tool' 消息塞回
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: searchContent
-        })
-      }
-    }
-
-    roundCount++
-  }
-
-  // 最终整理：
-  // 此时 messages 数组里包含了 [System, User, Assistant(Call), Tool(Result), Assistant(Call), Tool(Result)...]
-  // 我们可以把这个列表交给最后生成回答的函数，或者在这里把 Tool Result 提取出来格式化并追加到原始 prompt 中，
-  // 从而符合你原本的架构（即把搜索结果附加在 content 后面给最后的生成模型）。
-  
-  // 提取所有 Tool 消息的内容作为最后的上下文
-  const finalToolContexts = messages
-    .filter(m => m.role === 'tool')
-    .map(m => String(m.content))
-    .join('\n\n---\n\n')
-
-  if (!finalToolContexts) return ''
-
-  // 简单的格式化，或者你可以解析它做更精细的引用
-  return `\n\n【联网搜索参考信息】\n${finalToolContexts}\n\n【回答要求】\n根据以上搜索信息回答用户问题，并用Markdown引用来源。`
-}
-
 // ===================== 联网搜索 END =====================
 
 const ErrorCodeMessage: Record<string, string> = { 401: '提供错误的API密钥', 403: '服务器拒绝访问，请稍后再试', 502: '错误的网关', 503: '服务器繁忙，请稍后再试', 504: '网关超时', 500: '服务器繁忙，请稍后再试' }
 
-// ... (以下代码保持不变：replaceDataUrlImagesWithUploads, saveDataUrlImageToUploads 等辅助函数) ...
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
@@ -333,28 +419,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
 
-      // ✅ 优先使用 gpt-4o-mini 或 gemini-1.5-flash，只有在没配置时才尝试 fallback
-      const preferredPlanner = plannerModelName || 'gpt-4o-mini'
-
-      // ✅ 为 planner 找独立 key
+      // ✅ 为 planner 找独立 key；找不到则 fallback 到当前对话模型+key
       let plannerKey = key
-      let actualPlannerModel = model // 默认回退
-      
-      const candidateKey = await getRandomApiKey(options.user, preferredPlanner)
-      if (candidateKey) {
-        plannerKey = candidateKey
-        actualPlannerModel = preferredPlanner
-      } else {
-        // 如果找不到 fast planner 的 key，再尝试找 explicitly configured planner
-        if (plannerModelName && plannerModelName !== preferredPlanner) {
-           const specificKey = await getRandomApiKey(options.user, plannerModelName)
-           if (specificKey) {
-             plannerKey = specificKey
-             actualPlannerModel = plannerModelName
-           }
+      let actualPlannerModel = plannerModelName
+      if (plannerModelName !== model) {
+        const candidateKey = await getRandomApiKey(options.user, plannerModelName)
+        if (candidateKey) {
+          plannerKey = candidateKey
         }
-        // 如果都找不到，保持使用 current model 的 key，但打个 warning
-        if (!candidateKey) console.warn(`[WebSearch] No dedicated planner key found, using chat model "${model}"`)
+        else {
+          console.warn(`[WebSearch] No key found for planner model "${plannerModelName}", falling back to current model "${model}"`)
+          actualPlannerModel = model
+          plannerKey = key
+        }
       }
 
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
@@ -362,6 +439,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
+
+      // ✅ 用 actualPlannerModel（而非原始配置名）
+      const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
 
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
       const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
@@ -380,26 +460,36 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const historyContext = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
 
-      // ✅ 使用 Tool Loop
-      const searchContext = await executeToolSearchLoop({
-        openai: plannerOpenai, model: actualPlannerModel, userQuestion: message,
-        fullContext: historyContext, date: currentDate, maxRounds, maxResults,
+      const { rounds, selectedIds } = await runIterativeWebSearch({
+        openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
         abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
-        onProgress: onProgressLocal
+        onProgress: onProgressLocal,
+        fullContext: historyContext, date: currentDate
       })
 
-      if (searchContext) content = appendTextToMessageContent(content, searchContext)
+      // ✅ Filter results based on selectedIds, NO quantity limits
+      const filteredRounds = rounds.map((r, rIdx) => ({
+        query: r.query,
+        note: r.note,
+        items: r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
+      })).filter(r => r.items.length > 0 || r.note)
+
+      onProgressLocal(`✅ 筛选筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`)
+
+      const ctx = formatAggregatedSearchForAnswer(filteredRounds)
+      if (ctx) content = appendTextToMessageContent(content, ctx)
 
       if (API_DEBUG) {
-        debugLog('====== [WebSearch ToolCall] ======')
-        debugLog('[Planner]', actualPlannerModel)
+        debugLog('====== [WebSearch Debug] ======')
+        debugLog('[configuredPlanner]', plannerModelName, '[actualPlanner]', actualPlannerModel)
+        debugLog('[rounds]', rounds.length, '[filteredItems]', filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0))
+        debugLog('====== [WebSearch Debug End] ======')
       }
     }
     catch (e: any) { if (isAbortError(e, abort.signal)) throw e; globalThis.console.error('[WebSearch] failed:', e?.message ?? e) }
   }
 
   try {
-    // ... [Gemini & OpenAI Chat Logic remains same] ...
     // ① Gemini
     if (isGeminiImageModel) {
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined; const dataUrlCache: DataUrlCache = new Map()
