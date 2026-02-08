@@ -110,16 +110,13 @@ async function buildConversationContext(lastMessageId: string | undefined, maxCo
   return messages.reverse().join('\n')
 }
 
-// 修改：展示全部条目，不做 slice(0,5)，确保模型看到完整结果来判断完整性
 function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   if (!rounds.length) return '（无）'
   return rounds.map((r, idx) => {
-    // 这里的 content 保留完整文本，只做基本清洗
     const items = (r.items || []).map((it, i) =>
       `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  内容: ${String(it.content || '').replace(/\s+/g, ' ').trim()}`
     ).join('\n\n')
     const note = r.note ? `\n（注：${r.note}）` : ''
-    // [1.1] means Round 1 Item 1
     return `### 第${idx + 1}轮 query="${r.query}"\n${items || '（无结果）'}${note}`
   }).join('\n\n')
 }
@@ -135,9 +132,7 @@ async function planNextSearchAction(params: {
   abortSignal?: AbortSignal
 }): Promise<SearchPlan> {
   const { openai, model, userQuestion, rounds, fullContext, priorContextSummary, date, abortSignal } = params
-
   const isFirstRound = !priorContextSummary 
-
   const plannerSystem = [
     '你是"联网搜索规划器 & 结果筛选器"。你的任务是协助回答用户问题。',
     '',
@@ -172,7 +167,6 @@ async function planNextSearchAction(params: {
     '}'.replace(/, null/g, ''),
   ].filter(Boolean).join('\n')
 
-  // 如果有之前的总结，就用总结；否则用完整上下文
   const contextBlock = isFirstRound
     ? `【完整对话上下文（请总结生成 context_summary）】\n${fullContext || '（无）'}`
     : `【历史上下文总结 (context_summary)】\n${priorContextSummary}`
@@ -210,13 +204,18 @@ async function runIterativeWebSearch(params: {
   const usedQueries = new Set<string>()
   const selectedIds = new Set<string>()
   
-  // 存储第一轮生成的上下文总结，供后续使用
   let currentContextSummary: string | null = null
 
   for (let i = 0; i < maxRounds; i++) {
-    // 状态更新：开始分析
-    // 使用 emoji 和更自然的语言，减轻用户的等待焦虑
-    onProgress?.(`⏳ 第 ${i + 1}/${maxRounds} 轮规划：正在仔细分析您的意图与上下文...`)
+    // 核心修改 1 & 2：隐藏非第一轮的规划日志
+    // 第一轮必须给个反馈，告诉用户在干嘛
+    if (i === 0) {
+      onProgress?.(`⏳ 正在分析用户意图，规划搜索策略...`)
+    }
+    // 第二轮及以后：不输出日志。
+    // 上一轮搜索成功的日志是："搜索成功... 正在判断是否需要进一步搜索..."
+    // 这句话完美地充当了第二轮 Planner 思考时的 Loading 状态。
+    // 当 Planner 返回时，直接显示结果，从而实现无感衔接。
     
     let plan: SearchPlan | null = null
     for (const m of plannerModels) {
@@ -242,22 +241,14 @@ async function runIterativeWebSearch(params: {
         break 
     }
 
-    // 更新总结
-    if (plan.context_summary && typeof plan.context_summary === 'string') {
-      currentContextSummary = plan.context_summary
-      if (API_DEBUG) debugLog('[WebSearch] Context Summary updated:', currentContextSummary)
-    }
-
-    // 累积选中的 ID
-    if (Array.isArray(plan.selected_ids)) {
-      plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
-    }
-
-    // ✅ 如果第一轮 decide stop，说明不需要搜
-    const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
+    if (plan.context_summary && typeof plan.context_summary === 'string') currentContextSummary = plan.context_summary
+    if (Array.isArray(plan.selected_ids)) plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
     
+    const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
+
     if (plan.action !== 'search') { 
         if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
+        // 这里也会无缝衔接：直接显示“信息收集完毕”
         else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
         break
     }
@@ -271,7 +262,7 @@ async function runIterativeWebSearch(params: {
     }; 
     usedQueries.add(q)
     
-    // 状态更新：开始搜索
+    // 这里会作为新的一步跳出
     onProgress?.(`🔍 正在搜索：「${q}」\n   🧠 ${reasonText}`)
     
     try {
@@ -279,8 +270,8 @@ async function runIterativeWebSearch(params: {
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
       rounds.push({ query: q, items }); 
       
-      // 状态更新：搜索返回
-      onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在提取关键信息...`)
+      // 核心修改 1：修改措辞，让用户知道下一步是“判断”
+      onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
     } catch (e: any) {
       const errMsg = e?.message ?? String(e)
       console.error(`[WebSearch][Round ${i + 1}] Search failed for query "${q}":`, errMsg)
@@ -290,9 +281,8 @@ async function runIterativeWebSearch(params: {
     }
   }
   
-  if (rounds.length > 0) {
-      onProgress?.(`📚 搜索任务结束，正在从 ${rounds.reduce((a,b)=>a+(b.items?.length||0), 0)} 条记录中整理精华...`)
-  }
+  // 核心修改 3：移除函数末尾的 summary log
+  // 不再输出“搜索任务结束...”，让主流程直接接管输出“正在生成回答”
   
   return { rounds, selectedIds }
 }
@@ -425,10 +415,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     else { content = finalMessage }
   }
 
-  // 初始化一个变量来存储搜索过程的日志，确保在生成最终答案时，用户能看到之前发生了什么
   let searchProcessLog = ''
 
-  // ===== 联网搜索 =====
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
 
@@ -438,7 +426,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
 
-      // ✅ 为 planner 找独立 key；找不到则 fallback 到当前对话模型+key
       let plannerKey = key
       let actualPlannerModel = plannerModelName
       if (plannerModelName !== model) {
@@ -458,8 +445,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
-
-      // ✅ diff plannerModels
       const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
 
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
@@ -470,14 +455,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
         const displayLog = progressMessages.join('\n')
-        // 实时推送到前端，让用户看到“思考中...”
         processCb?.({
           id: customMessageId, text: displayLog + '\n\n⏳ 正在执行...', role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
         })
       }
 
-      // ✅ Build Context and Date
       const historyContext = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
 
@@ -488,12 +471,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         fullContext: historyContext, date: currentDate
       })
 
-      // 保存日志供最终输出使用
       if (progressMessages.length > 0) {
         searchProcessLog = progressMessages.join('\n') + '\n\n---\n\n'
       }
 
-      // ✅ Filter results based on selectedIds, NO quantity limits
       const filteredRounds = rounds.map((r, rIdx) => ({
         query: r.query,
         note: r.note,
@@ -502,10 +483,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
       
-      // 核心修改：明确告知用户正在生成最终回答
       let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...' 
       if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
 
+      // 直接进入生成阶段，无需等待“搜索任务结束”的日志
       processCb?.({
         id: customMessageId, 
         text: searchProcessLog + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`, 
@@ -517,12 +498,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (ctx) content = appendTextToMessageContent(content, ctx)
 
-      if (API_DEBUG) {
-        debugLog('====== [WebSearch Debug] ======')
-        debugLog('[configuredPlanner]', plannerModelName, '[actualPlanner]', actualPlannerModel)
-        debugLog('[rounds]', rounds.length, '[filteredItems]', filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0))
-        debugLog('====== [WebSearch Debug End] ======')
-      }
     }
     catch (e: any) { 
        if (isAbortError(e, abort.signal)) throw e; 
@@ -536,8 +511,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   try {
-    // ① Gemini
     if (isGeminiImageModel) {
+      // ... (Gemini 代码部分保持不变，但需确保 text 初始化包含 searchProcessLog)
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined; const dataUrlCache: DataUrlCache = new Map()
       const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache); content = normalizedCurrent.content
       const { metas } = await buildGeminiHistoryFromLastMessageId({ lastMessageId: lastContext.parentMessageId, maxContextCount, forGeminiImageModel: true })
@@ -554,7 +529,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const ai = new GoogleGenAI({ apiKey: key.key, ...(baseUrl ? { httpOptions: { baseUrl } } : {}) })
       const response = await abortablePromise(ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: inputParts }], config: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: '16:9', imageSize: '4K' }, ...(systemMessage ? { systemInstruction: systemMessage } as any : {}) } as any } as any), abort.signal)
       if (!response.candidates || response.candidates.length === 0) throw new Error('[Gemini] Empty candidates.')
-      let text = searchProcessLog; // 保留搜索日志
+      let text = searchProcessLog; // ✅ Keep log
       const parts = response.candidates?.[0]?.content?.parts ?? []
       for (const part of parts as any[]) { if (part?.text) { const replaced = await replaceDataUrlImagesWithUploads(part.text as string); text += replaced.text }; const inline = part?.inlineData; if (inline?.data) { const mime = inline.mimeType || 'image/png'; const buffer = Buffer.from(inline.data as string, 'base64'); const ext = mime.split('/')[1] || 'png'; const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`; await fs.writeFile(path.join(UPLOAD_DIR, filename), buffer); text += `${text ? '\n\n' : ''}![Generated Image](/uploads/${filename})` } }
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
@@ -564,14 +539,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
     // ② OpenAI
     const api = await initApi(key, { model, maxContextCount, temperature, top_p, content, abortSignal: abort.signal, systemMessage, lastMessageId: lastContext.parentMessageId, isImageModel: isImage })
-    let text = searchProcessLog; // 初始化文本包含搜索日志
+    let text = searchProcessLog; // ✅ Keep log
     let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
     if (isImage) {
       const response = api as any; const choice = response.choices[0]; let rawContent = choice.message?.content || ''; modelRes = response.model; usageRes = response.usage
       if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) text += `![Generated Image](${rawContent})`; else text += rawContent
       processCb?.({ id: customMessageId, text, role: choice.message.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: { choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }], created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage } as any })
     } else {
-      // Stream 处理：chunks 逐渐追加到 text (已经包含 searchProcessLog)
       for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { 
           text += chunk.choices[0]?.delta.content ?? ''; 
           chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage; 
