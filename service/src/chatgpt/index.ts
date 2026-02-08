@@ -214,7 +214,9 @@ async function runIterativeWebSearch(params: {
   let currentContextSummary: string | null = null
 
   for (let i = 0; i < maxRounds; i++) {
-    onProgress?.(`🔍 搜索规划中（第 ${i + 1}/${maxRounds} 轮）...`)
+    // 状态更新：开始分析
+    const stepLabel = `⏳ 第 ${i + 1}/${maxRounds} 轮规划`;
+    onProgress?.(`${stepLabel}：正在分析用户意图与上下文...`)
     
     let plan: SearchPlan | null = null
     for (const m of plannerModels) {
@@ -235,7 +237,10 @@ async function runIterativeWebSearch(params: {
       } 
     }
     
-    if (!plan) { onProgress?.('✅ 搜索规划完成（无需搜索）'); break }
+    if (!plan) { 
+        onProgress?.('❌ 规划模型未返回有效计划，流程结束。'); 
+        break 
+    }
 
     // 更新总结
     if (plan.context_summary && typeof plan.context_summary === 'string') {
@@ -248,34 +253,45 @@ async function runIterativeWebSearch(params: {
       plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
     }
 
-    // ✅ 如果第一轮就 decide stop，说明不需要搜
+    const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
+
+    // ✅ 如果第一轮 decide stop，说明不需要搜
     if (plan.action !== 'search') { 
-        if (i === 0) onProgress?.(`✅ 模型判断无需搜索：${plan.reason || '常识/闲聊/已有信息已足够'}`)
-        else onProgress?.(`✅ 搜索完成：${plan.reason || '信息已足够'}`)
+        if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
+        else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
         break
     }
     
     const q = String(plan.query || '').trim()
-    if (!q) break; if (usedQueries.has(q)) { onProgress?.('⚠️ 关键词重复，停止搜索'); break }; usedQueries.add(q)
+    if (!q) break; 
     
-    onProgress?.(`🌐 正在搜索：「${q}」...`)
+    if (usedQueries.has(q)) { 
+        onProgress?.(`⚠️ 关键词「${q}」已使用过，跳过重复搜索...`); 
+        break 
+    }; 
+    usedQueries.add(q)
+    
+    // 状态更新：开始搜索
+    onProgress?.(`🔍 决定搜索：「${q}」\n   🧠 ${reasonText}`)
+    
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
-      rounds.push({ query: q, items }); onProgress?.(`📄 第 ${i + 1} 轮搜索完成，获得 ${items.length} 条结果`)
+      rounds.push({ query: q, items }); 
+      
+      // 状态更新：搜索返回
+      onProgress?.(`📄 搜索响应成功，获取到 ${items.length} 个页面，正在阅读内容...`)
     } catch (e: any) {
       const errMsg = e?.message ?? String(e)
       console.error(`[WebSearch][Round ${i + 1}] Search failed for query "${q}":`, errMsg)
       rounds.push({ query: q, items: [], note: errMsg })
-      onProgress?.(`❌ 搜索失败：${errMsg}`)
+      onProgress?.(`❌ 搜索请求失败：${errMsg}`)
       break
     }
   }
   
-  if (!rounds.length) {
-      // 这里的文案已在上面处理（如果 i=0 break）
-  } else {
-      onProgress?.(`✅ 搜索全部完成，筛选出 ${selectedIds.size} 条高质量结果，正在生成回答...`)
+  if (rounds.length > 0) {
+      onProgress?.(`📚 搜索任务全部完成，从 ${rounds.reduce((a,b)=>a+(b.items?.length||0), 0)} 条记录中整理精华...`)
   }
   
   return { rounds, selectedIds }
@@ -409,6 +425,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     else { content = finalMessage }
   }
 
+  // 初始化一个变量来存储搜索过程的日志，确保在生成最终答案时，用户能看到之前发生了什么
+  let searchProcessLog = ''
+
   // ===== 联网搜索 =====
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
@@ -450,8 +469,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const progressMessages: string[] = []
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
+        const displayLog = progressMessages.join('\n')
+        // 实时推送到前端，让用户看到“思考中...”
         processCb?.({
-          id: customMessageId, text: progressMessages.join('\n'), role: 'assistant',
+          id: customMessageId, text: displayLog + '\n\n⏳ ...', role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
         })
       }
@@ -467,17 +488,31 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         fullContext: historyContext, date: currentDate
       })
 
+      // 保存日志供最终输出使用
+      if (progressMessages.length > 0) {
+        searchProcessLog = progressMessages.join('\n') + '\n\n---\n\n'
+      }
+
       // ✅ Filter results based on selectedIds, NO quantity limits
       const filteredRounds = rounds.map((r, rIdx) => ({
         query: r.query,
         note: r.note,
         items: r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
       })).filter(r => r.items.length > 0 || r.note)
-
-      onProgressLocal(`✅ 筛选筛选完成，保留 ${filteredRounds.reduce((s, r) => s + (r.items?.length ?? 0), 0)} 条高质量结果`)
-
+      
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
-      if (ctx) content = appendTextToMessageContent(content, ctx)
+      if (ctx) {
+        content = appendTextToMessageContent(content, ctx)
+        // 搜索结束，给一个信号
+        processCb?.({
+          id: customMessageId, 
+          text: searchProcessLog + '✅ 资料整理完毕，正在生成精彩回答...', 
+          role: 'assistant',
+          conversationId: lastContext?.conversationId, 
+          parentMessageId: lastContext?.parentMessageId, 
+          detail: undefined,
+        })
+      }
 
       if (API_DEBUG) {
         debugLog('====== [WebSearch Debug] ======')
@@ -486,7 +521,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         debugLog('====== [WebSearch Debug End] ======')
       }
     }
-    catch (e: any) { if (isAbortError(e, abort.signal)) throw e; globalThis.console.error('[WebSearch] failed:', e?.message ?? e) }
+    catch (e: any) { 
+       if (isAbortError(e, abort.signal)) throw e; 
+       globalThis.console.error('[WebSearch] failed:', e?.message ?? e);
+       // 搜索失败不阻断，只是记录错误
+       searchProcessLog += `\n❌ 联网搜索模块遇到问题：${e?.message ?? '未知错误'}\n\n---\n\n`
+       processCb?.({
+          id: customMessageId, text: searchProcessLog + '尝试使用已有知识回答...', role: 'assistant',
+          conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined
+       })
+    }
   }
 
   try {
@@ -508,7 +552,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const ai = new GoogleGenAI({ apiKey: key.key, ...(baseUrl ? { httpOptions: { baseUrl } } : {}) })
       const response = await abortablePromise(ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: inputParts }], config: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: '16:9', imageSize: '4K' }, ...(systemMessage ? { systemInstruction: systemMessage } as any : {}) } as any } as any), abort.signal)
       if (!response.candidates || response.candidates.length === 0) throw new Error('[Gemini] Empty candidates.')
-      let text = ''; const parts = response.candidates?.[0]?.content?.parts ?? []
+      let text = searchProcessLog; // 保留搜索日志
+      const parts = response.candidates?.[0]?.content?.parts ?? []
       for (const part of parts as any[]) { if (part?.text) { const replaced = await replaceDataUrlImagesWithUploads(part.text as string); text += replaced.text }; const inline = part?.inlineData; if (inline?.data) { const mime = inline.mimeType || 'image/png'; const buffer = Buffer.from(inline.data as string, 'base64'); const ext = mime.split('/')[1] || 'png'; const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`; await fs.writeFile(path.join(UPLOAD_DIR, filename), buffer); text += `${text ? '\n\n' : ''}![Generated Image](/uploads/${filename})` } }
       if (!text) text = '[Gemini] Success but no text/image parts returned.'
       processCb?.({ id: customMessageId, text, role: 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: undefined })
@@ -517,13 +562,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
     // ② OpenAI
     const api = await initApi(key, { model, maxContextCount, temperature, top_p, content, abortSignal: abort.signal, systemMessage, lastMessageId: lastContext.parentMessageId, isImageModel: isImage })
-    let text = ''; let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
+    let text = searchProcessLog; // 初始化文本包含搜索日志
+    let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
     if (isImage) {
       const response = api as any; const choice = response.choices[0]; let rawContent = choice.message?.content || ''; modelRes = response.model; usageRes = response.usage
-      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) text = `![Generated Image](${rawContent})`; else text = rawContent
+      if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) text += `![Generated Image](${rawContent})`; else text += rawContent
       processCb?.({ id: customMessageId, text, role: choice.message.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: { choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }], created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage } as any })
     } else {
-      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { text += chunk.choices[0]?.delta.content ?? ''; chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage; processCb?.({ ...chunk, id: customMessageId, text, role: chunk.choices[0]?.delta.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId }) }
+      // Stream 处理：chunks 逐渐追加到 text (已经包含 searchProcessLog)
+      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { 
+          text += chunk.choices[0]?.delta.content ?? ''; 
+          chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage; 
+          processCb?.({ ...chunk, id: customMessageId, text, role: chunk.choices[0]?.delta.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId }) 
+      }
     }
     return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext.conversationId, model: modelRes, text, id: chatIdRes, detail: { usage: usageRes && { ...usageRes, estimated: false } } } })
   } catch (error: any) {
