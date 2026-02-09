@@ -171,8 +171,17 @@ function safeParseJsonFromText(text: string): any | null {
 // ===== Planner timeout (dynamic schedule) + retry helpers =====
 class PlannerTimeoutError extends Error {
   public readonly code = 'PLANNER_TIMEOUT'
-  constructor(public readonly timeoutMs: number) {
-    super(`Planner request timeout after ${timeoutMs}ms`)
+  public readonly kind: string
+  public readonly original?: any
+  constructor(public readonly timeoutMs: number, opts?: { kind?: string; original?: any }) {
+    const kind = opts?.kind || 'timeout'
+    const original = opts?.original
+    const origMsg = original?.message ? String(original.message) : (original ? String(original) : '')
+    super(`Planner timeout (${kind}) after ${timeoutMs}ms${origMsg ? `: ${origMsg}` : ''}`)
+    this.name = 'PlannerTimeoutError'
+    this.kind = kind
+    this.original = original
+    try { (this as any).cause = original } catch { }
   }
 }
 
@@ -180,10 +189,70 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function oneLine(s: any, maxLen = 260): string {
+  const str = String(s ?? '').replace(/\s+/g, ' ').trim()
+  if (!str) return ''
+  return str.length > maxLen ? `${str.slice(0, maxLen)}...(len=${str.length})` : str
+}
+
+function getStatusCodeLike(e: any): number | undefined {
+  const raw = e?.statusCode ?? e?.status ?? e?.response?.status ?? e?.error?.status ?? e?.error?.statusCode
+  const n = typeof raw === 'number' ? raw : Number(raw)
+  return Number.isFinite(n) ? n : undefined
+}
+
+function getErrCodeLike(e: any): string | undefined {
+  const c = e?.code ?? e?.error?.code ?? e?.cause?.code
+  return c ? String(c) : undefined
+}
+
+function summarizeAnyError(e: any): string {
+  if (!e) return 'unknown'
+  const status = getStatusCodeLike(e)
+  const name = e?.name ? String(e.name) : undefined
+  const code = getErrCodeLike(e)
+  const msg = oneLine(e?.message ?? e)
+  const parts: string[] = []
+  if (status) parts.push(`status=${status}`)
+  if (name) parts.push(`name=${name}`)
+  if (code) parts.push(`code=${code}`)
+  if (msg) parts.push(`msg=${msg}`)
+  return parts.join(', ') || oneLine(e)
+}
+
+function summarizePlannerTimeoutReason(e: any): string {
+  if (e instanceof PlannerTimeoutError) {
+    const orig = e.original ? summarizeAnyError(e.original) : ''
+    return [ `kind=${e.kind}`, `timeout=${Math.round(e.timeoutMs / 1000)}s`, orig ? `original={${orig}}` : '' ]
+      .filter(Boolean)
+      .join(', ')
+  }
+  return summarizeAnyError(e)
+}
+
+function isLikelySdkOrNetworkTimeout(e: any): boolean {
+  const status = getStatusCodeLike(e)
+  if (status === 504) return true
+
+  const name = String(e?.name ?? '')
+  if (name === 'APIConnectionTimeoutError') return true
+
+  const code = String(getErrCodeLike(e) ?? '')
+  if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') return true
+
+  const msg = String(e?.message ?? '')
+  if (/timeout|timed out|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(msg)) return true
+
+  // 有些代理会在 message 写 504
+  if (/\b504\b/.test(msg)) return true
+
+  return false
+}
+
 /**
  * 单次请求：支持父 abort + 超时 abort
  * - parentSignal abort：立刻抛出（不视为 timeout，不重试）
- * - 超时：抛 PlannerTimeoutError
+ * - 超时/504/SDK timeout：抛 PlannerTimeoutError（进入重试）
  */
 async function openaiChatCreateWithTimeout<T>(params: {
   openai: OpenAI
@@ -217,11 +286,27 @@ async function openaiChatCreateWithTimeout<T>(params: {
 
     return await openai.chat.completions.create(request, { signal: ac.signal }) as T
   } catch (e: any) {
-    // 用户/上层 abort：不视为 timeout
+    // 用户/上层 abort：不视为 timeout（不重试）
     if (parentSignal?.aborted) throw e
 
-    // 我们触发的超时
-    if (didTimeout) throw new PlannerTimeoutError(timeoutMs)
+    // 1) 我们自己的计时器触发
+    if (didTimeout) {
+      throw new PlannerTimeoutError(timeoutMs, { kind: 'local_timer', original: e })
+    }
+
+    // 2) 504 / OpenAI SDK timeout / 网络超时：也当作 timeout 触发重试
+    if (isLikelySdkOrNetworkTimeout(e)) {
+      const status = getStatusCodeLike(e)
+      const code = getErrCodeLike(e)
+      const name = String(e?.name ?? '')
+
+      let kind = 'sdk_or_network_timeout'
+      if (status === 504) kind = 'gateway_504'
+      else if (name === 'APIConnectionTimeoutError') kind = 'sdk_timeout'
+      else if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') kind = `network_${code}`
+
+      throw new PlannerTimeoutError(timeoutMs, { kind, original: e })
+    }
 
     throw e
   } finally {
@@ -231,7 +316,7 @@ async function openaiChatCreateWithTimeout<T>(params: {
 }
 
 /**
- * 仅当“超时”时自动重试（动态递增超时）
+ * 仅当“超时类错误”时自动重试（动态递增超时）
  * timeoutsMs = [10s, 15s, 20s] => 最多 3 次尝试
  */
 async function openaiChatCreateWithTimeoutRetry<T>(params: {
@@ -244,6 +329,8 @@ async function openaiChatCreateWithTimeoutRetry<T>(params: {
     timeoutMs: number     // 当前这次请求的超时
     nextAttempt: number   // 即将进行的下一次请求序号
     nextTimeoutMs: number // 下一次请求的超时
+    reason: string        // 具体错误原因（已压缩为一行）
+    error: any
   }) => void
 }): Promise<T> {
   const { openai, request, parentSignal, onTimeoutRetry } = params
@@ -276,8 +363,9 @@ async function openaiChatCreateWithTimeoutRetry<T>(params: {
 
       const nextAttempt = attempt + 1
       const nextTimeoutMs = timeoutsMs[nextAttempt - 1]
+      const reason = summarizePlannerTimeoutReason(e)
 
-      onTimeoutRetry?.({ attempt, timeoutMs, nextAttempt, nextTimeoutMs })
+      onTimeoutRetry?.({ attempt, timeoutMs, nextAttempt, nextTimeoutMs, reason, error: e })
 
       // 简单退避，避免立刻重打
       await sleep(250 * Math.pow(2, attempt - 1))
@@ -346,7 +434,7 @@ async function planNextSearchAction(params: {
 
   // NEW: dynamic timeout schedule
   timeoutScheduleMs?: number[] // default [10_000, 15_000, 20_000]
-  onTimeoutRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number }) => void
+  onTimeoutRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number; reason: string; error: any }) => void
 }): Promise<SearchPlan> {
   const {
     openai,
@@ -369,7 +457,7 @@ async function planNextSearchAction(params: {
     '',
     '任务：',
     '1. 首先判断是否需要联网搜索。**这是最重要的决策。**',
-    '2. 评估"已进行的搜索与结果"，选出对回答问题有价值的条目ID (格式如 "1.1", "2.3")。',
+    '2. 评估"已进行的搜索与结果"，选出对回答用户问题有价值的条目ID (格式如 "1.1", "2.3")。',
     '',
     '【决策逻辑】',
     '- **必须搜索**：问题涉及近期新闻、特定事实查证（天气、股价等）、非常识性具体数据，且上下文中没有。',
@@ -486,12 +574,13 @@ async function runIterativeWebSearch(params: {
   const schedule = (plannerTimeoutScheduleMs && plannerTimeoutScheduleMs.length ? plannerTimeoutScheduleMs : [10_000, 15_000, 20_000])
 
   for (let i = 0; i < maxRounds; i++) {
-    // 修正：2. 第二轮及以后不再输出“正在规划”，静默处理，让用户只看到上一轮的“正在判断”
     if (i === 0) {
       onProgress?.(`⏳ 正在分析用户意图，规划搜索策略...`)
     }
 
     let plan: SearchPlan | null = null
+    let lastPlanError: any = null
+
     for (const m of plannerModels) {
       try {
         plan = await planNextSearchAction({
@@ -504,21 +593,24 @@ async function runIterativeWebSearch(params: {
           priorContextSummary: currentContextSummary,
           date,
           timeoutScheduleMs: schedule,
-          onTimeoutRetry: ({ attempt, timeoutMs, nextAttempt, nextTimeoutMs }) => {
+          onTimeoutRetry: ({ attempt, timeoutMs, nextAttempt, nextTimeoutMs, reason }) => {
             onProgress?.(
-              `⚠️ 规划器第 ${attempt} 次请求超时（>${Math.round(timeoutMs / 1000)}s），` +
-              `正在重试第 ${nextAttempt} 次（超时=${Math.round(nextTimeoutMs / 1000)}s）...`
+              `⚠️ 规划器第 ${attempt} 次请求异常/超时（>${Math.round(timeoutMs / 1000)}s），` +
+              `正在重试第 ${nextAttempt} 次（超时=${Math.round(nextTimeoutMs / 1000)}s）...\n` +
+              `   原因：${reason}`
             )
           },
         })
         break
       } catch (e) {
+        lastPlanError = e
         if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e)
       }
     }
 
     if (!plan) {
-      onProgress?.('❌ 规划服务暂时不可用，流程结束。')
+      const reason = lastPlanError ? summarizeAnyError(lastPlanError instanceof PlannerTimeoutError ? lastPlanError.original ?? lastPlanError : lastPlanError) : ''
+      onProgress?.(`❌ 规划服务暂时不可用，流程结束。${reason ? `\n   原因：${reason}` : ''}`)
       break
     }
 
@@ -529,7 +621,6 @@ async function runIterativeWebSearch(params: {
 
     if (plan.action !== 'search') {
       if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
-      // 修正：直接显示完毕，不带任何“正在执行”的后缀(由onProgressLocal控制)
       else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
       break
     }
@@ -548,9 +639,8 @@ async function runIterativeWebSearch(params: {
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
-      rounds.push({ query: q, items });
+      rounds.push({ query: q, items })
 
-      // 修正：1. 修改文案，提示用户系统正在思考下一步
       onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
     } catch (e: any) {
       const errMsg = e?.message ?? String(e)
@@ -561,7 +651,6 @@ async function runIterativeWebSearch(params: {
     }
   }
 
-  // 修正：3. 移除末尾日志，让 ChatReplyProcess 的“正在生成”直接衔接
   return { rounds, selectedIds }
 }
 
@@ -740,7 +829,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
 
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
-      const plannerOpenai = new OpenAI({ baseURL: PLANNER_BASE_URL, apiKey: plannerKey.key, maxRetries: 0, timeout: globalConfig.timeoutMs })
 
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
@@ -767,6 +855,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerTimeoutScheduleMs =
         parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS)
         ?? [10_000, 15_000, 20_000]
+
+      // 注意：为了避免 OpenAI SDK 自身 timeout 抢先触发，确保 client timeout >= 最大 schedule
+      const plannerClientTimeout = Math.max(
+        Number(globalConfig.timeoutMs ?? 0),
+        Math.max(...plannerTimeoutScheduleMs) + 2000,
+      )
+
+      const plannerOpenai = new OpenAI({
+        baseURL: PLANNER_BASE_URL,
+        apiKey: plannerKey.key,
+        maxRetries: 0,
+        timeout: plannerClientTimeout,
+      })
 
       const { rounds, selectedIds } = await runIterativeWebSearch({
         openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
@@ -968,7 +1069,7 @@ async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: st
   }
 
   const picked = await randomKeyConfig(keys)
-  if (API_DEBUG) { debugLog('====== [Key Pick Debug] ======'); debugLog('[chatModel]', chatModel, '[tokens]', tokenCount, '[accountId]', accountId ?? '(none)'); debugLog('[candidateKeyCount]', keys.length); debugLog('[picked]', picked ? { keyModel: picked.keyModel, baseUrl: picked.baseUrl, remark: picked.remark } : '(null)'); debugLog('====== [Key Pick Debug End] ======') }
+  if (API_DEBUG) { debugLog('====== [Key Pick Debug] ======'); debugLog('[chatModel]', chatModel, '[tokens]', tokenCount, '[accountId]', accountId ?? '(none)'); debugLog('[candidateKeyCount]', keys.length); debugLog('[picked]', picked ? { keyModel: picked.keyModel, baseUrl: picked.baseUrl, remark: picked.remark } : '(null)' ); debugLog('====== [Key Pick Debug End] ======') }
   return picked ?? undefined
 }
 
