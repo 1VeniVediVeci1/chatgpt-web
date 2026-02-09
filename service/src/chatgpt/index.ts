@@ -644,7 +644,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         abortSignal: abort.signal, 
         systemMessage: null, // systemMessage is already in messages
         lastMessageId: null, // history is already in messages
-        isImageModel 
+        isImageModel: isImage 
     })
     
     let text = searchProcessLog; 
