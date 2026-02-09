@@ -31,46 +31,32 @@ const show = ref(false)
 const handleSaving = ref(false)
 const keyConfig = ref(new KeyConfig('', 'ChatGPTAPI', [], [], ''))
 
-// ===== 新增解析相关变量与函数 =====
-const editingRawRemark = ref('')
+// 只保留 Token Policy（不再提供备注栏）
 const editingMaxTokens = ref<number | null>(null)
 const editingMinTokens = ref<number | null>(null)
 
-// 修复点：正则需要把外层的 [] 或 () 一起匹配掉，否则 replace 后会残留 "[]"
-const STRATEGY_REGEX = {
-  max: new RegExp('[\$$\$]?\\s*MAX_TOKENS?\\s*[:=]\\s*(\\d+)\\s*[\$$\$]?', 'i'),
-  min: new RegExp('[\$$\$]?\\s*MIN_TOKENS?\\s*[:=]\\s*(\\d+)\\s*[\$$\$]?', 'i'),
+const TOKEN_POLICY_REGEX = {
+  max: new RegExp('MAX_TOKENS?\\s*[:=]\\s*(\\d+)', 'i'),
+  min: new RegExp('MIN_TOKENS?\\s*[:=]\\s*(\\d+)', 'i'),
 }
 
-function parseRemark(remark: string) {
-  let clean = remark || ''
-  let max: number | null = null
-  let min: number | null = null
-
-  const maxMatch = clean.match(STRATEGY_REGEX.max)
-  if (maxMatch) {
-    max = Number.parseInt(maxMatch[1], 10)
-    // 用正则替换，确保把 [] 或 () 一起删掉
-    clean = clean.replace(STRATEGY_REGEX.max, '')
+function parseTokenPolicy(remark: string) {
+  const r = remark || ''
+  const max = r.match(TOKEN_POLICY_REGEX.max)?.[1]
+  const min = r.match(TOKEN_POLICY_REGEX.min)?.[1]
+  return {
+    max: max ? Number.parseInt(max, 10) : null,
+    min: min ? Number.parseInt(min, 10) : null,
   }
-
-  const minMatch = clean.match(STRATEGY_REGEX.min)
-  if (minMatch) {
-    min = Number.parseInt(minMatch[1], 10)
-    clean = clean.replace(STRATEGY_REGEX.min, '')
-  }
-
-  clean = clean.replace(/\s+/g, ' ').trim()
-  return { clean, max, min }
 }
 
-function buildRemark(raw: string, max: number | null, min: number | null) {
-  const parts: string[] = [raw.trim()]
+// 注意：这里会把 remark 覆盖成仅用于策略存储的内容（不再保存“备注文本”）
+function buildTokenPolicy(max: number | null, min: number | null) {
+  const parts: string[] = []
   if (max !== null) parts.push(`[MAX_TOKENS:${max}]`)
   if (min !== null) parts.push(`[MIN_TOKENS:${min}]`)
-  return parts.filter(Boolean).join(' ')
+  return parts.join(' ')
 }
-// =================================
 
 const keys = ref<any[]>([])
 
@@ -132,14 +118,12 @@ function createColumns(): DataTableColumns {
       },
     },
     {
-      title: 'Remark / Strategy',
-      key: 'remark',
-      width: 200,
+      title: 'Token Policy',
+      key: 'tokenPolicy',
+      width: 220,
       render(row: any) {
-        const { clean, max, min } = parseRemark(row.remark)
+        const { max, min } = parseTokenPolicy(row.remark)
         const nodes: any[] = []
-
-        if (clean) nodes.push(h('span', { style: { marginRight: '6px' } }, clean))
 
         if (max !== null) {
           nodes.push(
@@ -150,14 +134,13 @@ function createColumns(): DataTableColumns {
             ),
           )
         }
-
         if (min !== null) {
           nodes.push(
             h(NTag, { type: 'error', bordered: false, size: 'small' }, { default: () => `> ${min} Tokens` }),
           )
         }
 
-        return nodes
+        return nodes.length ? nodes : h('span', '-', {})
       },
     },
     {
@@ -229,10 +212,9 @@ async function handleGetKeys(page: number) {
 
   const size = pagination.pageSize
   const data = (await fetchGetKeys(page, size)).data
-
   data.keys.forEach((key: any) => keys.value.push(key))
-  keyConfig.value = keys.value[0]
 
+  keyConfig.value = keys.value[0]
   pagination.page = page
   pagination.pageCount = data.total / size + (data.total % size === 0 ? 0 : 1)
   pagination.itemCount = data.total
@@ -260,8 +242,8 @@ async function handleUpdateKeyConfig() {
     return
   }
 
-  // 保存时合并 remark + token policy
-  keyConfig.value.remark = buildRemark(editingRawRemark.value, editingMaxTokens.value, editingMinTokens.value)
+  // remark 字段仅用于存储 Token Policy（备注栏已移除）
+  keyConfig.value.remark = buildTokenPolicy(editingMaxTokens.value, editingMinTokens.value)
 
   handleSaving.value = true
   try {
@@ -276,7 +258,6 @@ async function handleUpdateKeyConfig() {
 
 function handleNewKey() {
   keyConfig.value = new KeyConfig('', 'ChatGPTAPI', [], [], '')
-  editingRawRemark.value = ''
   editingMaxTokens.value = null
   editingMinTokens.value = null
   show.value = true
@@ -284,8 +265,7 @@ function handleNewKey() {
 
 function handleEditKey(key: KeyConfig) {
   keyConfig.value = { ...key }
-  const { clean, max, min } = parseRemark((key as any).remark)
-  editingRawRemark.value = clean
+  const { max, min } = parseTokenPolicy((key as any).remark)
   editingMaxTokens.value = max
   editingMinTokens.value = min
   show.value = true
@@ -343,7 +323,12 @@ onMounted(async () => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.api') }}</span>
           <div class="flex-1">
-            <NInput v-model:value="keyConfig.key" type="textarea" :autosize="{ minRows: 3, maxRows: 4 }" placeholder="" />
+            <NInput
+              v-model:value="keyConfig.key"
+              type="textarea"
+              :autosize="{ minRows: 3, maxRows: 4 }"
+              placeholder=""
+            />
           </div>
         </div>
 
@@ -370,7 +355,13 @@ onMounted(async () => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.userRoles') }}</span>
           <div class="flex-1">
-            <NSelect style="width: 100%" multiple :value="keyConfig.userRoles" :options="userRoleOptions" @update-value="value => keyConfig.userRoles = value" />
+            <NSelect
+              style="width: 100%"
+              multiple
+              :value="keyConfig.userRoles"
+              :options="userRoleOptions"
+              @update-value="value => keyConfig.userRoles = value"
+            />
           </div>
         </div>
 
@@ -388,7 +379,6 @@ onMounted(async () => {
                 Max Input Tokens (Use this key if tokens ≤ val)
               </NTooltip>
             </div>
-
             <div class="flex-1">
               <NTooltip trigger="hover">
                 <template #trigger>
@@ -399,13 +389,6 @@ onMounted(async () => {
                 Min Input Tokens (Use this key if tokens &gt; val)
               </NTooltip>
             </div>
-          </div>
-        </div>
-
-        <div class="flex items-center space-x-4">
-          <span class="flex-shrink-0 w-[100px]">{{ $t('setting.remark') }}</span>
-          <div class="flex-1">
-            <NInput v-model:value="editingRawRemark" type="textarea" :autosize="{ minRows: 1, maxRows: 2 }" placeholder="Visible remark" />
           </div>
         </div>
 
