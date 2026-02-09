@@ -87,34 +87,34 @@ async function loadContextMessages(params: {
 }): Promise<OpenAI.ChatCompletionMessageParam[]> {
   const { maxContextCount, systemMessage, content } = params
   let { lastMessageId } = params
-  
+
   const messages: OpenAI.ChatCompletionMessageParam[] = []
-  
+
   // 1. 获取历史消息
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
     if (!message) break
-    
+
     let safeContent = message.text as string
     if (typeof safeContent === 'string') {
-        safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
+      safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
     }
-    
+
     messages.push({ role: message.role as any, content: safeContent })
     lastMessageId = message.parentMessageId
   }
-  
+
   // 2. 添加系统提示词
   if (systemMessage) {
     messages.push({ role: 'system', content: systemMessage })
   }
-  
+
   // 3. 翻转并添加当前用户消息
   messages.reverse()
   // 注意：OpenAI SDK 类型定义对于 content 比较严格，这里使用 as any 简化兼容 Text/Image 混合内容
   messages.push({ role: 'user', content: content as any })
-  
+
   return messages
 }
 
@@ -131,19 +131,19 @@ function estimateTokenCount(messages: OpenAI.ChatCompletionMessageParam[]): numb
       }
       return ''
     }).join('\n')
-    
+
     // 使用 gpt-3.5-turbo 作为基准 tokenizer
     const count = textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
-    
+
     // 如果计算出 0 但文本不为空，说明可能计算失败，降级到字符粗估
     if (count === 0 && allText.length > 0) {
-        return Math.ceil(allText.length / 3) 
+      return Math.ceil(allText.length / 3)
     }
     return count
   } catch (e) {
     // 降级策略: 字符数 / 4
     if (allText && allText.length > 0) {
-        return Math.ceil(allText.length / 4)
+      return Math.ceil(allText.length / 4)
     }
     return 0
   }
@@ -167,6 +167,142 @@ function safeParseJsonFromText(text: string): any | null {
   if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)) } catch { } }
   return null
 }
+
+// ===== Planner timeout (dynamic schedule) + retry helpers =====
+class PlannerTimeoutError extends Error {
+  public readonly code = 'PLANNER_TIMEOUT'
+  constructor(public readonly timeoutMs: number) {
+    super(`Planner request timeout after ${timeoutMs}ms`)
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * 单次请求：支持父 abort + 超时 abort
+ * - parentSignal abort：立刻抛出（不视为 timeout，不重试）
+ * - 超时：抛 PlannerTimeoutError
+ */
+async function openaiChatCreateWithTimeout<T>(params: {
+  openai: OpenAI
+  request: any
+  timeoutMs: number
+  parentSignal?: AbortSignal
+}): Promise<T> {
+  const { openai, request, timeoutMs, parentSignal } = params
+
+  const ac = new AbortController()
+  let didTimeout = false
+  let timer: any
+
+  const onParentAbort = () => {
+    try { ac.abort() } catch { }
+  }
+
+  try {
+    if (parentSignal) {
+      if (parentSignal.aborted) {
+        ac.abort()
+      } else {
+        parentSignal.addEventListener('abort', onParentAbort, { once: true })
+      }
+    }
+
+    timer = setTimeout(() => {
+      didTimeout = true
+      try { ac.abort() } catch { }
+    }, timeoutMs)
+
+    return await openai.chat.completions.create(request, { signal: ac.signal }) as T
+  } catch (e: any) {
+    // 用户/上层 abort：不视为 timeout
+    if (parentSignal?.aborted) throw e
+
+    // 我们触发的超时
+    if (didTimeout) throw new PlannerTimeoutError(timeoutMs)
+
+    throw e
+  } finally {
+    clearTimeout(timer)
+    parentSignal?.removeEventListener?.('abort', onParentAbort as any)
+  }
+}
+
+/**
+ * 仅当“超时”时自动重试（动态递增超时）
+ * timeoutsMs = [10s, 15s, 20s] => 最多 3 次尝试
+ */
+async function openaiChatCreateWithTimeoutRetry<T>(params: {
+  openai: OpenAI
+  request: any
+  timeoutsMs?: number[] // e.g. [10000,15000,20000]
+  parentSignal?: AbortSignal
+  onTimeoutRetry?: (info: {
+    attempt: number       // 当前是第几次请求（从1开始）
+    timeoutMs: number     // 当前这次请求的超时
+    nextAttempt: number   // 即将进行的下一次请求序号
+    nextTimeoutMs: number // 下一次请求的超时
+  }) => void
+}): Promise<T> {
+  const { openai, request, parentSignal, onTimeoutRetry } = params
+
+  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [10_000, 15_000, 20_000])
+    .map(n => Number(n))
+    .filter(n => Number.isFinite(n) && n > 0)
+
+  const timeoutsMs = timeoutsMsRaw.length ? timeoutsMsRaw : [20_000]
+  const totalAttempts = timeoutsMs.length
+
+  let lastErr: any
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    const timeoutMs = timeoutsMs[attempt - 1]
+
+    try {
+      return await openaiChatCreateWithTimeout<T>({
+        openai,
+        request,
+        timeoutMs,
+        parentSignal,
+      })
+    } catch (e: any) {
+      lastErr = e
+
+      const isTimeout = e?.code === 'PLANNER_TIMEOUT' || e instanceof PlannerTimeoutError
+      if (!isTimeout) throw e
+      if (attempt >= totalAttempts) throw e
+
+      const nextAttempt = attempt + 1
+      const nextTimeoutMs = timeoutsMs[nextAttempt - 1]
+
+      onTimeoutRetry?.({ attempt, timeoutMs, nextAttempt, nextTimeoutMs })
+
+      // 简单退避，避免立刻重打
+      await sleep(250 * Math.pow(2, attempt - 1))
+    }
+  }
+
+  throw lastErr
+}
+
+// 可选：解析 "10,15,20" / "10000,15000,20000" => ms
+function parseTimeoutScheduleToMs(input: any): number[] | null {
+  if (!input) return null
+  const s = String(input).trim()
+  if (!s) return null
+  const parts = s.split(/[,，]/).map(x => x.trim()).filter(Boolean)
+  const nums = parts.map(p => Number(p)).filter(n => Number.isFinite(n) && n > 0)
+  if (!nums.length) return null
+
+  // 如果看起来像秒（<= 300），转成 ms
+  const allLooksLikeSeconds = nums.every(n => n <= 300)
+  const out = allLooksLikeSeconds ? nums.map(n => Math.round(n * 1000)) : nums.map(n => Math.round(n))
+
+  return out.filter(n => n > 0)
+}
+// ===== Planner timeout (dynamic schedule) + retry helpers end =====
 
 async function buildConversationContext(lastMessageId: string | undefined, maxCount: number): Promise<string> {
   if (!lastMessageId) return ''
@@ -207,9 +343,25 @@ async function planNextSearchAction(params: {
   priorContextSummary: string | null
   date: string
   abortSignal?: AbortSignal
+
+  // NEW: dynamic timeout schedule
+  timeoutScheduleMs?: number[] // default [10_000, 15_000, 20_000]
+  onTimeoutRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number }) => void
 }): Promise<SearchPlan> {
-  const { openai, model, userQuestion, rounds, fullContext, priorContextSummary, date, abortSignal } = params
-  const isFirstRound = !priorContextSummary 
+  const {
+    openai,
+    model,
+    userQuestion,
+    rounds,
+    fullContext,
+    priorContextSummary,
+    date,
+    abortSignal,
+    timeoutScheduleMs,
+    onTimeoutRetry,
+  } = params
+
+  const isFirstRound = !priorContextSummary
   const plannerSystem = [
     '你是"联网搜索规划器 & 结果筛选器"。你的任务是协助回答用户问题。',
     '',
@@ -259,12 +411,42 @@ async function planNextSearchAction(params: {
     '现在请决定：selected_ids 是哪些？是否需要继续搜索？' + (isFirstRound ? ' 记得生成 context_summary。' : '')
   ].join('\n')
 
+  const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [10_000, 15_000, 20_000])
+
   try {
-    const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }], response_format: { type: 'json_object' } as any, stream: false } as any, { signal: abortSignal })
+    const resp = await openaiChatCreateWithTimeoutRetry<any>({
+      openai,
+      request: {
+        model,
+        temperature: 0,
+        messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }],
+        response_format: { type: 'json_object' } as any,
+        stream: false
+      } as any,
+      timeoutsMs: schedule,
+      parentSignal: abortSignal,
+      onTimeoutRetry,
+    })
+
     const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
     return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed' }
-  } catch {
-    const resp = await openai.chat.completions.create({ model, temperature: 0, messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` }], stream: false } as any, { signal: abortSignal })
+  } catch (e: any) {
+    // 如果已经是“超时重试后仍失败”，不要再跑 fallback（避免总时长翻倍）
+    if (e?.code === 'PLANNER_TIMEOUT' || e instanceof PlannerTimeoutError) throw e
+
+    const resp = await openaiChatCreateWithTimeoutRetry<any>({
+      openai,
+      request: {
+        model,
+        temperature: 0,
+        messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` }],
+        stream: false
+      } as any,
+      timeoutsMs: schedule,
+      parentSignal: abortSignal,
+      onTimeoutRetry,
+    })
+
     const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
     return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed' }
   }
@@ -275,72 +457,99 @@ async function runIterativeWebSearch(params: {
   abortSignal?: AbortSignal; provider?: 'searxng' | 'tavily'; searxngApiUrl?: string; tavilyApiKey?: string
   onProgress?: (status: string) => void
   fullContext: string; date: string
+
+  // NEW:
+  plannerTimeoutScheduleMs?: number[] // default [10_000, 15_000, 20_000]
 }): Promise<{ rounds: SearchRound[]; selectedIds: Set<string> }> {
-  const { openai, plannerModels, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress, fullContext, date } = params
+  const {
+    openai,
+    plannerModels,
+    userQuestion,
+    maxRounds,
+    maxResults,
+    abortSignal,
+    provider,
+    searxngApiUrl,
+    tavilyApiKey,
+    onProgress,
+    fullContext,
+    date,
+    plannerTimeoutScheduleMs
+  } = params
+
   const rounds: SearchRound[] = []
   const usedQueries = new Set<string>()
   const selectedIds = new Set<string>()
-  
+
   let currentContextSummary: string | null = null
+
+  const schedule = (plannerTimeoutScheduleMs && plannerTimeoutScheduleMs.length ? plannerTimeoutScheduleMs : [10_000, 15_000, 20_000])
 
   for (let i = 0; i < maxRounds; i++) {
     // 修正：2. 第二轮及以后不再输出“正在规划”，静默处理，让用户只看到上一轮的“正在判断”
     if (i === 0) {
       onProgress?.(`⏳ 正在分析用户意图，规划搜索策略...`)
     }
-    
+
     let plan: SearchPlan | null = null
     for (const m of plannerModels) {
       try {
-        plan = await planNextSearchAction({ 
-          openai, 
-          model: m, 
-          userQuestion, 
-          rounds, 
-          abortSignal, 
-          fullContext, 
-          priorContextSummary: currentContextSummary, 
-          date 
+        plan = await planNextSearchAction({
+          openai,
+          model: m,
+          userQuestion,
+          rounds,
+          abortSignal,
+          fullContext,
+          priorContextSummary: currentContextSummary,
+          date,
+          timeoutScheduleMs: schedule,
+          onTimeoutRetry: ({ attempt, timeoutMs, nextAttempt, nextTimeoutMs }) => {
+            onProgress?.(
+              `⚠️ 规划器第 ${attempt} 次请求超时（>${Math.round(timeoutMs / 1000)}s），` +
+              `正在重试第 ${nextAttempt} 次（超时=${Math.round(nextTimeoutMs / 1000)}s）...`
+            )
+          },
         })
-        break 
+        break
       } catch (e) {
-        if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e) 
-      } 
+        if (API_DEBUG) debugLog('[SearchPlanner] model failed:', m, (e as any)?.message ?? e)
+      }
     }
-    
-    if (!plan) { 
-        onProgress?.('❌ 规划服务暂时不可用，流程结束。'); 
-        break 
+
+    if (!plan) {
+      onProgress?.('❌ 规划服务暂时不可用，流程结束。')
+      break
     }
 
     if (plan.context_summary && typeof plan.context_summary === 'string') currentContextSummary = plan.context_summary
     if (Array.isArray(plan.selected_ids)) plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
-    
+
     const reasonText = plan.reason ? `(理由: ${plan.reason})` : ''
 
-    if (plan.action !== 'search') { 
-        if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
-        // 修正：直接显示完毕，不带任何“正在执行”的后缀(由onProgressLocal控制)
-        else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
-        break
+    if (plan.action !== 'search') {
+      if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
+      // 修正：直接显示完毕，不带任何“正在执行”的后缀(由onProgressLocal控制)
+      else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
+      break
     }
-    
+
     const q = String(plan.query || '').trim()
-    if (!q) break; 
-    
-    if (usedQueries.has(q)) { 
-        onProgress?.(`⚠️ 关键词「${q}」已使用过，跳过重复搜索...`); 
-        break 
-    }; 
+    if (!q) break
+
+    if (usedQueries.has(q)) {
+      onProgress?.(`⚠️ 关键词「${q}」已使用过，跳过重复搜索...`)
+      break
+    };
     usedQueries.add(q)
-    
+
     onProgress?.(`🔍 正在搜索：「${q}」\n   🧠 ${reasonText}`)
-    
+
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
-      rounds.push({ query: q, items }); 
-      
+      rounds.push({ query: q, items });
+
       // 修正：1. 修改文案，提示用户系统正在思考下一步
       onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
     } catch (e: any) {
@@ -351,7 +560,7 @@ async function runIterativeWebSearch(params: {
       break
     }
   }
-  
+
   // 修正：3. 移除末尾日志，让 ChatReplyProcess 的“正在生成”直接衔接
   return { rounds, selectedIds }
 }
@@ -361,7 +570,7 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
   let n = 0; const lines: string[] = []; const refLines: string[] = []
   lines.push('【联网搜索结果（已筛选）】')
   rounds.forEach((r, idx) => {
-    if (!r.items?.length) return 
+    if (!r.items?.length) return
     lines.push(`（相关来源：${r.query}）`)
     for (const it of r.items) {
       n++
@@ -372,7 +581,7 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
       refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`)
     }
   })
-  if (n === 0) return '' 
+  if (n === 0) return ''
 
   lines.push('')
   lines.push('【参考来源列表】')
@@ -444,23 +653,23 @@ export async function initApi(key: KeyConfig, { model, messages, temperature, to
   const config = await getCacheConfig()
   const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
   const openai = new OpenAI({ baseURL: OPENAI_API_BASE_URL, apiKey: key.key, maxRetries: 0, timeout: config.timeoutMs })
-  
+
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
   const finalTemperature = modelConfig.defaultTemperature ?? temperature
   const shouldUseTopP = modelConfig.supportTopP
 
   // Note: messages 现已由外部传入，不再在函数内查询 DB
-  
+
   const enableStream = !isImageModel
-  const options: OpenAI.ChatCompletionCreateParams = { 
-    model, 
-    stream: enableStream, 
-    stream_options: enableStream ? { include_usage: true } : undefined, 
-    messages 
+  const options: OpenAI.ChatCompletionCreateParams = {
+    model,
+    stream: enableStream,
+    stream_options: enableStream ? { include_usage: true } : undefined,
+    messages
   }
   options.temperature = finalTemperature
   if (shouldUseTopP) options.top_p = top_p
-  
+
   try { const siteCfg = config.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') (options as any).reasoning_effort = reasoningEffort } catch (e) { globalThis.console.error('[OpenAI] set reasoning_effort failed:', e) }
 
   if (API_DEBUG) { debugLog('====== [OpenAI Request Debug] ======'); debugLog('[baseURL]', OPENAI_API_BASE_URL); debugLog('[model]', model); debugLog('[messagesSummary]', safeJson(summarizeOpenAIMessages(messages))); debugLog('====== [OpenAI Request Debug End] ======') }
@@ -475,13 +684,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const userId = options.user._id.toString(); const messageId = options.messageId; const roomId = options.room.roomId; const abort = new AbortController(); const customMessageId = generateMessageId(); const threadKey = makeThreadKey(userId, roomId)
   const existingIdx = processThreads.findIndex(t => t.key === threadKey); if (existingIdx > -1) { processThreads[existingIdx].abort.abort(); processThreads.splice(existingIdx, 1) }
   processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
-  
-  await ensureUploadDir(); 
-  const model = options.room.chatModel; 
+
+  await ensureUploadDir();
+  const model = options.room.chatModel;
   const maxContextCount = options.user.advanced.maxContextCount ?? 20
-  
+
   updateRoomChatModel(userId, options.room.roomId, model)
-  
+
   const { message, uploadFileKeys, lastContext, process: processCb, systemMessage, temperature, top_p } = options
   processCb?.({ id: customMessageId, text: '', role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
 
@@ -508,14 +717,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       // 计算初步 Token 以获取 Planner Key
       const preContext = await loadContextMessages({ maxContextCount, lastMessageId: lastContext?.parentMessageId, systemMessage, content })
       const preTokens = estimateTokenCount(preContext)
-      
+
       const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
 
       // 获取 Planner Key (传入 token数)
       let plannerKey = await getRandomApiKey(options.user, model, options.room.accountId, preTokens)
-      
+
       if (!plannerKey) throw new Error('没有对应的 apikeys 配置 (Planner)')
 
       let actualPlannerModel = plannerModelName
@@ -532,7 +741,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
       const plannerOpenai = new OpenAI({ baseURL: PLANNER_BASE_URL, apiKey: plannerKey.key, maxRetries: 0, timeout: globalConfig.timeoutMs })
-      
+
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
       const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
@@ -545,7 +754,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         progressMessages.push(status)
         const displayLog = progressMessages.join('\n')
         const isFinishing = status.includes('完毕') || status.includes('无需');
-        const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...' 
+        const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...'
         processCb?.({
           id: customMessageId, text: displayLog + suffix, role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
@@ -555,11 +764,16 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const historyContextStr = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
 
+      const plannerTimeoutScheduleMs =
+        parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS)
+        ?? [10_000, 15_000, 20_000]
+
       const { rounds, selectedIds } = await runIterativeWebSearch({
         openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
         abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
         onProgress: onProgressLocal,
-        fullContext: historyContextStr, date: currentDate
+        fullContext: historyContextStr, date: currentDate,
+        plannerTimeoutScheduleMs,
       })
 
       if (progressMessages.length > 0) {
@@ -571,51 +785,51 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         note: r.note,
         items: r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
       })).filter(r => r.items.length > 0 || r.note)
-      
+
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
-      
-      let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...' 
+
+      let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...'
       if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
 
       processCb?.({
-        id: customMessageId, 
-        text: searchProcessLog + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`, 
+        id: customMessageId,
+        text: searchProcessLog + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`,
         role: 'assistant',
-        conversationId: lastContext?.conversationId, 
-        parentMessageId: lastContext?.parentMessageId, 
+        conversationId: lastContext?.conversationId,
+        parentMessageId: lastContext?.parentMessageId,
         detail: undefined,
       })
 
       // 更新 context (追加入 context)
       if (ctx) content = appendTextToMessageContent(content, ctx)
 
-    } catch (e: any) { 
-       if (isAbortError(e, abort.signal)) throw e; 
-       globalThis.console.error('[WebSearch] failed:', e?.message ?? e);
-       searchProcessLog += `\n❌ 联网搜索模块遇到问题：${e?.message ?? '未知错误'}\n\n---\n\n`
-       processCb?.({
-          id: customMessageId, text: searchProcessLog + '尝试使用已有知识回答...', role: 'assistant',
-          conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined
-       })
+    } catch (e: any) {
+      if (isAbortError(e, abort.signal)) throw e;
+      globalThis.console.error('[WebSearch] failed:', e?.message ?? e);
+      searchProcessLog += `\n❌ 联网搜索模块遇到问题：${e?.message ?? '未知错误'}\n\n---\n\n`
+      processCb?.({
+        id: customMessageId, text: searchProcessLog + '尝试使用已有知识回答...', role: 'assistant',
+        conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined
+      })
     }
   }
 
   // 3. 准备最终生成
   const finalMessages = await loadContextMessages({
-      maxContextCount, 
-      lastMessageId: lastContext?.parentMessageId, 
-      systemMessage, 
-      content 
+    maxContextCount,
+    lastMessageId: lastContext?.parentMessageId,
+    systemMessage,
+    content
   })
-  
+
   // 4. 计算最终 Input Token
   const finalTokenCount = estimateTokenCount(finalMessages)
-  
+
   // 5. 根据 Token 选择生成的 Key
   const key = await getRandomApiKey(options.user, model, options.room.accountId, finalTokenCount)
-  if (!key) { 
-      const idx = processThreads.findIndex(d => d.key === threadKey); if (idx > -1) processThreads.splice(idx, 1); 
-      throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount})，请检查 Key 备注配置。`) 
+  if (!key) {
+    const idx = processThreads.findIndex(d => d.key === threadKey); if (idx > -1) processThreads.splice(idx, 1);
+    throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount})，请检查 Key 备注配置。`)
   }
 
   try {
@@ -646,29 +860,29 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
 
     // ② OpenAI
-    const api = await initApi(key, { 
-        model, 
-        messages: finalMessages, 
-        temperature, 
-        top_p, 
-        content: null, // content is already in messages
-        abortSignal: abort.signal, 
-        systemMessage: null, // systemMessage is already in messages
-        lastMessageId: null, // history is already in messages
-        isImageModel: isImage 
+    const api = await initApi(key, {
+      model,
+      messages: finalMessages,
+      temperature,
+      top_p,
+      content: null, // content is already in messages
+      abortSignal: abort.signal,
+      systemMessage: null, // systemMessage is already in messages
+      lastMessageId: null, // history is already in messages
+      isImageModel: isImage
     })
-    
-    let text = searchProcessLog; 
+
+    let text = searchProcessLog;
     let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
     if (isImage) {
       const response = api as any; const choice = response.choices[0]; let rawContent = choice.message?.content || ''; modelRes = response.model; usageRes = response.usage
       if (rawContent && !rawContent.startsWith('![') && (rawContent.startsWith('http') || rawContent.startsWith('data:image'))) text += `![Generated Image](${rawContent})`; else text += rawContent
       processCb?.({ id: customMessageId, text, role: choice.message.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: { choices: [{ finish_reason: 'stop', index: 0, logprobs: null, message: choice.message }], created: response.created, id: response.id, model: response.model, object: 'chat.completion', usage: response.usage } as any })
     } else {
-      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) { 
-          text += chunk.choices[0]?.delta.content ?? ''; 
-          chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage; 
-          processCb?.({ ...chunk, id: customMessageId, text, role: chunk.choices[0]?.delta.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId }) 
+      for await (const chunk of api as AsyncIterable<OpenAI.ChatCompletionChunk>) {
+        text += chunk.choices[0]?.delta.content ?? '';
+        chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage;
+        processCb?.({ ...chunk, id: customMessageId, text, role: chunk.choices[0]?.delta.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId })
       }
     }
     return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext.conversationId, model: modelRes, text, id: chatIdRes, detail: { usage: usageRes && { ...usageRes, estimated: false } } } })
@@ -733,24 +947,24 @@ async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
 async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string, tokenCount?: number): Promise<KeyConfig | undefined> {
   let keys = (await getCacheApiKeys()).filter(d => hasAnyRole(d.userRoles, user.roles)).filter(d => d.chatModels.includes(chatModel))
   if (accountId) keys = keys.filter(d => d.keyModel === 'ChatGPTUnofficialProxyAPI' && getAccountId(d.key) === accountId)
-  
+
   if (tokenCount !== undefined && keys.length > 0) {
-     keys = keys.filter(k => {
-        const remark = k.remark || ''
-        const maxMatch = remark.match(/MAX_TOKENS?[:=]\s*(\d+)/i)
-        const minMatch = remark.match(/MIN_TOKENS?[:=]\s*(\d+)/i)
-        
-        let valid = true
-        if (maxMatch) {
-            const max = parseInt(maxMatch[1], 10)
-            if (tokenCount > max) valid = false
-        }
-        if (minMatch) {
-            const min = parseInt(minMatch[1], 10)
-            if (tokenCount <= min) valid = false
-        }
-        return valid
-     })
+    keys = keys.filter(k => {
+      const remark = k.remark || ''
+      const maxMatch = remark.match(/MAX_TOKENS?[:=]\s*(\d+)/i)
+      const minMatch = remark.match(/MIN_TOKENS?[:=]\s*(\d+)/i)
+
+      let valid = true
+      if (maxMatch) {
+        const max = parseInt(maxMatch[1], 10)
+        if (tokenCount > max) valid = false
+      }
+      if (minMatch) {
+        const min = parseInt(minMatch[1], 10)
+        if (tokenCount <= min) valid = false
+      }
+      return valid
+    })
   }
 
   const picked = await randomKeyConfig(keys)
