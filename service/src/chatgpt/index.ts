@@ -2,6 +2,8 @@ import * as dotenv from 'dotenv'
 import OpenAI from 'openai'
 import jwt_decode from 'jwt-decode'
 import { GoogleGenAI } from '@google/genai'
+import { textTokens } from 'gpt-token'
+import type { TiktokenModel } from 'gpt-token'
 import type { AuditConfig, KeyConfig, UserInfo } from '../storage/model'
 import { Status } from '../storage/model'
 import { convertImageUrl } from '../utils/image'
@@ -72,6 +74,70 @@ function summarizeOpenAIMessages(messages: any[]) {
   })
 }
 function debugLog(...args: any[]) { if (!API_DEBUG) return; console.log(...args) }
+
+// ===================== [新增 Helper] 加载上下文消息 =====================
+/**
+ * 提前加载并构建消息列表，用于 Token 计算和传递给 API
+ */
+async function loadContextMessages(params: {
+  maxContextCount: number
+  lastMessageId?: string
+  systemMessage?: string
+  content: MessageContent
+}): Promise<OpenAI.ChatCompletionMessageParam[]> {
+  const { maxContextCount, systemMessage, content } = params
+  let { lastMessageId } = params
+  
+  const messages: OpenAI.ChatCompletionMessageParam[] = []
+  
+  // 1. 获取历史消息
+  for (let i = 0; i < maxContextCount; i++) {
+    if (!lastMessageId) break
+    const message = await getMessageById(lastMessageId)
+    if (!message) break
+    
+    let safeContent = message.text as string
+    if (typeof safeContent === 'string') {
+        safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
+    }
+    
+    messages.push({ role: message.role as any, content: safeContent })
+    lastMessageId = message.parentMessageId
+  }
+  
+  // 2. 添加系统提示词
+  if (systemMessage) {
+    messages.push({ role: 'system', content: systemMessage })
+  }
+  
+  // 3. 翻转并添加当前用户消息
+  messages.reverse()
+  // 注意：OpenAI SDK 类型定义对于 content 比较严格，这里使用 as any 简化兼容 Text/Image 混合内容
+  messages.push({ role: 'user', content: content as any })
+  
+  return messages
+}
+
+/**
+ * 估算 Token 数量
+ */
+function estimateTokenCount(messages: OpenAI.ChatCompletionMessageParam[]): number {
+  try {
+    const allText = messages.map(m => {
+      if (typeof m.content === 'string') return m.content
+      if (Array.isArray(m.content)) {
+        return m.content.map((c: any) => c.type === 'text' ? c.text : '').join('')
+      }
+      return ''
+    }).join('\n')
+    // 使用 gpt-3.5-turbo 作为基准 tokenizer，足够用于阈值判断
+    return textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
+  } catch (e) {
+    console.warn('[TokenEstimate] Failed:', e)
+    return 0
+  }
+}
+// ===================== [End Helper] =====================
 
 // ===================== 联网搜索 =====================
 type SearchPlan = {
@@ -362,21 +428,30 @@ async function buildGeminiHistoryFromLastMessageId(params: { lastMessageId?: str
 function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: number): HistoryMessageMeta[] { const out: HistoryMessageMeta[] = []; for (let i = metas.length - 1; i >= 0; i--) { if (metas[i].role !== role) continue; out.push(metas[i]); if (out.length >= n) break }; return out }
 function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: string[]): ImageBinding[] { const lastModels = getLastNByRole(metas, 'model', 2); const lastUsers = getLastNByRole(metas, 'user', 1); const groups = [{ source: 'current_user' as const, tagPrefix: 'U0', urls: currentUrls }, { source: 'last_ai' as const, tagPrefix: 'A0', urls: lastModels[0]?.urls ?? [] }, { source: 'prev_user' as const, tagPrefix: 'U1', urls: lastUsers[0]?.urls ?? [] }, { source: 'prev_ai' as const, tagPrefix: 'A1', urls: lastModels[1]?.urls ?? [] }]; const seen = new Set<string>(); const bindings: ImageBinding[] = []; for (const g of groups) { let idx = 0; for (const u of g.urls) { if (!u || seen.has(u)) continue; seen.add(u); idx += 1; bindings.push({ tag: `${g.tagPrefix}_${idx}`, source: g.source, url: u }) } }; return bindings }
 const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = { current_user: '本次用户消息', last_ai: '最近一条AI回复', prev_user: '上一次用户消息', prev_ai: '倒数第二条AI回复' }
-export async function initApi(key: KeyConfig, { model, maxContextCount, temperature, top_p, abortSignal, content, systemMessage, lastMessageId, isImageModel }: any) {
+
+export async function initApi(key: KeyConfig, { model, messages, temperature, top_p, abortSignal, isImageModel }: any) {
   const config = await getCacheConfig()
   const OPENAI_API_BASE_URL = isNotEmptyString(key.baseUrl) ? key.baseUrl : config.apiBaseUrl
   const openai = new OpenAI({ baseURL: OPENAI_API_BASE_URL, apiKey: key.key, maxRetries: 0, timeout: config.timeoutMs })
+  
   const modelConfig = MODEL_CONFIGS[model] || { supportTopP: true }
   const finalTemperature = modelConfig.defaultTemperature ?? temperature
   const shouldUseTopP = modelConfig.supportTopP
-  const messages: OpenAI.ChatCompletionMessageParam[] = []
-  for (let i = 0; i < maxContextCount; i++) { if (!lastMessageId) break; const message = await getMessageById(lastMessageId); if (!message) break; let safeContent = message.text as string; if (typeof safeContent === 'string') safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]'); messages.push({ role: message.role as any, content: safeContent }); lastMessageId = message.parentMessageId }
-  if (systemMessage) messages.push({ role: 'system', content: systemMessage })
-  messages.reverse(); messages.push({ role: 'user', content })
+
+  // Note: messages 现已由外部传入，不再在函数内查询 DB
+  
   const enableStream = !isImageModel
-  const options: OpenAI.ChatCompletionCreateParams = { model, stream: enableStream, stream_options: enableStream ? { include_usage: true } : undefined, messages }
-  options.temperature = finalTemperature; if (shouldUseTopP) options.top_p = top_p
+  const options: OpenAI.ChatCompletionCreateParams = { 
+    model, 
+    stream: enableStream, 
+    stream_options: enableStream ? { include_usage: true } : undefined, 
+    messages 
+  }
+  options.temperature = finalTemperature
+  if (shouldUseTopP) options.top_p = top_p
+  
   try { const siteCfg = config.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') (options as any).reasoning_effort = reasoningEffort } catch (e) { globalThis.console.error('[OpenAI] set reasoning_effort failed:', e) }
+
   if (API_DEBUG) { debugLog('====== [OpenAI Request Debug] ======'); debugLog('[baseURL]', OPENAI_API_BASE_URL); debugLog('[model]', model); debugLog('[messagesSummary]', safeJson(summarizeOpenAIMessages(messages))); debugLog('====== [OpenAI Request Debug End] ======') }
   return await openai.chat.completions.create(options, { signal: abortSignal })
 }
@@ -389,9 +464,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const userId = options.user._id.toString(); const messageId = options.messageId; const roomId = options.room.roomId; const abort = new AbortController(); const customMessageId = generateMessageId(); const threadKey = makeThreadKey(userId, roomId)
   const existingIdx = processThreads.findIndex(t => t.key === threadKey); if (existingIdx > -1) { processThreads[existingIdx].abort.abort(); processThreads.splice(existingIdx, 1) }
   processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
-  await ensureUploadDir(); const model = options.room.chatModel; const key = await getRandomApiKey(options.user, model, options.room.accountId); const maxContextCount = options.user.advanced.maxContextCount ?? 20
-  if (!key) { const idx = processThreads.findIndex(d => d.key === threadKey); if (idx > -1) processThreads.splice(idx, 1); throw new Error('没有对应的 apikeys 配置，请再试一次。') }
+  
+  await ensureUploadDir(); 
+  const model = options.room.chatModel; 
+  const maxContextCount = options.user.advanced.maxContextCount ?? 20
+  
   updateRoomChatModel(userId, options.room.roomId, model)
+  
   const { message, uploadFileKeys, lastContext, process: processCb, systemMessage, temperature, top_p } = options
   processCb?.({ id: customMessageId, text: '', role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
 
@@ -399,6 +478,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const globalConfig = await getCacheConfig(); const imageModelsStr = globalConfig.siteConfig.imageModels || ''; const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   const isImage = imageModelList.some(m => model.includes(m)); const isGeminiImageModel = isImage && model.includes('gemini')
 
+  // 1. 处理文件内容合并
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(k => isTextFile(k)); const imageFiles = uploadFileKeys.filter(k => isImageFile(k))
     if (textFiles.length > 0) { for (const fileKey of textFiles) { try { const filePath = path.join(UPLOAD_DIR, stripTypePrefix(fileKey)); await fs.access(filePath); const fileContent = await fs.readFile(filePath, 'utf-8'); fileContext += `\n\n--- File Start: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- File End ---\n` } catch (e) { globalThis.console.error(`Error reading text file ${fileKey}`, e); fileContext += `\n\n[System Error: File ${fileKey} not found or unreadable]\n` } } }
@@ -408,37 +488,43 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   let searchProcessLog = ''
-
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
 
+  // 2. 如果开启联网搜索，执行搜索逻辑
   if (finalSearchMode) {
     try {
+      // 计算初步 Token 以获取 Planner Key
+      const preContext = await loadContextMessages({ maxContextCount, lastMessageId: lastContext?.parentMessageId, systemMessage, content })
+      const preTokens = estimateTokenCount(preContext)
+      
       const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
 
-      let plannerKey = key
+      // 获取 Planner Key (传入 token数)
+      let plannerKey = await getRandomApiKey(options.user, model, options.room.accountId, preTokens)
+      
+      if (!plannerKey) throw new Error('没有对应的 apikeys 配置 (Planner)')
+
       let actualPlannerModel = plannerModelName
       if (plannerModelName !== model) {
-        const candidateKey = await getRandomApiKey(options.user, plannerModelName)
+        // 如果 Planner 模型不同，尝试获取其专用 Key
+        const candidateKey = await getRandomApiKey(options.user, plannerModelName) // Planner通常 Token 较少，可不传 count
         if (candidateKey) {
           plannerKey = candidateKey
-        }
-        else {
-          console.warn(`[WebSearch] No key found for planner model "${plannerModelName}", falling back to current model "${model}"`)
+        } else {
+          // fallback
           actualPlannerModel = model
-          plannerKey = key
         }
       }
 
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
       const plannerOpenai = new OpenAI({ baseURL: PLANNER_BASE_URL, apiKey: plannerKey.key, maxRetries: 0, timeout: globalConfig.timeoutMs })
-
+      
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
       const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
-
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
       const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
       const searchTavilyKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
@@ -447,8 +533,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
         const displayLog = progressMessages.join('\n')
-        // 智能判断状态，如果是完成态，则不再附加“⏳ 正在执行...”，
-        // 避免出现“信息收集完毕... 正在执行”的怪异感
         const isFinishing = status.includes('完毕') || status.includes('无需');
         const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...' 
         processCb?.({
@@ -457,14 +541,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         })
       }
 
-      const historyContext = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
+      const historyContextStr = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
 
       const { rounds, selectedIds } = await runIterativeWebSearch({
         openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
         abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
         onProgress: onProgressLocal,
-        fullContext: historyContext, date: currentDate
+        fullContext: historyContextStr, date: currentDate
       })
 
       if (progressMessages.length > 0) {
@@ -482,7 +566,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...' 
       if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
 
-      // 直接进入生成阶段，无需等待“搜索任务结束”的日志
       processCb?.({
         id: customMessageId, 
         text: searchProcessLog + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`, 
@@ -492,10 +575,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         detail: undefined,
       })
 
+      // 更新 context (追加入 context)
       if (ctx) content = appendTextToMessageContent(content, ctx)
 
-    }
-    catch (e: any) { 
+    } catch (e: any) { 
        if (isAbortError(e, abort.signal)) throw e; 
        globalThis.console.error('[WebSearch] failed:', e?.message ?? e);
        searchProcessLog += `\n❌ 联网搜索模块遇到问题：${e?.message ?? '未知错误'}\n\n---\n\n`
@@ -506,9 +589,27 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
+  // 3. 准备最终生成
+  const finalMessages = await loadContextMessages({
+      maxContextCount, 
+      lastMessageId: lastContext?.parentMessageId, 
+      systemMessage, 
+      content 
+  })
+  
+  // 4. 计算最终 Input Token
+  const finalTokenCount = estimateTokenCount(finalMessages)
+  
+  // 5. 根据 Token 选择生成的 Key
+  const key = await getRandomApiKey(options.user, model, options.room.accountId, finalTokenCount)
+  if (!key) { 
+      const idx = processThreads.findIndex(d => d.key === threadKey); if (idx > -1) processThreads.splice(idx, 1); 
+      throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount})，请检查 Key 备注配置。`) 
+  }
+
   try {
     if (isGeminiImageModel) {
-      // ... (Gemini 代码部分保持不变，但需确保 text 初始化包含 searchProcessLog)
+      // Gemini 逻辑使用新 Key
       const baseUrl = isNotEmptyString(key.baseUrl) ? key.baseUrl.replace(/\/+$/, '') : undefined; const dataUrlCache: DataUrlCache = new Map()
       const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache); content = normalizedCurrent.content
       const { metas } = await buildGeminiHistoryFromLastMessageId({ lastMessageId: lastContext.parentMessageId, maxContextCount, forGeminiImageModel: true })
@@ -534,8 +635,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
 
     // ② OpenAI
-    const api = await initApi(key, { model, maxContextCount, temperature, top_p, content, abortSignal: abort.signal, systemMessage, lastMessageId: lastContext.parentMessageId, isImageModel: isImage })
-    let text = searchProcessLog; // ✅ Keep log
+    const api = await initApi(key, { 
+        model, 
+        messages: finalMessages, 
+        temperature, 
+        top_p, 
+        content: null, // content is already in messages
+        abortSignal: abort.signal, 
+        systemMessage: null, // systemMessage is already in messages
+        lastMessageId: null, // history is already in messages
+        isImageModel 
+    })
+    
+    let text = searchProcessLog; 
     let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
     if (isImage) {
       const response = api as any; const choice = response.choices[0]; let rawContent = choice.message?.content || ''; modelRes = response.model; usageRes = response.usage
@@ -607,11 +719,31 @@ async function randomKeyConfig(keys: KeyConfig[]): Promise<KeyConfig | null> {
   if (unsedKeys.length <= 0) return null; return unsedKeys[Math.floor(Math.random() * unsedKeys.length)]
 }
 
-async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string): Promise<KeyConfig | undefined> {
+async function getRandomApiKey(user: UserInfo, chatModel: string, accountId?: string, tokenCount?: number): Promise<KeyConfig | undefined> {
   let keys = (await getCacheApiKeys()).filter(d => hasAnyRole(d.userRoles, user.roles)).filter(d => d.chatModels.includes(chatModel))
   if (accountId) keys = keys.filter(d => d.keyModel === 'ChatGPTUnofficialProxyAPI' && getAccountId(d.key) === accountId)
+  
+  if (tokenCount !== undefined && keys.length > 0) {
+     keys = keys.filter(k => {
+        const remark = k.remark || ''
+        const maxMatch = remark.match(/MAX_TOKENS?[:=]\s*(\d+)/i)
+        const minMatch = remark.match(/MIN_TOKENS?[:=]\s*(\d+)/i)
+        
+        let valid = true
+        if (maxMatch) {
+            const max = parseInt(maxMatch[1], 10)
+            if (tokenCount > max) valid = false
+        }
+        if (minMatch) {
+            const min = parseInt(minMatch[1], 10)
+            if (tokenCount <= min) valid = false
+        }
+        return valid
+     })
+  }
+
   const picked = await randomKeyConfig(keys)
-  if (API_DEBUG) { debugLog('====== [Key Pick Debug] ======'); debugLog('[chatModel]', chatModel, '[accountId]', accountId ?? '(none)'); debugLog('[candidateKeyCount]', keys.length); debugLog('[picked]', picked ? { keyModel: picked.keyModel, baseUrl: picked.baseUrl, remark: picked.remark } : '(null)'); debugLog('====== [Key Pick Debug End] ======') }
+  if (API_DEBUG) { debugLog('====== [Key Pick Debug] ======'); debugLog('[chatModel]', chatModel, '[tokens]', tokenCount, '[accountId]', accountId ?? '(none)'); debugLog('[candidateKeyCount]', keys.length); debugLog('[picked]', picked ? { keyModel: picked.keyModel, baseUrl: picked.baseUrl, remark: picked.remark } : '(null)'); debugLog('====== [Key Pick Debug End] ======') }
   return picked ?? undefined
 }
 
