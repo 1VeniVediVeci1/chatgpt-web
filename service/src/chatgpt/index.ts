@@ -119,21 +119,32 @@ async function loadContextMessages(params: {
 }
 
 /**
- * 估算 Token 数量
+ * 估算 Token 数量 (增加降级策略)
  */
 function estimateTokenCount(messages: OpenAI.ChatCompletionMessageParam[]): number {
+  let allText = ''
   try {
-    const allText = messages.map(m => {
+    allText = messages.map(m => {
       if (typeof m.content === 'string') return m.content
       if (Array.isArray(m.content)) {
         return m.content.map((c: any) => c.type === 'text' ? c.text : '').join('')
       }
       return ''
     }).join('\n')
-    // 使用 gpt-3.5-turbo 作为基准 tokenizer，足够用于阈值判断
-    return textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
+    
+    // 使用 gpt-3.5-turbo 作为基准 tokenizer
+    const count = textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
+    
+    // 如果计算出 0 但文本不为空，说明可能计算失败，降级到字符粗估
+    if (count === 0 && allText.length > 0) {
+        return Math.ceil(allText.length / 3) 
+    }
+    return count
   } catch (e) {
-    console.warn('[TokenEstimate] Failed:', e)
+    // 降级策略: 字符数 / 4
+    if (allText && allText.length > 0) {
+        return Math.ceil(allText.length / 4)
+    }
     return 0
   }
 }
