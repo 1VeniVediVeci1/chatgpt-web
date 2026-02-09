@@ -207,15 +207,10 @@ async function runIterativeWebSearch(params: {
   let currentContextSummary: string | null = null
 
   for (let i = 0; i < maxRounds; i++) {
-    // 核心修改 1 & 2：隐藏非第一轮的规划日志
-    // 第一轮必须给个反馈，告诉用户在干嘛
+    // 修正：2. 第二轮及以后不再输出“正在规划”，静默处理，让用户只看到上一轮的“正在判断”
     if (i === 0) {
       onProgress?.(`⏳ 正在分析用户意图，规划搜索策略...`)
     }
-    // 第二轮及以后：不输出日志。
-    // 上一轮搜索成功的日志是："搜索成功... 正在判断是否需要进一步搜索..."
-    // 这句话完美地充当了第二轮 Planner 思考时的 Loading 状态。
-    // 当 Planner 返回时，直接显示结果，从而实现无感衔接。
     
     let plan: SearchPlan | null = null
     for (const m of plannerModels) {
@@ -248,7 +243,7 @@ async function runIterativeWebSearch(params: {
 
     if (plan.action !== 'search') { 
         if (i === 0) onProgress?.(`🛑 模型判断无需搜索 ${reasonText}`)
-        // 这里也会无缝衔接：直接显示“信息收集完毕”
+        // 修正：直接显示完毕，不带任何“正在执行”的后缀(由onProgressLocal控制)
         else onProgress?.(`✅ 信息收集完毕 ${reasonText}`)
         break
     }
@@ -262,7 +257,6 @@ async function runIterativeWebSearch(params: {
     }; 
     usedQueries.add(q)
     
-    // 这里会作为新的一步跳出
     onProgress?.(`🔍 正在搜索：「${q}」\n   🧠 ${reasonText}`)
     
     try {
@@ -270,7 +264,7 @@ async function runIterativeWebSearch(params: {
       const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
       rounds.push({ query: q, items }); 
       
-      // 核心修改 1：修改措辞，让用户知道下一步是“判断”
+      // 修正：1. 修改文案，提示用户系统正在思考下一步
       onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
     } catch (e: any) {
       const errMsg = e?.message ?? String(e)
@@ -281,9 +275,7 @@ async function runIterativeWebSearch(params: {
     }
   }
   
-  // 核心修改 3：移除函数末尾的 summary log
-  // 不再输出“搜索任务结束...”，让主流程直接接管输出“正在生成回答”
-  
+  // 修正：3. 移除末尾日志，让 ChatReplyProcess 的“正在生成”直接衔接
   return { rounds, selectedIds }
 }
 
@@ -455,8 +447,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
         const displayLog = progressMessages.join('\n')
+        // 智能判断状态，如果是完成态，则不再附加“⏳ 正在执行...”，
+        // 避免出现“信息收集完毕... 正在执行”的怪异感
+        const isFinishing = status.includes('完毕') || status.includes('无需');
+        const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...' 
         processCb?.({
-          id: customMessageId, text: displayLog + '\n\n⏳ 正在执行...', role: 'assistant',
+          id: customMessageId, text: displayLog + suffix, role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
         })
       }
