@@ -1,7 +1,20 @@
 <script lang="ts" setup>
 import type { DataTableColumns } from 'naive-ui'
 import { h, onMounted, reactive, ref } from 'vue'
-import { NButton, NDataTable, NInput, NInputNumber, NModal, NSelect, NSpace, NSwitch, NTag, NTooltip, useDialog, useMessage } from 'naive-ui'
+import {
+  NButton,
+  NDataTable,
+  NInput,
+  NInputNumber,
+  NModal,
+  NSelect,
+  NSpace,
+  NSwitch,
+  NTag,
+  NTooltip,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
 import { KeyConfig, Status, UserRole, apiModelOptions, userRoleOptions } from './model'
 import { fetchGetKeys, fetchUpdateApiKeyStatus, fetchUpsertApiKey } from '@/api'
 import { t } from '@/locales'
@@ -23,11 +36,10 @@ const editingRawRemark = ref('')
 const editingMaxTokens = ref<number | null>(null)
 const editingMinTokens = ref<number | null>(null)
 
-// 使用 new RegExp 构造，避开构建工具对字面量正则中 [] 的误判
-// 匹配: 可选的 [ 或 (, 接着是关键字, 接着是数字, 接着是可选的 ] 或 )
+// 修复点：正则需要把外层的 [] 或 () 一起匹配掉，否则 replace 后会残留 "[]"
 const STRATEGY_REGEX = {
-  max: new RegExp('[\$\$$]?\\s*MAX_TOKENS?[:=]\\s*(\\d+)\\s*[\$\$$]?', 'i'),
-  min: new RegExp('[\$\$$]?\\s*MIN_TOKENS?[:=]\\s*(\\d+)\\s*[\$\$$]?', 'i')
+  max: new RegExp('[\$$\$]?\\s*MAX_TOKENS?\\s*[:=]\\s*(\\d+)\\s*[\$$\$]?', 'i'),
+  min: new RegExp('[\$$\$]?\\s*MIN_TOKENS?\\s*[:=]\\s*(\\d+)\\s*[\$$\$]?', 'i'),
 }
 
 function parseRemark(remark: string) {
@@ -37,31 +49,31 @@ function parseRemark(remark: string) {
 
   const maxMatch = clean.match(STRATEGY_REGEX.max)
   if (maxMatch) {
-    max = parseInt(maxMatch[1], 10)
-    clean = clean.replace(maxMatch[0], '')
+    max = Number.parseInt(maxMatch[1], 10)
+    // 用正则替换，确保把 [] 或 () 一起删掉
+    clean = clean.replace(STRATEGY_REGEX.max, '')
   }
 
   const minMatch = clean.match(STRATEGY_REGEX.min)
   if (minMatch) {
-    min = parseInt(minMatch[1], 10)
-    clean = clean.replace(minMatch[0], '')
+    min = Number.parseInt(minMatch[1], 10)
+    clean = clean.replace(STRATEGY_REGEX.min, '')
   }
 
-  // 清理多余空格
   clean = clean.replace(/\s+/g, ' ').trim()
   return { clean, max, min }
 }
 
 function buildRemark(raw: string, max: number | null, min: number | null) {
-  const parts = [raw.trim()]
-  // 保存时使用不带特殊正则含义的格式，或者保留 [] 但不再依赖正则字面量解析
+  const parts: string[] = [raw.trim()]
   if (max !== null) parts.push(`[MAX_TOKENS:${max}]`)
   if (min !== null) parts.push(`[MIN_TOKENS:${min}]`)
   return parts.filter(Boolean).join(' ')
 }
 // =================================
 
-const keys = ref([])
+const keys = ref<any[]>([])
+
 function createColumns(): DataTableColumns {
   return [
     {
@@ -88,22 +100,17 @@ function createColumns(): DataTableColumns {
       key: 'chatModels',
       width: 300,
       render(row: any) {
-        const tags = row.chatModels.map((chatModel: string) => {
-          return h(
+        return row.chatModels.map((chatModel: string) =>
+          h(
             NTag,
             {
-              style: {
-                marginRight: '6px',
-              },
+              style: { marginRight: '6px' },
               type: 'info',
               bordered: false,
             },
-            {
-              default: () => chatModel,
-            },
-          )
-        })
-        return tags
+            { default: () => chatModel },
+          ),
+        )
       },
     },
     {
@@ -111,46 +118,47 @@ function createColumns(): DataTableColumns {
       key: 'userRoles',
       width: 180,
       render(row: any) {
-        const tags = row.userRoles.map((userRole: UserRole) => {
-          return h(
+        return row.userRoles.map((userRole: UserRole) =>
+          h(
             NTag,
             {
-              style: {
-                marginRight: '6px',
-              },
+              style: { marginRight: '6px' },
               type: 'info',
               bordered: false,
             },
-            {
-              default: () => UserRole[userRole],
-            },
-          )
-        })
-        return tags
+            { default: () => UserRole[userRole] },
+          ),
+        )
       },
     },
-    { // 修改 Remark 列展示逻辑
+    {
       title: 'Remark / Strategy',
       key: 'remark',
       width: 200,
       render(row: any) {
         const { clean, max, min } = parseRemark(row.remark)
         const nodes: any[] = []
-        
-        if (clean) {
-          nodes.push(h('span', { style: { marginRight: '6px' } }, clean))
-        }
-        
+
+        if (clean) nodes.push(h('span', { style: { marginRight: '6px' } }, clean))
+
         if (max !== null) {
-          nodes.push(h(NTag, { type: 'warning', bordered: false, size: 'small', style: { marginRight: '4px' } }, { default: () => `≤ ${max} Tokens` }))
+          nodes.push(
+            h(
+              NTag,
+              { type: 'warning', bordered: false, size: 'small', style: { marginRight: '4px' } },
+              { default: () => `≤ ${max} Tokens` },
+            ),
+          )
         }
-        
+
         if (min !== null) {
-          nodes.push(h(NTag, { type: 'error', bordered: false, size: 'small' }, { default: () => `> ${min} Tokens` }))
+          nodes.push(
+            h(NTag, { type: 'error', bordered: false, size: 'small' }, { default: () => `> ${min} Tokens` }),
+          )
         }
-        
+
         return nodes
-      }
+      },
     },
     {
       title: 'Action',
@@ -159,31 +167,31 @@ function createColumns(): DataTableColumns {
       fixed: 'right',
       render(row: any) {
         const actions: any[] = []
-        actions.push(h(
-          NButton,
-          {
-            size: 'small',
-            style: {
-              marginRight: '6px',
-            },
-            type: 'error',
-            onClick: () => handleUpdateApiKeyStatus(row._id as string, Status.Disabled),
-          },
-          { default: () => t('common.delete') },
-        ))
-        if (row.status === Status.Normal) {
-          actions.push(h(
+        actions.push(
+          h(
             NButton,
             {
               size: 'small',
-              style: {
-                marginRight: '6px',
-              },
-              type: 'info',
-              onClick: () => handleEditKey(row as KeyConfig),
+              style: { marginRight: '6px' },
+              type: 'error',
+              onClick: () => handleUpdateApiKeyStatus(row._id as string, Status.Disabled),
             },
-            { default: () => t('common.edit') },
-          ))
+            { default: () => t('common.delete') },
+          ),
+        )
+        if (row.status === Status.Normal) {
+          actions.push(
+            h(
+              NButton,
+              {
+                size: 'small',
+                style: { marginRight: '6px' },
+                type: 'info',
+                onClick: () => handleEditKey(row as KeyConfig),
+              },
+              { default: () => t('common.edit') },
+            ),
+          )
         }
         return actions
       },
@@ -215,19 +223,20 @@ const pagination = reactive({
 })
 
 async function handleGetKeys(page: number) {
-  if (loading.value)
-    return
+  if (loading.value) return
   keys.value.length = 0
   loading.value = true
+
   const size = pagination.pageSize
   const data = (await fetchGetKeys(page, size)).data
-  data.keys.forEach((key: never) => {
-    keys.value.push(key)
-  })
+
+  data.keys.forEach((key: any) => keys.value.push(key))
   keyConfig.value = keys.value[0]
+
   pagination.page = page
   pagination.pageCount = data.total / size + (data.total % size === 0 ? 0 : 1)
   pagination.itemCount = data.total
+
   loading.value = false
 }
 
@@ -250,8 +259,8 @@ async function handleUpdateKeyConfig() {
     ms.error('Api key is required')
     return
   }
-  
-  // 保存时合并
+
+  // 保存时合并 remark + token policy
   keyConfig.value.remark = buildRemark(editingRawRemark.value, editingMaxTokens.value, editingMinTokens.value)
 
   handleSaving.value = true
@@ -259,8 +268,7 @@ async function handleUpdateKeyConfig() {
     await fetchUpsertApiKey(keyConfig.value)
     await handleGetKeys(pagination.page)
     show.value = false
-  }
-  catch (error: any) {
+  } catch (error: any) {
     ms.error(error.message)
   }
   handleSaving.value = false
@@ -268,7 +276,6 @@ async function handleUpdateKeyConfig() {
 
 function handleNewKey() {
   keyConfig.value = new KeyConfig('', 'ChatGPTAPI', [], [], '')
-  // 重置编辑状态
   editingRawRemark.value = ''
   editingMaxTokens.value = null
   editingMinTokens.value = null
@@ -277,8 +284,7 @@ function handleNewKey() {
 
 function handleEditKey(key: KeyConfig) {
   keyConfig.value = { ...key }
-  // 解析出现有配置
-  const { clean, max, min } = parseRemark(key.remark)
+  const { clean, max, min } = parseRemark((key as any).remark)
   editingRawRemark.value = clean
   editingMaxTokens.value = max
   editingMinTokens.value = min
@@ -308,7 +314,8 @@ onMounted(async () => {
           :pagination="pagination"
           :max-height="444"
           :scroll-x="1300"
-          striped @update:page="handleGetKeys"
+          striped
+          @update:page="handleGetKeys"
         />
       </NSpace>
     </div>
@@ -332,24 +339,21 @@ onMounted(async () => {
             <a v-else target="_blank" href="https://chat.openai.com/api/auth/session">Get Access Token</a>
           </p>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.api') }}</span>
           <div class="flex-1">
-            <NInput
-              v-model:value="keyConfig.key" type="textarea"
-              :autosize="{ minRows: 3, maxRows: 4 }" placeholder=""
-            />
+            <NInput v-model:value="keyConfig.key" type="textarea" :autosize="{ minRows: 3, maxRows: 4 }" placeholder="" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.apiBaseUrl') }}</span>
           <div class="flex-1">
-            <NInput
-              v-model:value="keyConfig.baseUrl"
-              style="width: 100%" placeholder=""
-            />
+            <NInput v-model:value="keyConfig.baseUrl" style="width: 100%" placeholder="" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.chatModels') }}</span>
           <div class="flex-1">
@@ -362,53 +366,46 @@ onMounted(async () => {
             />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.userRoles') }}</span>
           <div class="flex-1">
-            <NSelect
-              style="width: 100%"
-              multiple
-              :value="keyConfig.userRoles"
-              :options="userRoleOptions"
-              @update-value="value => keyConfig.userRoles = value"
-            />
+            <NSelect style="width: 100%" multiple :value="keyConfig.userRoles" :options="userRoleOptions" @update-value="value => keyConfig.userRoles = value" />
           </div>
         </div>
-        
-        <!-- 新增 Token Policy 配置区域 -->
+
+        <!-- Token Policy -->
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">Token Policy</span>
           <div class="flex-1 flex gap-4">
-             <div class="flex-1">
-                <NTooltip trigger="hover">
-                  <template #trigger>
-                    <NInputNumber v-model:value="editingMaxTokens" placeholder="Max" :min="0" :show-button="false">
-                       <template #prefix>≤ </template>
-                    </NInputNumber>
-                  </template>
-                  Max Input Tokens (Use this key if tokens ≤ val)
-                </NTooltip>
-             </div>
-             <div class="flex-1">
-                <NTooltip trigger="hover">
-                  <template #trigger>
-                    <NInputNumber v-model:value="editingMinTokens" placeholder="Min" :min="0" :show-button="false">
-                       <template #prefix>&gt; </template>
-                    </NInputNumber>
-                  </template>
-                  Min Input Tokens (Use this key if tokens > val)
-                </NTooltip>
-             </div>
+            <div class="flex-1">
+              <NTooltip trigger="hover">
+                <template #trigger>
+                  <NInputNumber v-model:value="editingMaxTokens" placeholder="Max" :min="0" :show-button="false">
+                    <template #prefix>≤ </template>
+                  </NInputNumber>
+                </template>
+                Max Input Tokens (Use this key if tokens ≤ val)
+              </NTooltip>
+            </div>
+
+            <div class="flex-1">
+              <NTooltip trigger="hover">
+                <template #trigger>
+                  <NInputNumber v-model:value="editingMinTokens" placeholder="Min" :min="0" :show-button="false">
+                    <template #prefix>&gt; </template>
+                  </NInputNumber>
+                </template>
+                Min Input Tokens (Use this key if tokens &gt; val)
+              </NTooltip>
+            </div>
           </div>
         </div>
 
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.remark') }}</span>
           <div class="flex-1">
-            <NInput
-              v-model:value="editingRawRemark" type="textarea"
-              :autosize="{ minRows: 1, maxRows: 2 }" placeholder="Visible remark"
-            />
+            <NInput v-model:value="editingRawRemark" type="textarea" :autosize="{ minRows: 1, maxRows: 2 }" placeholder="Visible remark" />
           </div>
         </div>
 
@@ -422,6 +419,7 @@ onMounted(async () => {
             />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]" />
           <NButton type="primary" :loading="handleSaving" @click="handleUpdateKeyConfig()">
