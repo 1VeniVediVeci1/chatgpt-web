@@ -23,9 +23,10 @@ const editingRawRemark = ref('')
 const editingMaxTokens = ref<number | null>(null)
 const editingMinTokens = ref<number | null>(null)
 
+// 升级正则：匹配 [MAX_TOKENS:100] 或 MAX_TOKENS:100，优先匹配带中括号的
 const STRATEGY_REGEX = {
-  max: /MAX_TOKENS?[:=]\s*(\d+)/i,
-  min: /MIN_TOKENS?[:=]\s*(\d+)/i
+  max: /$$?\s*MAX_TOKENS?[:=]\s*(\d+)\s*$$?/i,
+  min: /$$?\s*MIN_TOKENS?[:=]\s*(\d+)\s*$$?/i
 }
 
 function parseRemark(remark: string) {
@@ -45,7 +46,8 @@ function parseRemark(remark: string) {
     clean = clean.replace(minMatch[0], '')
   }
 
-  clean = clean.replace(/[$$$$]/g, ' ').replace(/\s+/g, ' ').trim()
+  // 清理多余空格
+  clean = clean.replace(/\s+/g, ' ').trim()
   return { clean, max, min }
 }
 
