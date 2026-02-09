@@ -140,7 +140,7 @@ function createColumns(): DataTableColumns {
           )
         }
 
-        return nodes.length ? nodes : h('span', '-', {})
+        return nodes.length? nodes: h('span', { style: { color: '#999' } }, '-')
       },
     },
     {
