@@ -23,10 +23,11 @@ const editingRawRemark = ref('')
 const editingMaxTokens = ref<number | null>(null)
 const editingMinTokens = ref<number | null>(null)
 
-// 升级正则：显式转义方括号，确保构建工具正确解析
+// 使用 new RegExp 构造，避开构建工具对字面量正则中 [] 的误判
+// 匹配: 可选的 [ 或 (, 接着是关键字, 接着是数字, 接着是可选的 ] 或 )
 const STRATEGY_REGEX = {
-  max: /\[?\s*MAX_TOKENS?[:=]\s*(\d+)\s*$$?/i,
-  min: /$$?\s*MIN_TOKENS?[:=]\s*(\d+)\s*$$?/i
+  max: new RegExp('[\$\$$]?\\s*MAX_TOKENS?[:=]\\s*(\\d+)\\s*[\$\$$]?', 'i'),
+  min: new RegExp('[\$\$$]?\\s*MIN_TOKENS?[:=]\\s*(\\d+)\\s*[\$\$$]?', 'i')
 }
 
 function parseRemark(remark: string) {
@@ -46,13 +47,14 @@ function parseRemark(remark: string) {
     clean = clean.replace(minMatch[0], '')
   }
 
-  // 清理多余空格和残留符号
-  clean = clean.replace(/[$$$$]/g, ' ').replace(/\s+/g, ' ').trim()
+  // 清理多余空格
+  clean = clean.replace(/\s+/g, ' ').trim()
   return { clean, max, min }
 }
 
 function buildRemark(raw: string, max: number | null, min: number | null) {
   const parts = [raw.trim()]
+  // 保存时使用不带特殊正则含义的格式，或者保留 [] 但不再依赖正则字面量解析
   if (max !== null) parts.push(`[MAX_TOKENS:${max}]`)
   if (min !== null) parts.push(`[MIN_TOKENS:${min}]`)
   return parts.filter(Boolean).join(' ')
