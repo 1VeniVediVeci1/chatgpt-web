@@ -273,9 +273,10 @@ async function openaiChatStreamWithIdleTimeout(params: {
     // 2. 发起请求
     resetWatchdog() // 建立连接前也算时间
     
+    // 【修正 TypeScript 错误】显式类型断言，告诉 TS 返回的是一个异步可迭代的流
     const stream = await openai.chat.completions.create(streamRequest, {
       signal: ac.signal,
-    })
+    }) as unknown as AsyncIterable<OpenAI.ChatCompletionChunk>
 
     streamStarted = true
 
@@ -338,7 +339,7 @@ async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(
 }): Promise<T> {
   const { openai, request, parentSignal, onTimeoutRetry, validator } = params
 
-  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [15_000, 20_000, 25_000])
+  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [10_000, 15_000, 20_000])
     .map(n => Number(n))
     .filter(n => Number.isFinite(n) && n > 0)
 
