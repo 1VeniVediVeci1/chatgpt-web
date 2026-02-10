@@ -338,7 +338,7 @@ async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(
 }): Promise<T> {
   const { openai, request, parentSignal, onTimeoutRetry, validator } = params
 
-  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [10_000, 15_000, 20_000])
+  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [15_000, 20_000, 25_000])
     .map(n => Number(n))
     .filter(n => Number.isFinite(n) && n > 0)
 
