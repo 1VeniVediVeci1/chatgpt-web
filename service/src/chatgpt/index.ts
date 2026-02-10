@@ -222,15 +222,12 @@ function summarizePlannerTimeoutReason(e: any): string {
 
 function isLikelySdkOrNetworkTimeout(e: any): boolean {
   const status = getStatusCodeLike(e)
-  
-  // [Fix 2] 包含 500, 502, 503, 504 以及其他超时状态
   if (status && (status === 504 || status === 503 || status === 502 || status === 500)) return true
 
   const name = String(e?.name ?? '')
   if (name === 'APIConnectionTimeoutError') return true
 
   const code = String(getErrCodeLike(e) ?? '')
-  // 网络层面超时
   if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT' || code === 'ECONNRESET') return true
 
   const msg = String(e?.message ?? '')
@@ -240,55 +237,76 @@ function isLikelySdkOrNetworkTimeout(e: any): boolean {
   return false
 }
 
-async function openaiChatCreateWithTimeout<T>(params: {
+// 【新增】支持空闲超时的流式请求函数
+async function openaiChatStreamWithIdleTimeout(params: {
   openai: OpenAI
   request: any
-  timeoutMs: number
+  idleTimeoutMs: number
   parentSignal?: AbortSignal
-}): Promise<T> {
-  const { openai, request, timeoutMs, parentSignal } = params
-
+}): Promise<string> {
+  const { openai, request, idleTimeoutMs, parentSignal } = params
+  
+  // 1. 强制启用流式
+  const streamRequest = { ...request, stream: true }
+  
   const ac = new AbortController()
-  let didTimeout = false
   let timer: any
+  let accumulatedText = ''
+  let streamStarted = false
 
-  const onParentAbort = () => {
-    try { ac.abort() } catch { }
+  // 处理父级信号中断
+  const onParentAbort = () => { try { ac.abort() } catch { } }
+  if (parentSignal) {
+    if (parentSignal.aborted) throw new Error('Aborted by parent signal')
+    parentSignal.addEventListener('abort', onParentAbort, { once: true })
+  }
+
+  // 看门狗函数：重置超时倒计时
+  const resetWatchdog = () => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => {
+      ac.abort() // 中断流
+    }, idleTimeoutMs)
   }
 
   try {
-    if (parentSignal) {
-      if (parentSignal.aborted) {
-        ac.abort()
-      } else {
-        parentSignal.addEventListener('abort', onParentAbort, { once: true })
-      }
+    // 2. 发起请求
+    resetWatchdog() // 建立连接前也算时间
+    
+    const stream = await openai.chat.completions.create(streamRequest, {
+      signal: ac.signal,
+    })
+
+    streamStarted = true
+
+    // 3. 消费流
+    for await (const chunk of stream) {
+      // **关键**：每收到一个 chunk，重置超时计时器
+      resetWatchdog()
+      
+      const delta = chunk.choices[0]?.delta?.content || ''
+      accumulatedText += delta
     }
 
-    timer = setTimeout(() => {
-      didTimeout = true
-      try { ac.abort() } catch { }
-    }, timeoutMs)
+    // 流结束，清除定时器
+    clearTimeout(timer)
+    return accumulatedText
 
-    return await openai.chat.completions.create(request, { signal: ac.signal }) as T
   } catch (e: any) {
+    clearTimeout(timer)
+    
     if (parentSignal?.aborted) throw e
 
-    if (didTimeout) {
-      throw new PlannerTimeoutError(timeoutMs, { kind: 'local_timer', original: e })
+    // 如果是由我们自己的 AbortController 触发的，说明是看门狗超时
+    if (ac.signal.aborted) {
+      // 区分是还没连上就超时，还是流中间断了
+      const kind = streamStarted ? 'stream_idle_timeout' : 'connection_timeout'
+      throw new PlannerTimeoutError(idleTimeoutMs, { kind, original: e })
     }
 
+    // 其他类型的网络错误
     if (isLikelySdkOrNetworkTimeout(e)) {
-      const status = getStatusCodeLike(e)
-      const code = getErrCodeLike(e)
-      const name = String(e?.name ?? '')
-
-      let kind = 'sdk_or_network_timeout'
-      if (status) kind = `gateway_or_server_${status}`
-      else if (name === 'APIConnectionTimeoutError') kind = 'sdk_timeout'
-      else if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') kind = `network_${code}`
-
-      throw new PlannerTimeoutError(timeoutMs, { kind, original: e })
+        throw new PlannerTimeoutError(idleTimeoutMs, { kind: 'network_error', original: e })
     }
 
     throw e
@@ -298,11 +316,17 @@ async function openaiChatCreateWithTimeout<T>(params: {
   }
 }
 
-async function openaiChatCreateWithTimeoutRetry<T>(params: {
+// 定义一个通用的 Response 结构，用于 TS 泛型
+type ChatCompletionResponseLike = { choices: { message: { content: string | null } }[] };
+
+// 【修改】重试逻辑：使用流式空闲超时，并增加结果校验器
+async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(params: {
   openai: OpenAI
   request: any
   timeoutsMs?: number[]
   parentSignal?: AbortSignal
+  // 【新增】校验器：如果返回 false 或抛出异常，视为本次尝试失败，消耗一次重试机会
+  validator?: (result: T) => void | Promise<void> 
   onTimeoutRetry?: (info: {
     attempt: number
     timeoutMs: number
@@ -312,7 +336,7 @@ async function openaiChatCreateWithTimeoutRetry<T>(params: {
     error: any
   }) => void
 }): Promise<T> {
-  const { openai, request, parentSignal, onTimeoutRetry } = params
+  const { openai, request, parentSignal, onTimeoutRetry, validator } = params
 
   const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [10_000, 15_000, 20_000])
     .map(n => Number(n))
@@ -324,27 +348,44 @@ async function openaiChatCreateWithTimeoutRetry<T>(params: {
   let lastErr: any
 
   for (let attempt = 1; attempt <= totalAttempts; attempt++) {
-    const timeoutMs = timeoutsMs[attempt - 1]
+    // 这里的 timeoutMs 现在代表 "最大字符间隙等待时间 (Idle Timeout)"
+    const idleTimeoutMs = timeoutsMs[attempt - 1]
 
     try {
-      return await openaiChatCreateWithTimeout<T>({
+      // 1. 调用流式处理函数
+      const fullText = await openaiChatStreamWithIdleTimeout({
         openai,
         request,
-        timeoutMs,
+        idleTimeoutMs,
         parentSignal,
       })
+
+      // 2. 构造一个模拟的 Response 对象，以维持接口兼容性
+      const fakeResponse = {
+        choices: [{ message: { content: fullText } }]
+      } as unknown as T
+
+      // 3. 【关键新增】执行校验
+      // 如果校验失败抛出 Error，会被下方的 catch 捕获，从而进入下一次循环
+      if (validator) {
+        await validator(fakeResponse)
+      }
+
+      return fakeResponse // 一切正常，返回结果
     } catch (e: any) {
       lastErr = e
 
-      const isTimeout = e?.code === 'PLANNER_TIMEOUT' || e instanceof PlannerTimeoutError
-      if (!isTimeout) throw e
+      if (parentSignal?.aborted) throw e
+      // 如果已经是最后一次尝试，直接抛出，不再重试
       if (attempt >= totalAttempts) throw e
 
       const nextAttempt = attempt + 1
       const nextTimeoutMs = timeoutsMs[nextAttempt - 1]
+      
+      // 判断错误类型：超时 或 校验失败 均可重试
       const reason = summarizePlannerTimeoutReason(e)
 
-      onTimeoutRetry?.({ attempt, timeoutMs, nextAttempt, nextTimeoutMs, reason, error: e })
+      onTimeoutRetry?.({ attempt, timeoutMs: idleTimeoutMs, nextAttempt, nextTimeoutMs, reason, error: e })
 
       // 退避策略
       await sleep(250 * Math.pow(2, attempt - 1))
@@ -397,6 +438,7 @@ function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   }).join('\n\n')
 }
 
+// 【修改】Plan 函数：移除内部 try-catch，使用验证器，提示词增强
 async function planNextSearchAction(params: {
   openai: OpenAI
   model: string
@@ -455,6 +497,8 @@ async function planNextSearchAction(params: {
     '  "selected_ids": string[],',
     isFirstRound ? '  "context_summary": string' : null,
     '}'.replace(/, null/g, ''),
+    // 【关键修改】加强提示，禁止 Markdown 格式
+    '请只返回纯 JSON 字符串，不要包含 Markdown 格式（如 ```json ... ```）。'
   ].filter(Boolean).join('\n')
 
   const contextBlock = isFirstRound
@@ -474,50 +518,40 @@ async function planNextSearchAction(params: {
 
   const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [10_000, 15_000, 20_000])
 
-  try {
-    const resp = await openaiChatCreateWithTimeoutRetry<any>({
-      openai,
-      request: {
-        model,
-        temperature: 0,
-        messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }],
-        response_format: { type: 'json_object' } as any,
-        stream: false
-      } as any,
-      timeoutsMs: schedule,
-      parentSignal: abortSignal,
-      onTimeoutRetry,
-    })
-
-    const content = resp.choices?.[0]?.message?.content ?? ''
-    const obj = safeParseJsonFromText(content)
-    
-    // [Fix 1] 如果解析失败，主动抛出异常，强制触发下方 catch 块的重试逻辑
-    if (!obj) {
-      throw new Error(`JSON parsing failed, raw content preview: ${trunc(content, 50)}`)
+  // 【关键修改】移除 try-catch 的嵌套重试逻辑
+  // 使用 validator 将解析错误纳入重试循环
+  const resp = await openaiChatCreateWithTimeoutRetry<any>({
+    openai,
+    request: {
+      model,
+      temperature: 0,
+      messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }],
+      response_format: { type: 'json_object' } as any,
+      stream: true, // 显式标记为流式
+    } as any,
+    timeoutsMs: schedule,
+    parentSignal: abortSignal,
+    onTimeoutRetry,
+    // 【关键新增】传入校验函数
+    validator: (res) => {
+      const content = res.choices?.[0]?.message?.content ?? ''
+      // 尝试解析 JSON
+      const parsed = safeParseJsonFromText(content)
+      if (!parsed) {
+        // 主动抛错，会被视为一次 "Attempt Failed"，触发下一次重试
+        // 错误信息会被 onTimeoutRetry 捕获并打印
+        throw new Error(`JSON parsing failed (len=${content.length}, content preview: ${trunc(content, 50)})`)
+      }
+      // 可选：校验关键字段是否存在
+      if (!parsed.action) {
+         throw new Error('Invalid JSON: missing "action" field')
+      }
     }
+  })
 
-    return obj as SearchPlan
-  } catch (e: any) {
-    if (e?.code === 'PLANNER_TIMEOUT' || e instanceof PlannerTimeoutError) throw e
-
-    // 针对 JSON 解析失败的重试
-    const resp = await openaiChatCreateWithTimeoutRetry<any>({
-      openai,
-      request: {
-        model,
-        temperature: 0,
-        messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: `${plannerUser}\n\n只输出 JSON，不要输出其它文本。` }],
-        stream: false
-      } as any,
-      timeoutsMs: schedule,
-      parentSignal: abortSignal,
-      onTimeoutRetry,
-    })
-
-    const obj = safeParseJsonFromText(resp.choices?.[0]?.message?.content ?? '')
-    return obj ? obj as SearchPlan : { action: 'stop', reason: 'planner json parse failed after retry' }
-  }
+  // 能走到这里，说明 validator 一定通过了
+  const finalContent = resp.choices?.[0]?.message?.content ?? ''
+  return safeParseJsonFromText(finalContent) as SearchPlan
 }
 
 async function runIterativeWebSearch(params: {
@@ -552,8 +586,8 @@ async function runIterativeWebSearch(params: {
           priorContextSummary: currentContextSummary, date, timeoutScheduleMs: schedule,
           onTimeoutRetry: ({ attempt, timeoutMs, nextAttempt, nextTimeoutMs, reason }) => {
             onProgress?.(
-              `⚠️ 规划器第 ${attempt} 次请求异常/超时（>${Math.round(timeoutMs / 1000)}s），` +
-              `正在重试第 ${nextAttempt} 次（超时=${Math.round(nextTimeoutMs / 1000)}s）...\n` +
+              `⚠️ 规划器第 ${attempt} 次请求失败（空闲超时/校验失败 >${Math.round(timeoutMs / 1000)}s），` +
+              `正在重试第 ${nextAttempt} 次（超时阈值=${Math.round(nextTimeoutMs / 1000)}s）...\n` +
               `   原因：${reason}`
             )
           },
@@ -779,7 +813,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const PLANNER_BASE_URL = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : globalConfig.apiBaseUrl
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
-      const plannerModels = [actualPlannerModel, model].filter((v, i, arr) => Boolean(v) && arr.indexOf(v) === i)
+      
+      // 【关键修改】为了严格控制重试次数，这里只使用一个确定的模型，不再进行多模型轮询
+      const plannerModels = [actualPlannerModel]
+      
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
       const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
       const searchTavilyKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
@@ -806,9 +843,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS)
         ?? [15_000, 20_000, 25_000]
 
+      // 由于使用了流式空闲超时，客户端的总超时时间可以设置得更长一些，作为最后的兜底
       const plannerClientTimeout = Math.max(
         Number(globalConfig.timeoutMs ?? 0),
-        Math.max(...plannerTimeoutScheduleMs) + 2000,
+        Math.max(...plannerTimeoutScheduleMs) * 3, // 给够时间，主要靠空闲超时断开
       )
 
       const plannerOpenai = new OpenAI({
