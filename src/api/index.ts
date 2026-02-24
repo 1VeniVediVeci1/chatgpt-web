@@ -1,7 +1,7 @@
 import type { AxiosProgressEvent, GenericAbortSignal } from 'axios'
 import { get, post } from '@/utils/request'
 import type { AnnounceConfig, AuditConfig, ConfigState, GiftCard, KeyConfig, MailConfig, SiteConfig, Status, UserInfo, UserPassword, UserPrompt } from '@/components/common/Setting/model'
-import { useAuthStore, useUserStore } from '@/store'
+import { useUserStore } from '@/store'
 import type { SettingsState } from '@/store/modules/user/helper'
 
 export function fetchAnnouncement<T = any>() {
@@ -33,9 +33,8 @@ export function fetchChatAPIProcess<T = any>(
   },
 ) {
   const userStore = useUserStore()
-  const authStore = useAuthStore()
 
-  let data: Record<string, any> = {
+  const data: Record<string, any> = {
     roomId: params.roomId,
     uuid: params.uuid,
     regenerate: params.regenerate || false,
@@ -43,15 +42,11 @@ export function fetchChatAPIProcess<T = any>(
     searchMode: params.searchMode ?? false,
     uploadFileKeys: params.uploadFileKeys,
     options: params.options,
-  }
 
-  if (authStore.isChatGPTAPI) {
-    data = {
-      ...data,
-      systemMessage: userStore.userInfo.advanced.systemMessage,
-      temperature: userStore.userInfo.advanced.temperature,
-      top_p: userStore.userInfo.advanced.top_p,
-    }
+    // ✅ 统一传给后端（后端会按实际模型/provider使用）
+    systemMessage: userStore.userInfo.advanced.systemMessage,
+    temperature: userStore.userInfo.advanced.temperature,
+    top_p: userStore.userInfo.advanced.top_p,
   }
 
   return post<T>({
@@ -69,7 +64,6 @@ export function fetchChatStopResponding<T = any>(roomId: number, text: string) {
   })
 }
 
-// [新增] 轮询后端任务状态
 export function fetchChatProcessStatus<T = any>() {
   return post<T>({
     url: '/chat-process-status',
@@ -145,7 +139,6 @@ export function fetchUpdateUserInfo<T = any>(name: string, avatar: string, descr
   })
 }
 
-// 提交用户兑换后额度
 export function fetchUpdateUserAmt<T = any>(useAmount: number) {
   return post<T>({
     url: '/user-updateamtinfo',
@@ -153,14 +146,12 @@ export function fetchUpdateUserAmt<T = any>(useAmount: number) {
   })
 }
 
-// 获取用户目前额度
 export function fetchUserAmt<T = any>() {
   return get<T>({
     url: '/user-getamtinfo',
   })
 }
 
-// 获取兑换码对应的额度
 export function decode_redeemcard<T = any>(redeemCardNo: string) {
   return post<T>({
     url: '/redeem-card',
@@ -223,7 +214,6 @@ export function fetchUpdateUserStatus<T = any>(userId: string, status: Status) {
   })
 }
 
-// 增加useAmount信息 limit_switch
 export function fetchUpdateUser<T = any>(userInfo: UserInfo) {
   return post<T>({
     url: '/user-edit',
