@@ -215,7 +215,7 @@ function safeParseJsonFromText(text: string): any | null {
 
 function removeImagesFromText(text: string): string {
   if (!text) return ''
-  let clean = text.replace(/!$$[^$$]*]$\s*([^)]+?)\s*$/g, '')
+  let clean = text.replace(/!$$[^$$]*\]\s*$[^)]+?$\s*$/g, '')
   clean = clean.replace(/<img[^>]*>/gi, '')
   clean = clean.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, '')
   return clean.trim()
@@ -752,7 +752,7 @@ let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([^)]+?)\s*$/g
+const MARKDOWN_IMAGE_RE = /!$$[^$$]*\]\s*$[^)]+?$\s*$/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 
@@ -1359,6 +1359,18 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined,
       ])
 
+      // 针对 Gemini-3-pro-image 注入专属生图参数 (如 4K)
+      const isGemini3ProImageModel = model.includes('gemini-3-pro-image')
+      const googleProviderOpts: any = {
+        responseModalities: ['TEXT', 'IMAGE'],
+      }
+      if (isGemini3ProImageModel) {
+        googleProviderOpts.imageConfig = {
+          imageSize: '4K',
+          aspectRatio: '16:9'
+        }
+      }
+
       // 修复：移除多余的 system 参数，避免合并出两个 system/developer
       const result: any = await generateText({
         model: lm,
@@ -1367,7 +1379,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         topP: shouldUseTopP ? top_p : undefined,
         abortSignal: callSignal,
         providerOptions: {
-          google: { responseModalities: ['TEXT', 'IMAGE'] } as any,
+          google: googleProviderOpts,
         } as any,
       })
 
@@ -1417,6 +1429,18 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     ])
 
     if (isImage) {
+      // 动态构造 Google 的专属参数
+      let basicGoogleOpts: any = undefined
+      if (provider === 'google') {
+        basicGoogleOpts = { responseModalities: ['TEXT', 'IMAGE'] }
+        if (model.includes('gemini-3-pro-image')) {
+          basicGoogleOpts.imageConfig = {
+            imageSize: '4K',
+            aspectRatio: '16:9'
+          }
+        }
+      }
+
       // 修复：移除系统传参
       const result: any = await generateText({
         model: lm,
@@ -1425,7 +1449,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         topP: shouldUseTopP ? top_p : undefined,
         abortSignal: callSignal,
         providerOptions: provider === 'google'
-          ? { google: { responseModalities: ['TEXT', 'IMAGE'] } as any }
+          ? { google: basicGoogleOpts } as any
           : undefined,
       })
 
