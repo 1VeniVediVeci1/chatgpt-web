@@ -158,6 +158,14 @@ function safeParseJsonFromText(text: string): any | null {
   return null
 }
 
+function removeImagesFromText(text: string): string {
+  if (!text) return '';
+  let clean = text.replace(/!$$.*?$$$.*?$/g, ''); // 移除 Markdown 图片
+  clean = clean.replace(/<img[^>]*>/gi, ''); // 移除 HTML img 图片
+  clean = clean.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, ''); // 移除 Base64 图片
+  return clean.trim();
+}
+
 // ===== Planner timeout (dynamic schedule) + retry helpers =====
 class PlannerTimeoutError extends Error {
   public readonly code = 'PLANNER_TIMEOUT'
@@ -237,7 +245,7 @@ function isLikelySdkOrNetworkTimeout(e: any): boolean {
   return false
 }
 
-// 【新增】支持空闲超时的流式请求函数
+// 流式请求函数：支持空闲超时中断
 async function openaiChatStreamWithIdleTimeout(params: {
   openai: OpenAI
   request: any
@@ -246,50 +254,40 @@ async function openaiChatStreamWithIdleTimeout(params: {
 }): Promise<string> {
   const { openai, request, idleTimeoutMs, parentSignal } = params
   
-  // 1. 强制启用流式
   const streamRequest = { ...request, stream: true }
-  
   const ac = new AbortController()
   let timer: any
   let accumulatedText = ''
   let streamStarted = false
 
-  // 处理父级信号中断
   const onParentAbort = () => { try { ac.abort() } catch { } }
   if (parentSignal) {
     if (parentSignal.aborted) throw new Error('Aborted by parent signal')
     parentSignal.addEventListener('abort', onParentAbort, { once: true })
   }
 
-  // 看门狗函数：重置超时倒计时
   const resetWatchdog = () => {
     if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
-      ac.abort() // 中断流
+      ac.abort()
     }, idleTimeoutMs)
   }
 
   try {
-    // 2. 发起请求
-    resetWatchdog() // 建立连接前也算时间
+    resetWatchdog()
     
-    // 【修正 TypeScript 错误】显式类型断言，告诉 TS 返回的是一个异步可迭代的流
     const stream = await openai.chat.completions.create(streamRequest, {
       signal: ac.signal,
     }) as unknown as AsyncIterable<OpenAI.ChatCompletionChunk>
 
     streamStarted = true
 
-    // 3. 消费流
     for await (const chunk of stream) {
-      // **关键**：每收到一个 chunk，重置超时计时器
       resetWatchdog()
-      
       const delta = chunk.choices[0]?.delta?.content || ''
       accumulatedText += delta
     }
 
-    // 流结束，清除定时器
     clearTimeout(timer)
     return accumulatedText
 
@@ -298,14 +296,11 @@ async function openaiChatStreamWithIdleTimeout(params: {
     
     if (parentSignal?.aborted) throw e
 
-    // 如果是由我们自己的 AbortController 触发的，说明是看门狗超时
     if (ac.signal.aborted) {
-      // 区分是还没连上就超时，还是流中间断了
       const kind = streamStarted ? 'stream_idle_timeout' : 'connection_timeout'
       throw new PlannerTimeoutError(idleTimeoutMs, { kind, original: e })
     }
 
-    // 其他类型的网络错误
     if (isLikelySdkOrNetworkTimeout(e)) {
         throw new PlannerTimeoutError(idleTimeoutMs, { kind: 'network_error', original: e })
     }
@@ -317,16 +312,13 @@ async function openaiChatStreamWithIdleTimeout(params: {
   }
 }
 
-// 定义一个通用的 Response 结构，用于 TS 泛型
 type ChatCompletionResponseLike = { choices: { message: { content: string | null } }[] };
 
-// 【修改】重试逻辑：使用流式空闲超时，并增加结果校验器
 async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(params: {
   openai: OpenAI
   request: any
   timeoutsMs?: number[]
   parentSignal?: AbortSignal
-  // 【新增】校验器：如果返回 false 或抛出异常，视为本次尝试失败，消耗一次重试机会
   validator?: (result: T) => void | Promise<void> 
   onTimeoutRetry?: (info: {
     attempt: number
@@ -339,7 +331,7 @@ async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(
 }): Promise<T> {
   const { openai, request, parentSignal, onTimeoutRetry, validator } = params
 
-  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [10_000, 15_000, 20_000])
+  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [20_000, 30_000, 40_000])
     .map(n => Number(n))
     .filter(n => Number.isFinite(n) && n > 0)
 
@@ -349,11 +341,9 @@ async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(
   let lastErr: any
 
   for (let attempt = 1; attempt <= totalAttempts; attempt++) {
-    // 这里的 timeoutMs 现在代表 "最大字符间隙等待时间 (Idle Timeout)"
     const idleTimeoutMs = timeoutsMs[attempt - 1]
 
     try {
-      // 1. 调用流式处理函数
       const fullText = await openaiChatStreamWithIdleTimeout({
         openai,
         request,
@@ -361,34 +351,28 @@ async function openaiChatCreateWithTimeoutRetry<T = ChatCompletionResponseLike>(
         parentSignal,
       })
 
-      // 2. 构造一个模拟的 Response 对象，以维持接口兼容性
       const fakeResponse = {
         choices: [{ message: { content: fullText } }]
       } as unknown as T
 
-      // 3. 【关键新增】执行校验
-      // 如果校验失败抛出 Error，会被下方的 catch 捕获，从而进入下一次循环
       if (validator) {
         await validator(fakeResponse)
       }
 
-      return fakeResponse // 一切正常，返回结果
+      return fakeResponse
     } catch (e: any) {
       lastErr = e
 
       if (parentSignal?.aborted) throw e
-      // 如果已经是最后一次尝试，直接抛出，不再重试
       if (attempt >= totalAttempts) throw e
 
       const nextAttempt = attempt + 1
       const nextTimeoutMs = timeoutsMs[nextAttempt - 1]
       
-      // 判断错误类型：超时 或 校验失败 均可重试
       const reason = summarizePlannerTimeoutReason(e)
 
       onTimeoutRetry?.({ attempt, timeoutMs: idleTimeoutMs, nextAttempt, nextTimeoutMs, reason, error: e })
 
-      // 退避策略
       await sleep(250 * Math.pow(2, attempt - 1))
     }
   }
@@ -439,7 +423,6 @@ function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   }).join('\n\n')
 }
 
-// 【修改】Plan 函数：移除内部 try-catch，使用验证器，提示词增强
 async function planNextSearchAction(params: {
   openai: OpenAI
   model: string
@@ -498,7 +481,6 @@ async function planNextSearchAction(params: {
     '  "selected_ids": string[],',
     isFirstRound ? '  "context_summary": string' : null,
     '}'.replace(/, null/g, ''),
-    // 【关键修改】加强提示，禁止 Markdown 格式
     '请只返回纯 JSON 字符串，不要包含 Markdown 格式（如 ```json ... ```）。'
   ].filter(Boolean).join('\n')
 
@@ -517,10 +499,8 @@ async function planNextSearchAction(params: {
     '现在请决定：selected_ids 是哪些？是否需要继续搜索？' + (isFirstRound ? ' 记得生成 context_summary。' : '')
   ].join('\n')
 
-  const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [10_000, 15_000, 20_000])
+  const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [20_000, 30_000, 40_000])
 
-  // 【关键修改】移除 try-catch 的嵌套重试逻辑
-  // 使用 validator 将解析错误纳入重试循环
   const resp = await openaiChatCreateWithTimeoutRetry<any>({
     openai,
     request: {
@@ -528,29 +508,23 @@ async function planNextSearchAction(params: {
       temperature: 0,
       messages: [{ role: 'system', content: plannerSystem }, { role: 'user', content: plannerUser }],
       response_format: { type: 'json_object' } as any,
-      stream: true, // 显式标记为流式
+      stream: true,
     } as any,
     timeoutsMs: schedule,
     parentSignal: abortSignal,
     onTimeoutRetry,
-    // 【关键新增】传入校验函数
     validator: (res) => {
       const content = res.choices?.[0]?.message?.content ?? ''
-      // 尝试解析 JSON
       const parsed = safeParseJsonFromText(content)
       if (!parsed) {
-        // 主动抛错，会被视为一次 "Attempt Failed"，触发下一次重试
-        // 错误信息会被 onTimeoutRetry 捕获并打印
         throw new Error(`JSON parsing failed (len=${content.length}, content preview: ${trunc(content, 50)})`)
       }
-      // 可选：校验关键字段是否存在
       if (!parsed.action) {
          throw new Error('Invalid JSON: missing "action" field')
       }
     }
   })
 
-  // 能走到这里，说明 validator 一定通过了
   const finalContent = resp.choices?.[0]?.message?.content ?? ''
   return safeParseJsonFromText(finalContent) as SearchPlan
 }
@@ -561,7 +535,7 @@ async function runIterativeWebSearch(params: {
   onProgress?: (status: string) => void
   fullContext: string; date: string
   plannerTimeoutScheduleMs?: number[]
-}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string> }> {
+}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string>; planFailed: boolean }> {
   const {
     openai, plannerModels, userQuestion, maxRounds, maxResults,
     abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress, fullContext, date, plannerTimeoutScheduleMs
@@ -572,7 +546,8 @@ async function runIterativeWebSearch(params: {
   const selectedIds = new Set<string>()
 
   let currentContextSummary: string | null = null
-  const schedule = (plannerTimeoutScheduleMs && plannerTimeoutScheduleMs.length ? plannerTimeoutScheduleMs : [10_000, 15_000, 20_000])
+  const schedule = (plannerTimeoutScheduleMs && plannerTimeoutScheduleMs.length ? plannerTimeoutScheduleMs : [20_000, 30_000, 40_000])
+  let planFailed = false
 
   for (let i = 0; i < maxRounds; i++) {
     if (i === 0) onProgress?.(`⏳ 正在分析用户意图，规划搜索策略...`)
@@ -601,6 +576,7 @@ async function runIterativeWebSearch(params: {
     }
 
     if (!plan) {
+      planFailed = true
       const reason = lastPlanError ? summarizeAnyError(lastPlanError instanceof PlannerTimeoutError ? lastPlanError.original ?? lastPlanError : lastPlanError) : ''
       onProgress?.(`❌ 规划服务暂时不可用，流程结束。${reason ? `\n   原因：${reason}` : ''}`)
       break
@@ -630,7 +606,7 @@ async function runIterativeWebSearch(params: {
 
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
-      const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: String(it.content || '') }))
+      const items = (r.results || []).slice(0, maxResults).map(it => ({ title: String(it.title || ''), url: String(it.url || ''), content: removeImagesFromText(String(it.content || '')) }))
       rounds.push({ query: q, items })
       onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
     } catch (e: any) {
@@ -642,7 +618,7 @@ async function runIterativeWebSearch(params: {
     }
   }
 
-  return { rounds, selectedIds }
+  return { rounds, selectedIds, planFailed }
 }
 
 function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
@@ -785,7 +761,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     else { content = finalMessage }
   }
 
-  // [Fix 3/5] 日志变量分离：searchProcessLog 仅用于即时流式展示，不参与 answerText 的存储
+  // 日志变量分离：searchProcessLog 仅用于即时流式展示，不参与 answerText 的存储
   let searchProcessLog = ''
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
@@ -815,7 +791,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
       const maxResults = Math.max(1, Math.min(10, Number(globalConfig.siteConfig?.webSearchMaxResults ?? process.env.WEB_SEARCH_MAX_RESULTS ?? 5)))
       
-      // 【关键修改】为了严格控制重试次数，这里只使用一个确定的模型，不再进行多模型轮询
       const plannerModels = [actualPlannerModel]
       
       const searchProvider = globalConfig.siteConfig?.webSearchProvider as any
@@ -825,12 +800,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const progressMessages: string[] = []
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
-        searchProcessLog = progressMessages.join('\n') // 实时更新 Log 变量
+        searchProcessLog = progressMessages.join('\n') 
         
         const isFinishing = status.includes('完毕') || status.includes('无需');
         const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...'
         
-        // 推送给前端：Log + Suffix
         processCb?.({
           id: customMessageId, text: searchProcessLog + suffix, role: 'assistant',
           conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined,
@@ -842,12 +816,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const plannerTimeoutScheduleMs =
         parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS)
-        ?? [15_000, 20_000, 25_000]
+        ?? [20_000, 30_000, 40_000]
 
-      // 由于使用了流式空闲超时，客户端的总超时时间可以设置得更长一些，作为最后的兜底
       const plannerClientTimeout = Math.max(
         Number(globalConfig.timeoutMs ?? 0),
-        Math.max(...plannerTimeoutScheduleMs) * 3, // 给够时间，主要靠空闲超时断开
+        Math.max(...plannerTimeoutScheduleMs) * 3,
       )
 
       const plannerOpenai = new OpenAI({
@@ -857,7 +830,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         timeout: plannerClientTimeout,
       })
 
-      const { rounds, selectedIds } = await runIterativeWebSearch({
+      const { rounds, selectedIds, planFailed } = await runIterativeWebSearch({
         openai: plannerOpenai, plannerModels, userQuestion: message, maxRounds, maxResults,
         abortSignal: abort.signal, provider: searchProvider, searxngApiUrl: searchSearxngUrl, tavilyApiKey: searchTavilyKey,
         onProgress: onProgressLocal,
@@ -866,23 +839,26 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
 
       if (progressMessages.length > 0) {
-        searchProcessLog = progressMessages.join('\n') // 确保搜索结束后 log 是完整的
+        searchProcessLog = progressMessages.join('\n')
       }
 
+      // 遇到 planner 出错引发的未完成筛选时开启兜底，全量不作 filter。
       const filteredRounds = rounds.map((r, rIdx) => ({
         query: r.query,
         note: r.note,
-        items: r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
+        items: planFailed 
+               ? r.items 
+               : r.items.filter((_, iIdx) => selectedIds.has(`${rIdx + 1}.${iIdx + 1}`))
       })).filter(r => r.items.length > 0 || r.note)
 
       const ctx = formatAggregatedSearchForAnswer(filteredRounds)
 
       let finalStatusMessage = '✅ 资料整理完毕，正在生成回答...'
-      if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
+      if (planFailed && rounds.length > 0) finalStatusMessage = '⚠️ 资料整理发生异常，保留现存搜索资料进行回答...'
+      else if (!ctx && rounds.length > 0) finalStatusMessage = '⚠️ 未能筛选出有效引用，尝试直接回答...'
 
       processCb?.({
         id: customMessageId,
-        // 这里仅用于 UI 展示，将 Log 和提示连接在一起
         text: (searchProcessLog ? searchProcessLog + '\n\n---\n\n' : '') + `⚡️ ${finalStatusMessage}\n(模型正在阅读 ${ctx.length > 5000 ? '大量' : ''}资料并构思最终回答，请稍候...)`,
         role: 'assistant',
         conversationId: lastContext?.conversationId,
@@ -912,14 +888,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   const finalTokenCount = estimateTokenCount(finalMessages)
   const key = await getRandomApiKey(options.user, model, options.room.accountId, finalTokenCount)
-  if (!key) {
-    const idx = processThreads.findIndex(d => d.key === threadKey); if (idx > -1) processThreads.splice(idx, 1);
-    throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount})，请检查 Key 备注配置。`)
-  }
 
   try {
-    // [Fix 3/5 Helper] 获取“流式展示文本”：包含 Logger + 分割线 + 正文
-    // 注意：这里的分割线使用Markdown分割线，前端展示效果较好
+    if (!key) {
+      throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount} / Model: ${model})，请检查 Key 配置。`)
+    }
+    
     const getCombineStreamText = (currentAnswerText: string) => {
         if (!searchProcessLog) return currentAnswerText
         return `${searchProcessLog}\n\n---\n\n${currentAnswerText}`
@@ -943,15 +917,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const response = await abortablePromise(ai.models.generateContent({ model, contents: [...history, { role: 'user', parts: inputParts }], config: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { aspectRatio: '16:9', imageSize: '4K' }, ...(systemMessage ? { systemInstruction: systemMessage } as any : {}) } as any } as any), abort.signal)
       if (!response.candidates || response.candidates.length === 0) throw new Error('[Gemini] Empty candidates.')
       
-      let answerText = ''; // 纯回答文本，不含 Log
+      let answerText = ''; 
       const parts = response.candidates?.[0]?.content?.parts ?? []
       for (const part of parts as any[]) { if (part?.text) { const replaced = await replaceDataUrlImagesWithUploads(part.text as string); answerText += replaced.text }; const inline = part?.inlineData; if (inline?.data) { const mime = inline.mimeType || 'image/png'; const buffer = Buffer.from(inline.data as string, 'base64'); const ext = mime.split('/')[1] || 'png'; const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`; await fs.writeFile(path.join(UPLOAD_DIR, filename), buffer); answerText += `${answerText ? '\n\n' : ''}![Generated Image](/uploads/${filename})` } }
       if (!answerText) answerText = '[Gemini] Success but no text/image parts returned.'
 
-      // 前端显示：Log + Answer
       processCb?.({ id: customMessageId, text: getCombineStreamText(answerText), role: 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId, detail: undefined })
       
-      // 数据库存储：只存 Answer (answerText)
       return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: answerText }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext.conversationId, model, text: answerText, id: customMessageId, detail: {} } })
     }
 
@@ -968,7 +940,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       isImageModel: isImage
     })
 
-    let answerText = ''; // 纯回答文本，不含 Log
+    let answerText = '';
     let chatIdRes = customMessageId; let modelRes = ''; let usageRes: any
     
     if (isImage) {
@@ -982,21 +954,55 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         answerText += delta;
         chatIdRes = customMessageId; modelRes = chunk.model; usageRes = usageRes || chunk.usage;
         
-        // 流式推送：包含 Logger
         processCb?.({ ...chunk, id: customMessageId, text: getCombineStreamText(answerText), role: chunk.choices[0]?.delta.role || 'assistant', conversationId: lastContext.conversationId, parentMessageId: lastContext.parentMessageId })
       }
     }
     
-    // 最终返回：只包含 answerText（不含 Log），确保数据库中只存有纯净的回答
     return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: answerText }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext.conversationId, model: modelRes, text: answerText, id: chatIdRes, detail: { usage: usageRes && { ...usageRes, estimated: false } } } })
   } catch (error: any) {
     if (isAbortError(error, abort.signal)) throw error
-    const code = error.statusCode
-    if (code === 429 && (error.message.includes('Too Many Requests') || error.message.includes('Rate limit'))) { if (options.tryCount++ < 3) { _lockedKeys.push({ key: key.key, lockedTime: Date.now() }); await new Promise(resolve => setTimeout(resolve, 2000)); const index = processThreads.findIndex(d => d.key === threadKey); if (index > -1) processThreads.splice(index, 1); return await chatReplyProcess(options) } }
-    globalThis.console.error(error)
-    if (Reflect.has(ErrorCodeMessage, code)) return sendResponse({ type: 'Fail', message: ErrorCodeMessage[code] })
-    return sendResponse({ type: 'Fail', message: error.message ?? 'Please check the back-end console' })
-  } finally { const index = processThreads.findIndex(d => d.key === threadKey); if (index > -1) processThreads.splice(index, 1) }
+    
+    const code = error.statusCode || error.status || error.response?.status
+    const errorMsgRaw = error.message ?? String(error)
+    
+    if (code === 429 && (errorMsgRaw.includes('Too Many Requests') || errorMsgRaw.includes('Rate limit'))) { 
+      if (key && options.tryCount++ < 3) { 
+        _lockedKeys.push({ key: key.key, lockedTime: Date.now() }); 
+        await new Promise(resolve => setTimeout(resolve, 2000)); 
+        const index = processThreads.findIndex(d => d.key === threadKey); 
+        if (index > -1) processThreads.splice(index, 1); 
+        return await chatReplyProcess(options) 
+      } 
+    }
+    
+    globalThis.console.error('[ChatReply Process Error]:', error)
+    
+    let displayErrorMsg = errorMsgRaw
+    if (code && Reflect.has(ErrorCodeMessage, code)) {
+       displayErrorMsg = `${ErrorCodeMessage[code]} (${errorMsgRaw})`
+    } else if (code) {
+       displayErrorMsg = `[Status ${code}] ${errorMsgRaw}`
+    }
+
+    // 将错误信息通过进度回调函数推向前端对话框展示，解决无反馈的问题
+    const finalErrorText = searchProcessLog 
+      ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` 
+      : `❌ 模型请求失败：${displayErrorMsg}`
+
+    processCb?.({ 
+      id: customMessageId, 
+      text: finalErrorText, 
+      role: 'assistant', 
+      conversationId: lastContext?.conversationId, 
+      parentMessageId: lastContext?.parentMessageId, 
+      detail: undefined 
+    });
+
+    return sendResponse({ type: 'Fail', message: displayErrorMsg })
+  } finally { 
+    const index = processThreads.findIndex(d => d.key === threadKey); 
+    if (index > -1) processThreads.splice(index, 1) 
+  }
 }
 
 export function abortChatProcess(userId: string, roomId: number) {
