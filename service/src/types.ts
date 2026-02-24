@@ -1,5 +1,4 @@
 import type { JwtPayload } from 'jsonwebtoken'
-import type fetch from 'node-fetch'
 
 export interface RequestProps {
   roomId: number
@@ -24,15 +23,6 @@ export interface ChatContext {
   parentMessageId?: string
 }
 
-export interface ChatGPTUnofficialProxyAPIOptions {
-  accessToken: string
-  apiReverseProxyUrl?: string
-  model?: string
-  debug?: boolean
-  headers?: Record<string, string>
-  fetch?: typeof fetch
-}
-
 export interface ModelConfig {
   apiModel?: APIMODEL
   reverseProxy?: string
@@ -45,24 +35,7 @@ export interface ModelConfig {
   accessTokenExpiredTime?: string
 }
 
-export type APIMODEL = 'ChatGPTAPI' | 'ChatGPTUnofficialProxyAPI' | undefined
-
-export interface JWT {
-  'https://api.openai.com/profile': {
-    'email': string
-    'email_verified': boolean
-  }
-  'https://api.openai.com/auth': {
-    'user_id': string
-  }
-  'iss': string
-  'sub': string
-  'aud': []
-  'iat': number
-  'exp': number
-  'azp': string
-  'scope': string
-}
+export type APIMODEL = 'openai-compatible' | 'google' | undefined
 
 export interface AuthJwtPayload extends JwtPayload {
   name: string
