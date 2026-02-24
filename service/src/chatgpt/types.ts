@@ -1,15 +1,21 @@
-import type OpenAI from 'openai'
-import type { ChatCompletionChunk, ChatCompletionRole } from 'openai/resources'
+// service/src/chatgpt/types.ts
 import type { ChatRoom, UsageResponse, UserInfo } from 'src/storage/model'
+
+export type ChatRole = 'system' | 'user' | 'assistant'
+
+export type MessagePart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
+export type MessageContent = string | MessagePart[]
 
 export interface ChatMessage {
   id: string
   text: MessageContent
-  role: ChatCompletionRole
+  role: ChatRole
   name?: string
   delta?: string
-  // detail?: openai.CreateChatCompletionResponse | CreateChatCompletionStreamResponse
-  detail?: ChatCompletionChunk
+  detail?: any
   parentMessageId?: string
   conversationId?: string
 }
@@ -35,12 +41,17 @@ export interface RequestOptions {
 export interface BalanceResponse {
   total_usage: number
 }
-export type MessageContent = string | Array<OpenAI.ChatCompletionContentPart>
 
-export type ChatResponse = OpenAI.ChatCompletion & {
+export type ChatResponse = {
   text: string
   detail?: {
     usage?: UsageResponse
   }
   conversationId?: string
+  // 保持兼容旧结构
+  object?: string
+  choices?: any[]
+  created?: number
+  model?: string
+  id?: string
 }
