@@ -50,39 +50,57 @@ onMounted(() => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.apiBaseUrl') }}</span>
           <div class="flex-1">
-            <NInput :value="config.apiBaseUrl" placeholder="https://api.openai.com, Only used by ChatGPTAPI" @input="(val) => { config.apiBaseUrl = val }" />
+            <NInput
+              :value="config.apiBaseUrl"
+              placeholder="默认 baseUrl（可被每个 Key 的 baseUrl 覆盖）。如 OpenAI/兼容网关地址"
+              @input="(val) => { config.apiBaseUrl = val }"
+            />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.reverseProxy') }}</span>
           <div class="flex-1">
-            <NInput :value="config.reverseProxy" placeholder="Only used by ChatGPTUnofficialProxyAPI" @input="(val) => { config.reverseProxy = val }" />
+            <NInput
+              :value="config.reverseProxy"
+              placeholder="Legacy（不再使用，可留空）"
+              @input="(val) => { config.reverseProxy = val }"
+            />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.timeout') }}</span>
           <div class="flex-1">
-            <NInput :value="config.timeoutMs !== undefined ? String(config.timeoutMs) : undefined" placeholder="" @input="(val) => { config.timeoutMs = typeof val === 'string' ? Number(val) : undefined }" />
+            <NInput
+              :value="config.timeoutMs !== undefined ? String(config.timeoutMs) : undefined"
+              placeholder=""
+              @input="(val) => { config.timeoutMs = typeof val === 'string' ? Number(val) : undefined }"
+            />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.socks') }}</span>
           <div class="flex-1">
             <NInput :value="config.socksProxy" placeholder="ip:port" @input="(val) => { config.socksProxy = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.socksAuth') }}</span>
           <div class="flex-1">
-            <NInput :value="config.socksAuth" placeholder="name:pasword" @input="(val) => { config.socksAuth = val }" />
+            <NInput :value="config.socksAuth" placeholder="name:password" @input="(val) => { config.socksAuth = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.httpsProxy') }}</span>
           <div class="flex-1">
             <NInput :value="config.httpsProxy" placeholder="" @input="(val) => { config.httpsProxy = val }" />
           </div>
         </div>
+
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]" />
           <NButton :loading="saving" type="primary" @click="updateBaseSetting(config)">
