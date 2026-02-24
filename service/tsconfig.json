@@ -1,9 +1,7 @@
 {
   "compilerOptions": {
     "target": "es2020",
-    "lib": [
-      "esnext"
-    ],
+    "lib": ["esnext", "dom"],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": false,
@@ -14,13 +12,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "baseUrl": ".",
-    "outDir": "build",
+    "outDir": "build"
   },
-  "exclude": [
-    "node_modules",
-    "build"
-  ],
-  "include": [
-    "src/**/*.ts"
-  ]
+  "exclude": ["node_modules", "build"],
+  "include": ["src/**/*.ts"]
 }
