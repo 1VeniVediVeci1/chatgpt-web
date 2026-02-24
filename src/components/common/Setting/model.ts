@@ -45,7 +45,6 @@ export class SiteConfig {
   webSearchMaxRounds?: number
   webSearchPlannerModel?: string
   hiddenModels?: string
-
 }
 
 export class MailConfig {
@@ -56,6 +55,7 @@ export class MailConfig {
   smtpPassword?: string
   smtpFrom?: string
 }
+
 export type TextAuditServiceProvider = 'baidu'
 
 export interface TextAuditServiceOptions {
@@ -63,6 +63,7 @@ export interface TextAuditServiceOptions {
   apiSecret: string
   label?: string
 }
+
 export enum TextAudioType {
   None = 0,
   Request = 1 << 0,
@@ -135,9 +136,14 @@ export class UserPrompt {
   }
 }
 
-export type APIMODEL = 'ChatGPTAPI' | 'ChatGPTUnofficialProxyAPI' | undefined
+/**
+ * ✅ provider（Key 配置页里选）
+ * - openai-compatible：走 OpenAI 兼容接口（可接各种网关/聚合/反代）
+ * - google：Gemini 官方/反代
+ */
+export type APIMODEL = 'openai-compatible' | 'google' | undefined
 
-export const apiModelOptions = ['ChatGPTAPI', 'ChatGPTUnofficialProxyAPI'].map((model: string) => {
+export const apiModelOptions = ['openai-compatible', 'google'].map((model: string) => {
   return { label: model, key: model, value: model }
 })
 
