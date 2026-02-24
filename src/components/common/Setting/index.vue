@@ -15,24 +15,19 @@ import Password from './Password.vue'
 import TwoFA from './TwoFA.vue'
 import Announcement from './Anonuncement.vue'
 import { SvgIcon } from '@/components/common'
-import { useAuthStore, useUserStore } from '@/store'
+import { useUserStore } from '@/store'
 import { useBasicLayout } from '@/hooks/useBasicLayout'
 import ChatRecord from '@/components/common/Setting/ChatRecord.vue'
 
 const props = defineProps<Props>()
-
 const emit = defineEmits<Emit>()
 
 const userStore = useUserStore()
-const authStore = useAuthStore()
 const { isMobile } = useBasicLayout()
-
-const isChatGPTAPI = computed<boolean>(() => !!authStore.isChatGPTAPI)
 
 interface Props {
   visible: boolean
 }
-
 interface Emit {
   (e: 'update:visible', visible: boolean): void
 }
@@ -50,7 +45,12 @@ const show = computed({
 </script>
 
 <template>
-  <NModal v-model:show="show" :auto-focus="false" preset="card" :style="{ 'width': !isMobile ? '80%' : '100%', 'min-height': !isMobile ? '800px' : 'auto' }">
+  <NModal
+    v-model:show="show"
+    :auto-focus="false"
+    preset="card"
+    :style="{ 'width': !isMobile ? '80%' : '100%', 'min-height': !isMobile ? '800px' : 'auto' }"
+  >
     <div>
       <NTabs v-model:value="active" type="line" animated>
         <NTabPane name="General" tab="General">
@@ -62,6 +62,7 @@ const show = computed({
             <General />
           </div>
         </NTabPane>
+
         <NTabPane name="PasswordConfig" tab="PasswordConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri-key-2-line" />
@@ -69,6 +70,7 @@ const show = computed({
           </template>
           <Password />
         </NTabPane>
+
         <NTabPane name="TwoFAConfig" tab="TwoFAConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri-key-2-line" />
@@ -76,7 +78,9 @@ const show = computed({
           </template>
           <TwoFA />
         </NTabPane>
-        <NTabPane v-if="isChatGPTAPI" name="Advanced" tab="Advanced">
+
+        <!-- ✅ Advanced 始终显示（不再依赖 ChatGPTAPI/Unofficial） -->
+        <NTabPane name="Advanced" tab="Advanced">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:equalizer-line" />
             <span class="ml-2">{{ $t('setting.advanced') }}</span>
@@ -85,6 +89,7 @@ const show = computed({
             <Advanced />
           </div>
         </NTabPane>
+
         <NTabPane name="Statistics" tab="Statistics">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:bar-chart-box-line" />
@@ -94,6 +99,7 @@ const show = computed({
             <Statistics />
           </div>
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="Config" tab="Config">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:list-settings-line" />
@@ -101,6 +107,7 @@ const show = computed({
           </template>
           <About />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="ChatRecord" tab="ChatRecord">
           <template #tab>
             <SvgIcon class="text-lg" icon="ic:outline-chat" />
@@ -108,6 +115,7 @@ const show = computed({
           </template>
           <ChatRecord />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="KeysConfig" tab="KeysConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri-key-2-line" />
@@ -115,6 +123,7 @@ const show = computed({
           </template>
           <Key />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="SiteConfig" tab="SiteConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:settings-line" />
@@ -122,6 +131,7 @@ const show = computed({
           </template>
           <Site />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="AnnounceConfig" tab="AnnounceConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:settings-line" />
@@ -129,6 +139,7 @@ const show = computed({
           </template>
           <Announcement />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="MailConfig" tab="MailConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:mail-line" />
@@ -136,6 +147,7 @@ const show = computed({
           </template>
           <Mail />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="AuditConfig" tab="AuditConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri:settings-line" />
@@ -143,6 +155,7 @@ const show = computed({
           </template>
           <Audit />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="UserConfig" tab="UserConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="ri-user-5-line" />
@@ -150,6 +163,7 @@ const show = computed({
           </template>
           <User />
         </NTabPane>
+
         <NTabPane v-if="userStore.userInfo.root" name="GiftCardConfig" tab="GiftCardConfig">
           <template #tab>
             <SvgIcon class="text-lg" icon="mdi-gift" />
