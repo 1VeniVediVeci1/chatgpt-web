@@ -300,4 +300,9 @@ export class UserPrompt {
   }
 }
 
-export type APIMODEL = 'ChatGPTAPI' | 'ChatGPTUnofficialProxyAPI'
+/**
+ * ✅ keyModel（前端 Key 配置页里选）
+ * - openai-compatible：走 OpenAI 兼容接口（可对接各类聚合/反代）
+ * - google：Gemini 官方/反代
+ */
+export type APIMODEL = 'openai-compatible' | 'google'
