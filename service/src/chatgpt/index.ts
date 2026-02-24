@@ -130,7 +130,6 @@ function toCoreMessages(messages: Array<{ role: string; content: any }>): CoreMe
     }
 
     if (Array.isArray(c)) {
-      // 兼容旧格式：{type:'text'} / {type:'image_url'}
       const parts = c.map((p: any) => {
         if (p?.type === 'text')
           return { type: 'text' as const, text: String(p.text ?? '') }
@@ -158,7 +157,6 @@ function toUsageResponse(usage: any): any | undefined {
   }
 }
 
-// ===================== [Helper] 加载上下文消息 =====================
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
 
 async function loadContextMessages(params: {
@@ -172,7 +170,6 @@ async function loadContextMessages(params: {
 
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = []
 
-  // 1) 历史消息
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
@@ -186,19 +183,16 @@ async function loadContextMessages(params: {
     lastMessageId = message.parentMessageId
   }
 
-  // 2) 系统提示词
+  // 修改：仅在这里塞入系统消息，避免和 API 调用的 system 冲突
   if (systemMessage)
     messages.push({ role: 'system', content: systemMessage })
 
-  // 3) 翻转并添加当前用户消息
   messages.reverse()
   messages.push({ role: 'user', content: content as any })
 
   return messages
 }
-// ===================== [End Helper] =====================
 
-// ===================== 联网搜索（Planner + 多轮） =====================
 type SearchPlan = {
   action: 'search' | 'stop'
   query?: string
@@ -221,13 +215,12 @@ function safeParseJsonFromText(text: string): any | null {
 
 function removeImagesFromText(text: string): string {
   if (!text) return ''
-  let clean = text.replace(/!$$[^$$]*]$\s*([^)]+?)\s*$/g, '') // 移除 Markdown 图片
-  clean = clean.replace(/<img[^>]*>/gi, '') // 移除 HTML img
-  clean = clean.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, '') // 移除 Base64 图片
+  let clean = text.replace(/!$$[^$$]*]$\s*([^)]+?)\s*$/g, '')
+  clean = clean.replace(/<img[^>]*>/gi, '')
+  clean = clean.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, '')
   return clean.trim()
 }
 
-// ===== Planner timeout (dynamic schedule) + retry helpers =====
 class PlannerTimeoutError extends Error {
   public readonly code = 'PLANNER_TIMEOUT'
   public readonly kind: string
@@ -290,17 +283,13 @@ function summarizePlannerTimeoutReason(e: any): string {
 function isLikelySdkOrNetworkTimeout(e: any): boolean {
   const status = getStatusCodeLike(e)
   if (status && (status === 504 || status === 503 || status === 502 || status === 500)) return true
-
   const name = String(e?.name ?? '')
   if (name === 'TimeoutError' || name === 'AbortError') return true
-
   const code = String(getErrCodeLike(e) ?? '')
   if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT' || code === 'ECONNRESET') return true
-
   const msg = String(e?.message ?? '')
   if (/timeout|timed out|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(msg)) return true
   if (/\b504\b/.test(msg)) return true
-
   return false
 }
 
@@ -353,7 +342,8 @@ async function aiStreamTextWithIdleTimeout(params: {
     for await (const part of (result as any).fullStream as AsyncIterable<any>) {
       if (part?.type === 'text-delta') {
         resetWatchdog()
-        accumulatedText += String(part.text ?? '')
+        // 关键改动: ai-sdk 返回的是 textDelta 而不是 text
+        accumulatedText += String(part.textDelta ?? '')
       }
     }
 
@@ -362,18 +352,14 @@ async function aiStreamTextWithIdleTimeout(params: {
   }
   catch (e: any) {
     clearTimeout(timer)
-
     if (parentSignal?.aborted) throw e
-
     if (ac.signal.aborted) {
       const kind = streamStarted ? 'stream_idle_timeout' : 'connection_timeout'
       throw new PlannerTimeoutError(idleTimeoutMs, { kind, original: e })
     }
-
     if (isLikelySdkOrNetworkTimeout(e)) {
       throw new PlannerTimeoutError(idleTimeoutMs, { kind: 'network_error', original: e })
     }
-
     throw e
   }
   finally {
@@ -765,7 +751,6 @@ const ErrorCodeMessage: Record<string, string> = {
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
-// ========== DataURL/Uploads 相关（保留原逻辑，用于 Gemini 图片编辑输入） ==========
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
 const MARKDOWN_IMAGE_RE = /!$$[^$$]*]$\s*([^)]+?)\s*$/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
@@ -1077,7 +1062,6 @@ async function imageUrlToAiSdkImagePart(urlStr: string): Promise<AiPart | null> 
   }
   return null
 }
-// ========== DataURL/Uploads END ==========
 
 type ProcessThread = { key: string; userId: string; roomId: number; abort: AbortController; messageId: string }
 const processThreads: ProcessThread[] = []
@@ -1107,7 +1091,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
   const { message, uploadFileKeys, lastContext, process: processCb, systemMessage, temperature, top_p } = options
 
-  // ✅ 占位输出，保证 abort/轮询时前端有“正在生成”的记录
   processCb?.({
     id: customMessageId,
     text: '',
@@ -1125,7 +1108,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const imageModelList = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
   const isImage = imageModelList.some(m => model.includes(m))
 
-  // 1) 处理文件内容合并（保持原逻辑）
   if (uploadFileKeys && uploadFileKeys.length > 0) {
     const textFiles = uploadFileKeys.filter(k => isTextFile(k))
     const imageFiles = uploadFileKeys.filter(k => isImageFile(k))
@@ -1157,7 +1139,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
   }
 
-  // 日志变量分离：searchProcessLog 仅用于即时展示，不参与 answerText 存储
   let searchProcessLog = ''
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
@@ -1202,10 +1183,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
         searchProcessLog = progressMessages.join('\n')
-
         const isFinishing = status.includes('完毕') || status.includes('无需')
         const suffix = isFinishing ? '\n\n⚡️ 准备生成...' : '\n\n⏳ 正在执行...'
-
         processCb?.({
           id: customMessageId,
           text: searchProcessLog + suffix,
@@ -1247,7 +1226,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       if (progressMessages.length > 0) searchProcessLog = progressMessages.join('\n')
 
-      // planner 出错：兜底不做 filter
       const filteredRounds = rounds.map((r, rIdx) => ({
         query: r.query,
         note: r.note,
@@ -1303,7 +1281,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       throw new Error(`没有对应的 apikeys 配置 (Token: ${finalTokenCount} / Model: ${model})，请检查 Key 配置。`)
     }
 
-    // ✅ 所有 key 都允许自定义 baseUrl：key.baseUrl 优先，全局 apiBaseUrl 兜底
     const resolvedBaseUrl = isNotEmptyString(key.baseUrl)
       ? key.baseUrl
       : (isNotEmptyString(globalConfig.apiBaseUrl) ? globalConfig.apiBaseUrl : undefined)
@@ -1325,13 +1302,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       return `${searchProcessLog}\n\n---\n\n${currentAnswerText}`
     }
 
-    // ✅ 只有在 provider=google 且是 gemini 图片模型时，走“最近两轮图片引用/编辑”逻辑
     const isGeminiImageModel = isImage && provider === 'google' && model.includes('gemini')
 
     if (isGeminiImageModel) {
       const dataUrlCache: DataUrlCache = new Map()
-
-      // 先把本次 message content 里的 dataURL 归档到 uploads，便于引用与缓存
       const normalizedCurrent = await normalizeMessageContentDataUrlsToUploads(content, dataUrlCache)
       content = normalizedCurrent.content
 
@@ -1385,9 +1359,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined,
       ])
 
+      // 修复：移除多余的 system 参数，避免合并出两个 system/developer
       const result: any = await generateText({
         model: lm,
-        system: systemMessage || undefined,
         messages: [...historyCore, { role: 'user', content: userParts as any }],
         temperature: finalTemperature,
         topP: shouldUseTopP ? top_p : undefined,
@@ -1435,7 +1409,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // ---- 非 Gemini 图片模型（或 openai-compatible 下的 gemini image 等） ----
     const coreMessages = toCoreMessages(finalMessages)
 
     const callSignal = mergeAbortSignals([
@@ -1443,16 +1416,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined,
     ])
 
-    // 图片/非流式：generateText（同时兼容 result.files 返回图片）
     if (isImage) {
+      // 修复：移除系统传参
       const result: any = await generateText({
         model: lm,
-        system: systemMessage || undefined,
         messages: coreMessages,
         temperature: finalTemperature,
         topP: shouldUseTopP ? top_p : undefined,
         abortSignal: callSignal,
-        // google 也允许返回 image（如果是 Gemini 图像模型但没走特殊分支）
         providerOptions: provider === 'google'
           ? { google: { responseModalities: ['TEXT', 'IMAGE'] } as any }
           : undefined,
@@ -1470,7 +1441,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         }
       }
 
-      // 兼容旧行为：如果直接返回的是 url/base64
       if (answerText && !answerText.startsWith('![') && (answerText.startsWith('http') || answerText.startsWith('data:image')))
         answerText = `![Generated Image](${answerText})`
 
@@ -1500,10 +1470,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // 文本流式：streamText
+    // 修复：移除可能导致系统 Prompt 重复的参数
     const result: any = streamText({
       model: lm,
-      system: systemMessage || undefined,
       messages: coreMessages,
       temperature: finalTemperature,
       topP: shouldUseTopP ? top_p : undefined,
@@ -1527,7 +1496,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let answerText = ''
     for await (const part of (result as any).fullStream as AsyncIterable<any>) {
       if (part?.type === 'text-delta') {
-        const delta = String(part.text ?? '')
+        // 关键改动: ai-sdk v3+ 的 streamText 返回的文本在 textDelta，不在 text！
+        const delta = String(part.textDelta ?? '')
         answerText += delta
         processCb?.({
           id: customMessageId,
@@ -1537,6 +1507,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           parentMessageId: lastContext?.parentMessageId,
           detail: undefined,
         })
+      }
+      else if (part?.type === 'error') {
+        globalThis.console.error('[Stream Error Part]', part.error)
       }
     }
 
