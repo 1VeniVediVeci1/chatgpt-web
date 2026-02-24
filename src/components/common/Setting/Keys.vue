@@ -29,7 +29,7 @@ const { isMobile } = useBasicLayout()
 const loading = ref(false)
 const show = ref(false)
 const handleSaving = ref(false)
-const keyConfig = ref(new KeyConfig('', 'ChatGPTAPI', [], [], ''))
+const keyConfig = ref(new KeyConfig('', 'openai-compatible', [], [], ''))
 
 // 只保留 Token Policy（不再提供备注栏）
 const editingMaxTokens = ref<number | null>(null)
@@ -72,14 +72,14 @@ function createColumns(): DataTableColumns {
       ellipsis: true,
     },
     {
-      title: 'Api Model',
+      title: 'Provider',
       key: 'keyModel',
-      width: 150,
+      width: 160,
     },
     {
       title: 'Base url',
       key: 'baseUrl',
-      width: 150,
+      width: 220,
     },
     {
       title: 'Chat Model',
@@ -140,7 +140,7 @@ function createColumns(): DataTableColumns {
           )
         }
 
-        return nodes.length? nodes: h('span', { style: { color: '#999' } }, '-')
+        return nodes.length ? nodes : h('span', { style: { color: '#999' } }, '-')
       },
     },
     {
@@ -242,7 +242,7 @@ async function handleUpdateKeyConfig() {
     return
   }
 
-  // remark 字段仅用于存储 Token Policy（备注栏已移除）
+  // remark 字段仅用于存储 Token Policy
   keyConfig.value.remark = buildTokenPolicy(editingMaxTokens.value, editingMinTokens.value)
 
   handleSaving.value = true
@@ -250,14 +250,15 @@ async function handleUpdateKeyConfig() {
     await fetchUpsertApiKey(keyConfig.value)
     await handleGetKeys(pagination.page)
     show.value = false
-  } catch (error: any) {
+  }
+  catch (error: any) {
     ms.error(error.message)
   }
   handleSaving.value = false
 }
 
 function handleNewKey() {
-  keyConfig.value = new KeyConfig('', 'ChatGPTAPI', [], [], '')
+  keyConfig.value = new KeyConfig('', 'openai-compatible', [], [], '')
   editingMaxTokens.value = null
   editingMinTokens.value = null
   show.value = true
@@ -315,8 +316,8 @@ onMounted(async () => {
             />
           </div>
           <p v-if="!isMobile">
-            <a v-if="keyConfig.keyModel === 'ChatGPTAPI'" target="_blank" href="https://platform.openai.com/account/api-keys">Get Api Key</a>
-            <a v-else target="_blank" href="https://chat.openai.com/api/auth/session">Get Access Token</a>
+            <a v-if="keyConfig.keyModel === 'openai-compatible'" target="_blank" href="https://platform.openai.com/account/api-keys">Get OpenAI API Key</a>
+            <a v-else-if="keyConfig.keyModel === 'google'" target="_blank" href="https://aistudio.google.com/app/apikey">Get Gemini API Key</a>
           </p>
         </div>
 
@@ -335,7 +336,11 @@ onMounted(async () => {
         <div class="flex items-center space-x-4">
           <span class="flex-shrink-0 w-[100px]">{{ $t('setting.apiBaseUrl') }}</span>
           <div class="flex-1">
-            <NInput v-model:value="keyConfig.baseUrl" style="width: 100%" placeholder="" />
+            <NInput
+              v-model:value="keyConfig.baseUrl"
+              style="width: 100%"
+              placeholder="可选：该 Key 专用 baseUrl（优先级最高）。openai-compatible 填 OpenAI/兼容网关；google 填 Gemini 反代域名"
+            />
           </div>
         </div>
 
