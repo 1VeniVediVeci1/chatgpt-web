@@ -23,17 +23,24 @@ export async function getCacheConfig(): Promise<Config> {
   return Promise.resolve(cachedConfig)
 }
 
+function normalizeApiModel(input: any): 'openai-compatible' | 'google' {
+  const v = String(input ?? '').trim()
+  if (v === 'google') return 'google'
+  return 'openai-compatible'
+}
+
 export async function getOriginConfig() {
   let config = await getConfig()
   if (config == null) {
-    config = new Config(new ObjectId(),
+    config = new Config(
+      new ObjectId(),
       !Number.isNaN(+process.env.TIMEOUT_MS) ? +process.env.TIMEOUT_MS : 600 * 1000,
       process.env.OPENAI_API_KEY,
       process.env.OPENAI_API_DISABLE_DEBUG === 'true',
-      process.env.OPENAI_ACCESS_TOKEN,
+      process.env.OPENAI_ACCESS_TOKEN, // legacy（不再使用）
       process.env.OPENAI_API_BASE_URL,
-      process.env.OPENAI_API_MODEL === 'ChatGPTUnofficialProxyAPI' ? 'ChatGPTUnofficialProxyAPI' : 'ChatGPTAPI',
-      process.env.API_REVERSE_PROXY,
+      normalizeApiModel(process.env.OPENAI_API_MODEL),
+      process.env.API_REVERSE_PROXY, // legacy（不再使用）
       (process.env.SOCKS_PROXY_HOST && process.env.SOCKS_PROXY_PORT)
         ? (`${process.env.SOCKS_PROXY_HOST}:${process.env.SOCKS_PROXY_PORT}`)
         : '',
@@ -49,8 +56,10 @@ export async function getOriginConfig() {
         process.env.REGISTER_ENABLED === 'true',
         process.env.REGISTER_REVIEW === 'true',
         process.env.REGISTER_MAILS,
-        process.env.SITE_DOMAIN),
-      new MailConfig(process.env.SMTP_HOST,
+        process.env.SITE_DOMAIN,
+      ),
+      new MailConfig(
+        process.env.SMTP_HOST,
         !Number.isNaN(+process.env.SMTP_PORT) ? +process.env.SMTP_PORT : 465,
         process.env.SMTP_TSL === 'true',
         process.env.SMTP_USERNAME,
@@ -75,12 +84,8 @@ export async function getOriginConfig() {
     }
     if (config.siteConfig.registerReview === undefined)
       config.siteConfig.registerReview = process.env.REGISTER_REVIEW === 'true'
-  }
-  if (config.apiModel !== 'ChatGPTAPI' && config.apiModel !== 'ChatGPTUnofficialProxyAPI') {
-    if (isNotEmptyString(config.accessToken))
-      config.apiModel = 'ChatGPTUnofficialProxyAPI'
-    else
-      config.apiModel = 'ChatGPTAPI'
+    if (!config.apiModel)
+      config.apiModel = 'openai-compatible'
   }
 
   if (config.auditConfig === undefined) {
@@ -192,15 +197,14 @@ export function clearApiKeyCache() {
 export async function getApiKeys() {
   const result = await getKeys()
   const config = await getCacheConfig()
+
+  // ✅ 没有 key 时：用全局 apiKey 自动补一条 openai-compatible（兼容旧行为）
   if (result.keys.length <= 0) {
-    if (config.apiModel === 'ChatGPTAPI')
-      result.keys.push(await upsertKey(new KeyConfig(config.apiKey, 'ChatGPTAPI', [], [], '')))
-
-    if (config.apiModel === 'ChatGPTUnofficialProxyAPI')
-      result.keys.push(await upsertKey(new KeyConfig(config.accessToken, 'ChatGPTUnofficialProxyAPI', [], [], '')))
-
-    result.total++
+    if (isNotEmptyString(config.apiKey))
+      result.keys.push(await upsertKey(new KeyConfig(config.apiKey, 'openai-compatible', [], [], '')))
+    result.total = result.keys.length
   }
+
   result.keys.forEach((key) => {
     if (key.userRoles == null || key.userRoles.length <= 0) {
       key.userRoles.push(UserRole.Admin)
