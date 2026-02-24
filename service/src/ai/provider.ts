@@ -3,20 +3,8 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import nodeFetch from 'node-fetch'
 
-/**
- * ✅ Debug 总开关：按你的要求“默认开启”，不再读取 .env
- * - API_DEBUG: 是否输出调试日志
- * - API_DEBUG_FETCH: 是否抓包输出上游 API 请求/响应
- */
 const API_DEBUG = true
 const API_DEBUG_FETCH = true
-
-/**
- * 响应体预览最多读取多少字节
- * - 普通 JSON/文本：resp.clone().text() 后截断
- * - SSE(text/event-stream)：读取流的前 N bytes
- */
-const API_DEBUG_FETCH_BODY_BYTES = 2048
 
 export type KeyProvider = 'openai-compatible' | 'google'
 
@@ -57,11 +45,9 @@ function trunc(s: any, n = 1200): string {
 function redactHeaders(headers: any) {
   const out: Record<string, any> = {}
   try {
-    // Headers
     if (headers?.forEach) {
       headers.forEach((v: any, k: any) => { out[String(k)] = v })
     }
-    // plain object
     else if (headers && typeof headers === 'object') {
       Object.assign(out, headers)
     }
@@ -83,38 +69,6 @@ function redactHeaders(headers: any) {
   return out
 }
 
-async function readStreamPreview(body: any, maxBytes: number) {
-  try {
-    if (!body?.getReader) return ''
-    const reader = body.getReader()
-    const chunks: Uint8Array[] = []
-    let total = 0
-
-    while (total < maxBytes) {
-      const { value, done } = await reader.read()
-      if (done) break
-      if (value) {
-        chunks.push(value)
-        total += value.length
-      }
-    }
-
-    // 只取消 clone 的分支，避免等待整个 SSE 完成
-    try { await reader.cancel() } catch {}
-
-    const buf = Buffer.concat(chunks.map(c => Buffer.from(c)))
-    return buf.toString('utf8')
-  }
-  catch {
-    return ''
-  }
-}
-
-/**
- * ✅ 上游抓包：打印 Request/Response/Preview
- * - 不会泄露 Authorization（已脱敏）
- * - SSE 只取前 N bytes
- */
 function wrapFetchWithDebug(fetchFn: any) {
   return async (input: any, init?: any) => {
     if (!API_DEBUG || !API_DEBUG_FETCH)
@@ -146,24 +100,14 @@ function wrapFetchWithDebug(fetchFn: any) {
       const ct = String(resp?.headers?.get?.('content-type') ?? '')
       const respHeaders = redactHeaders(resp?.headers)
 
-      let preview = ''
-      if (ct.includes('text/event-stream')) {
-        // SSE：读取 clone 的前 N bytes
-        preview = await readStreamPreview(resp.clone().body, API_DEBUG_FETCH_BODY_BYTES)
-      }
-      else {
-        const txt = await resp.clone().text().catch(() => '')
-        preview = txt ? trunc(txt, API_DEBUG_FETCH_BODY_BYTES) : ''
-      }
-
       console.log('[Response]', {
         status: resp.status,
         statusText: resp.statusText,
         ms,
         contentType: ct,
         headers: respHeaders,
+        isStream: ct.includes('text/event-stream')
       })
-      console.log('[ResponsePreview]', preview || '(empty)')
       console.log('====== [Upstream Fetch Debug End] ======')
 
       return resp
@@ -177,10 +121,6 @@ function wrapFetchWithDebug(fetchFn: any) {
   }
 }
 
-/**
- * ✅ 强制 baseUrl 生效：改写 origin（保留 pathname+query）
- * - 适用于你自建反代：只要它能按原路径转发即可
- */
 function wrapFetchWithBaseUrl(fetchFn: any, baseUrl: string) {
   const base = new URL(normalizeBaseUrl(baseUrl)! + '/')
   return async (input: any, init?: any) => {
@@ -204,7 +144,6 @@ export function createLanguageModel(params: {
   const baseUrl = normalizeBaseUrl(params.baseUrl)
 
   if (provider === 'google') {
-    // google：如果配置了 baseUrl，先强制改写 origin，再套 debug
     const fetchWithBase = baseUrl ? wrapFetchWithBaseUrl(baseFetch, baseUrl) : baseFetch
     const fetchWithDebug = wrapFetchWithDebug(fetchWithBase)
 
@@ -217,8 +156,6 @@ export function createLanguageModel(params: {
     return google(model)
   }
 
-  // openai-compatible
-  // 注意：这里仍使用 ai-sdk 的 baseURL 逻辑，不强行改写 pathname，避免 baseUrl 带 path 的用户被破坏
   const openai = createOpenAI({
     apiKey,
     ...(baseUrl ? { baseURL: baseUrl } : {}),
