@@ -983,7 +983,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const requestBody = {
         contents: [...historyNative, { role: 'user', parts: nativeUserParts }],
         generationConfig: { temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined,
-          ...(isGemini3ProImageModel ? { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: '16:9' } } : {}) },
+          ...(isGemini3ProImageModel ? { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } } : {}) },
       }
       const res = await fetch(fetchUrl, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key.key, 'Authorization': `Bearer ${key.key}` },
