@@ -906,14 +906,14 @@ onUnmounted(() => stopPolling())
                 >
                   <SvgIcon icon="ri:file-music-line" class="text-lg" style="color: #f59e0b;" />
                   <div>
-                    <div class="text-sm font-medium">PDF / 音视 / 视频</div>
+                    <div class="text-sm font-medium">PDF / 音频 / 视频</div>
                     <div class="text-[11px] text-gray-400">PDF, MP4, MP3, WAV...</div>
                   </div>
                 </div>
               </div>
             </NPopover>
 
-            <!-- 隐藏的三个 NUpload 组件 -->
+            <!-- 隐藏的三个 NUpload 组件（通过点击菜单项触发） -->
             <NUpload
               ref="imageUploadRef"
               action="/api/upload-image"
