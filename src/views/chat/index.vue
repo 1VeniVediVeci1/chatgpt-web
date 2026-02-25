@@ -226,7 +226,11 @@ function ensureAssistantPlaceholder(roomId: number, jobUuid: number): number | u
 
 async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
   const u: number | undefined = (processingUuidRef.value ?? inferLatestUuidFromUI()) ?? undefined
-  if (u === undefined) return
+  if (u === undefined) {
+    // 强制脱困安全网
+    if (finalize) { loading.value = false; processingUuidRef.value = undefined; stopPolling() }
+    return
+  }
   try {
     const r = await get<{
       text: string
@@ -242,10 +246,9 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
     let targetIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === u)
     if (targetIndex === -1) {
       const idx = ensureAssistantPlaceholder(roomId, u)
-      if (idx === undefined) return
-      targetIndex = idx
+      if (idx !== undefined) targetIndex = idx
     }
-    if (!dataSources.value[targetIndex]?.inversion) {
+    if (targetIndex !== -1 && !dataSources.value[targetIndex]?.inversion) {
       updateChatSome(roomId, targetIndex, {
         text: d.text ?? '',
         loading: finalize ? false : true,
@@ -253,6 +256,15 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
         usage: d.usage ?? dataSources.value[targetIndex].usage,
       })
     }
+  }
+  catch (e) {
+    console.error('[fetchLatestAndUpdateUI] fail:', e)
+    if (finalize) {
+      const targetIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === u)
+      if (targetIndex !== -1 && !dataSources.value[targetIndex]?.inversion) updateChatSome(roomId, targetIndex, { loading: false })
+    }
+  }
+  finally {
     if (finalize) {
       loading.value = false
       processingUuidRef.value = undefined
@@ -260,7 +272,6 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
     }
     scrollToBottomIfAtBottom()
   }
-  catch { /* ignore */ }
 }
 
 function startPolling() {
@@ -283,14 +294,16 @@ function startPolling() {
         await fetchLatestAndUpdateUI(roomId, false)
       }
       else {
-        loading.value = false
+        // 请求完毕停止状态
         stopPolling()
         await fetchLatestAndUpdateUI(roomId, true)
       }
     }
     catch (e) {
-      console.error(e)
+      console.error('[Polling] fail:', e)
       stopPolling()
+      loading.value = false
+      processingUuidRef.value = undefined
     }
   }, 2000)
 }
@@ -352,6 +365,7 @@ async function checkProcessStatus() {
   }
   catch (e) {
     console.error(e)
+    loading.value = false
   }
 }
 
@@ -892,14 +906,14 @@ onUnmounted(() => stopPolling())
                 >
                   <SvgIcon icon="ri:file-music-line" class="text-lg" style="color: #f59e0b;" />
                   <div>
-                    <div class="text-sm font-medium">PDF / 音频 / 视频</div>
+                    <div class="text-sm font-medium">PDF / 音视 / 视频</div>
                     <div class="text-[11px] text-gray-400">PDF, MP4, MP3, WAV...</div>
                   </div>
                 </div>
               </div>
             </NPopover>
 
-            <!-- 隐藏的三个 NUpload 组件（通过点击菜单项触发） -->
+            <!-- 隐藏的三个 NUpload 组件 -->
             <NUpload
               ref="imageUploadRef"
               action="/api/upload-image"
