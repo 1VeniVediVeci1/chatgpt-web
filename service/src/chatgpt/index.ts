@@ -80,16 +80,13 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
     const ext = path.extname(realFilename).toLowerCase().replace('.', '')
 
     let mime = 'application/octet-stream'
-    // 图片
     if (ext === 'jpg' || ext === 'jpeg') mime = 'image/jpeg'
     else if (ext === 'png') mime = 'image/png'
     else if (ext === 'webp') mime = 'image/webp'
     else if (ext === 'gif') mime = 'image/gif'
     else if (ext === 'heic') mime = 'image/heic'
     else if (ext === 'bmp') mime = 'image/bmp'
-    // PDF
     else if (ext === 'pdf') mime = 'application/pdf'
-    // 视频
     else if (ext === 'mp4') mime = 'video/mp4'
     else if (ext === 'mov') mime = 'video/quicktime'
     else if (ext === 'avi') mime = 'video/x-msvideo'
@@ -97,7 +94,6 @@ async function getFileBase64(filename: string): Promise<{ mime: string; data: st
     else if (ext === 'flv') mime = 'video/x-flv'
     else if (ext === 'webm') mime = 'video/webm'
     else if (['mpeg', 'mpg', 'mpegps'].includes(ext)) mime = 'video/mpeg'
-    // 音频
     else if (ext === 'mp3') mime = 'audio/mp3'
     else if (ext === 'wav') mime = 'audio/wav'
     else if (ext === 'ogg') mime = 'audio/ogg'
@@ -1089,7 +1085,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         answerText += delta
         processCb?.({ id: customMessageId, text: getCombineStreamText(answerText), role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
       }
-      else if (part?.type === 'error') globalThis.console.error('[Stream Error Part]', part.error)
+      else if (part?.type === 'error') {
+        globalThis.console.error('[Stream Error Part]', part.error)
+        throw part.error  // 关键修复：主动抛出隐藏的流错误来触发 fail/retry 层
+      }
     }
 
     let usageRes: any
@@ -1100,7 +1099,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   catch (error: any) {
     if (isAbortError(error, abort.signal)) throw error
 
-    // 完全修复 OneAPI 与 Vercel AI SDK 嵌套 Error 的解析过程
+    // 解析完全嵌套的最深层的真实报错内容（适配 AI SDK 最新特性）
     const realError = error?.lastError ?? error?.cause ?? error
     const code = realError?.statusCode || realError?.status || realError?.response?.status || error?.statusCode
 
@@ -1132,7 +1131,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const finalErrorText = searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`
     processCb?.({ id: customMessageId, text: finalErrorText, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
     
-    // 如果抛出错误，触发 catch 到 fail 层
+    // 主动拒绝以切断任务状态，释放前端等待
     return Promise.reject({ message: displayErrorMsg, data: null, status: 'Fail' })
   }
   finally {
