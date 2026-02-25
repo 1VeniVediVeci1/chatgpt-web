@@ -4,7 +4,7 @@ import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, 
 import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import type { MessageReactive, UploadFileInfo } from 'naive-ui'
-import { NAutoComplete, NButton, NInput, NSelect, NSlider, NSpace, NSpin, NUpload, useDialog, useMessage } from 'naive-ui'
+import { NAutoComplete, NButton, NInput, NPopover, NSelect, NSlider, NSpace, NSpin, NUpload, useDialog, useMessage } from 'naive-ui'
 import html2canvas from 'html2canvas'
 import { Message } from './components'
 import { useScroll } from './hooks/useScroll'
@@ -55,27 +55,22 @@ const showPrompt = ref(false)
 const nowSelectChatModel = ref<string | null>(null)
 const currentChatModel = computed(() => nowSelectChatModel.value ?? currentChatHistory.value?.chatModel ?? userStore.userInfo.config.chatModel)
 
-// ✅ 当前 room 正在生成的 uuid（统一用 undefined，不用 null）
 const processingUuidRef = ref<number | undefined>(undefined)
 
 const groupedChatModelOptions = computed(() => {
   const session = authStore.session
   const base = session?.chatModels ?? []
   if (!base.length) return []
-
   const geminiSet = new Set(session?.geminiChatModels ?? [])
   const nonStreamSet = new Set(session?.nonStreamChatModels ?? [])
-
   const gemini: any[] = []
   const nonStream: any[] = []
   const others: any[] = []
-
   for (const opt of base) {
     if (geminiSet.has(opt.value)) gemini.push(opt)
     else if (nonStreamSet.has(opt.value)) nonStream.push(opt)
     else others.push(opt)
   }
-
   const groups: any[] = []
   if (gemini.length) groups.push({ type: 'group', label: 'Gemini', key: 'g_gemini', children: gemini })
   if (nonStream.length) groups.push({ type: 'group', label: '非流式/图片模型', key: 'g_nonstream', children: nonStream })
@@ -86,17 +81,7 @@ const groupedChatModelOptions = computed(() => {
 const currentNavIndexRef = ref<number>(-1)
 const isVisionModel = ref(true)
 
-/**
- * ✅ 联网搜索开关（前端控制）
- * - true：后端会做“模型判断是否需要搜索 + 多轮调整关键词搜索”
- * - false：不启用
- */
 const searchMode = ref(false)
-/**
- * ✅ 后台是否允许联网搜索（管理员配置）
- * - true：用户可以使用地球按钮
- * - false：地球按钮禁用
- */
 const webSearchAllowed = computed(() => authStore.session?.webSearchEnabled === true)
 
 let loadingms: MessageReactive
@@ -106,10 +91,92 @@ let prevScrollTop: number
 const promptStore = usePromptStore()
 const { promptList: promptTemplate } = storeToRefs<any>(promptStore)
 
-const imageUploadFileKeysRef = ref<string[]>([])
-const textUploadFileKeysRef = ref<string[]>([])
+// ========== 统一上传文件管理 ==========
+interface UploadedFile {
+  key: string
+  type: 'img' | 'txt' | 'file'
+  name: string
+}
 
-// ✅ 浏览器端 interval 类型
+const uploadedFilesRef = ref<UploadedFile[]>([])
+const showUploadPopover = ref(false)
+
+const imageUploadRef = ref<any>(null)
+const textUploadRef = ref<any>(null)
+const mediaUploadRef = ref<any>(null)
+
+function handleUploadFinish(fileType: 'img' | 'txt' | 'file', options: { file: UploadFileInfo; event?: ProgressEvent }) {
+  if (options.file.status === 'finished') {
+    const response = (options.event?.target as XMLHttpRequest).response
+    const key = `${response.data.fileKey}`
+    uploadedFilesRef.value.push({
+      key,
+      type: fileType,
+      name: options.file.name || key,
+    })
+    showUploadPopover.value = false
+    ms.success(`${options.file.name || '文件'} 上传成功`)
+  }
+}
+
+function handleFinishImage(options: { file: UploadFileInfo; event?: ProgressEvent }) {
+  handleUploadFinish('img', options)
+}
+
+function handleFinishText(options: { file: UploadFileInfo; event?: ProgressEvent }) {
+  handleUploadFinish('txt', options)
+}
+
+function handleFinishMedia(options: { file: UploadFileInfo; event?: ProgressEvent }) {
+  handleUploadFinish('file', options)
+}
+
+function handleDeleteUploadedFile(index: number) {
+  uploadedFilesRef.value.splice(index, 1)
+}
+
+function handleBeforeUpload(data: { file: UploadFileInfo }) {
+  if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
+    ms.error('文件大小不能超过 100MB')
+    return false
+  }
+  return true
+}
+
+function getFileTypeIcon(type: string): string {
+  if (type === 'img') return 'ri:image-line'
+  if (type === 'txt') return 'ri:file-text-line'
+  return 'ri:file-music-line'
+}
+
+function getFileTypeColor(type: string): string {
+  if (type === 'img') return '#10b981'
+  if (type === 'txt') return '#3b82f6'
+  return '#f59e0b'
+}
+
+function triggerImageUpload() {
+  nextTick(() => {
+    const el = document.getElementById('unified-upload-image')
+    if (el) el.click()
+  })
+}
+
+function triggerTextUpload() {
+  nextTick(() => {
+    const el = document.getElementById('unified-upload-text')
+    if (el) el.click()
+  })
+}
+
+function triggerMediaUpload() {
+  nextTick(() => {
+    const el = document.getElementById('unified-upload-media')
+    if (el) el.click()
+  })
+}
+// ========== 统一上传文件管理 END ==========
+
 let pollInterval: ReturnType<typeof setInterval> | null = null
 
 function getCurrentRoomId(): number | undefined {
@@ -135,21 +202,11 @@ async function fetchRoomProcessStatus(roomId: number) {
   })
 }
 
-/**
- * ✅ 确保“本轮 jobUuid 对应的 assistant 消息”存在
- * - 如果已有：返回其 index
- * - 如果没有且最后一条是 user：补一个占位 assistant（uuid=jobUuid）
- * - 否则：返回最后一条 index（不强行插入，避免重复空白）
- */
 function ensureAssistantPlaceholder(roomId: number, jobUuid: number): number | undefined {
   const existedIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === jobUuid)
-  if (existedIndex !== -1)
-    return existedIndex
-
+  if (existedIndex !== -1) return existedIndex
   const lastIndex = dataSources.value.length - 1
-  if (lastIndex < 0)
-    return undefined
-
+  if (lastIndex < 0) return undefined
   const lastItem = dataSources.value[lastIndex]
   if (lastItem?.inversion) {
     addChat(roomId, {
@@ -164,15 +221,12 @@ function ensureAssistantPlaceholder(roomId: number, jobUuid: number): number | u
     })
     return dataSources.value.length - 1
   }
-
-  // 最后一条是 assistant，但 uuid 不匹配：不再插入，防止叠两个空白
   return lastIndex
 }
 
 async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
   const u: number | undefined = (processingUuidRef.value ?? inferLatestUuidFromUI()) ?? undefined
   if (u === undefined) return
-
   try {
     const r = await get<{
       text: string
@@ -184,19 +238,13 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
       url: '/chat-latest',
       data: { roomId, uuid: u },
     })
-
     const d: any = r.data
-
-    // ✅ 优先更新“jobUuid 对应的 assistant 消息”，如果不存在才看最后一条
     let targetIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === u)
     if (targetIndex === -1) {
-      // 如果最后一条是 user，补一个占位（避免更新不到）
       const idx = ensureAssistantPlaceholder(roomId, u)
       if (idx === undefined) return
       targetIndex = idx
     }
-
-    // 只更新 assistant
     if (!dataSources.value[targetIndex]?.inversion) {
       updateChatSome(roomId, targetIndex, {
         text: d.text ?? '',
@@ -205,18 +253,14 @@ async function fetchLatestAndUpdateUI(roomId: number, finalize = false) {
         usage: d.usage ?? dataSources.value[targetIndex].usage,
       })
     }
-
     if (finalize) {
       loading.value = false
       processingUuidRef.value = undefined
       stopPolling()
     }
-
     scrollToBottomIfAtBottom()
   }
-  catch {
-    // ignore
-  }
+  catch { /* ignore */ }
 }
 
 function startPolling() {
@@ -225,29 +269,20 @@ function startPolling() {
     try {
       const roomId = getCurrentRoomId()
       if (!roomId) return
-
       const { data } = await fetchRoomProcessStatus(roomId)
-
       if (data.isProcessing) {
         loading.value = true
-
         const jobUuid: number | undefined = (data.uuid ?? processingUuidRef.value ?? inferLatestUuidFromUI()) ?? undefined
         processingUuidRef.value = jobUuid
-
-        // ✅ 历史还没加载出来：不要插入占位，直接等下一轮
         if (!dataSources.value.length) return
-
-        // ✅ 如果已知 jobUuid，确保占位存在（必要时补一条）
         if (jobUuid !== undefined) {
           const idx = ensureAssistantPlaceholder(roomId, jobUuid)
           if (idx !== undefined && !dataSources.value[idx]?.inversion && !dataSources.value[idx].loading)
             updateChatSome(roomId, idx, { loading: true })
         }
-
         await fetchLatestAndUpdateUI(roomId, false)
       }
       else {
-        // done
         loading.value = false
         stopPolling()
         await fetchLatestAndUpdateUI(roomId, true)
@@ -267,56 +302,32 @@ function stopPolling() {
   }
 }
 
-/**
- * ✅ 修复：切回房间时不要额外插入“空白 assistant”导致重复
- */
 async function checkProcessStatus() {
   try {
     stopPolling()
     loading.value = false
     processingUuidRef.value = undefined
-
     const roomId = getCurrentRoomId()
     if (!roomId) return
-
     const { data } = await fetchRoomProcessStatus(roomId)
-
     if (!data.isProcessing) {
       loading.value = false
       processingUuidRef.value = undefined
       return
     }
-
     loading.value = true
-
-    // ✅ 把后端的 number|null 统一转成 number|undefined
     const jobUuid: number | undefined = (data.uuid ?? inferLatestUuidFromUI()) ?? undefined
     processingUuidRef.value = jobUuid
-
-    // ✅ 历史尚未加载：不插入占位，直接开始轮询
-    if (!dataSources.value.length) {
-      startPolling()
-      return
-    }
-
-    // ✅ 没有 jobUuid（极少数）：直接轮询等待后端落库
-    if (jobUuid === undefined) {
-      startPolling()
-      return
-    }
-
-    // ✅ 已经存在该 jobUuid 的 assistant：只标记 loading
+    if (!dataSources.value.length) { startPolling(); return }
+    if (jobUuid === undefined) { startPolling(); return }
     const existingAssistantIndex = dataSources.value.findIndex(m => !m.inversion && m.uuid === jobUuid)
     if (existingAssistantIndex !== -1) {
       if (!dataSources.value[existingAssistantIndex].loading)
         updateChatSome(roomId, existingAssistantIndex, { loading: true })
-
       await fetchLatestAndUpdateUI(roomId, false)
       startPolling()
       return
     }
-
-    // ✅ 只有最后一条是 user 时才补占位 assistant（uuid=jobUuid）
     const lastIndex = dataSources.value.length - 1
     const lastItem = dataSources.value[lastIndex]
     if (lastItem?.inversion) {
@@ -336,7 +347,6 @@ async function checkProcessStatus() {
       if (!lastItem?.loading)
         updateChatSome(roomId, lastIndex, { loading: true })
     }
-
     await fetchLatestAndUpdateUI(roomId, false)
     startPolling()
   }
@@ -348,11 +358,7 @@ async function checkProcessStatus() {
 const handleLoadingChain = async () => {
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
-  // 1) 切换房间时先停止旧轮询
   stopPolling()
-
-  // 2) 拉取历史
   await chatStore.syncChat(
     { uuid: roomId } as Chat.History,
     undefined,
@@ -364,8 +370,6 @@ const handleLoadingChain = async () => {
       })
       if (inputRef.value && !isMobile.value)
         (inputRef.value as any)?.focus()
-
-      // 3) 历史拉完后，检查该房间是否有运行任务
       checkProcessStatus()
     },
   )
@@ -377,25 +381,20 @@ async function onConversation() {
   let message = prompt.value
   if (!message || message.trim() === '') return
   if (loading.value) return
-
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
   if (nowSelectChatModel.value && currentChatHistory.value)
     currentChatHistory.value.chatModel = nowSelectChatModel.value
 
+  // 将统一文件列表转换为带前缀的 keys
   const uploadFileKeys = isVisionModel.value
-    ? [
-        ...imageUploadFileKeysRef.value.map(k => `img:${k}`),
-        ...textUploadFileKeysRef.value.map(k => `txt:${k}`),
-      ]
+    ? uploadedFilesRef.value.map(f => `${f.type}:${f.key}`)
     : []
 
-  imageUploadFileKeysRef.value = []
-  textUploadFileKeysRef.value = []
+  // 清空已上传列表
+  uploadedFilesRef.value = []
 
   controller = new AbortController()
-
   const chatUuid = Date.now()
   processingUuidRef.value = chatUuid
 
@@ -461,31 +460,20 @@ async function onConversation() {
   }
 }
 
-/**
- * ✅ Stop Responding：保证传 roomId，且立即停止轮询/结束 loading
- */
 async function handleStop() {
   if (!loading.value) return
-
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
-  // 1) abort 前端请求（如果还没返回）
   controller.abort()
-
-  // 2) 取当前 UI 已输出文本
   const u = processingUuidRef.value
   const assistantIndex = (u !== undefined)
     ? dataSources.value.findIndex(m => !m.inversion && m.uuid === u)
     : -1
-
   const lastIndex = dataSources.value.length - 1
   const currentAssistantIndex = assistantIndex !== -1
     ? assistantIndex
     : (lastIndex >= 0 && !dataSources.value[lastIndex].inversion ? lastIndex : -1)
-
   const currentText = currentAssistantIndex >= 0 ? (dataSources.value[currentAssistantIndex].text ?? '') : ''
-
   try {
     await fetchChatStopResponding(roomId, currentText)
   }
@@ -493,15 +481,11 @@ async function handleStop() {
     console.error('[StopResponding] abort failed:', e)
   }
   finally {
-    // 3) 立即结束前端状态
     stopPolling()
     loading.value = false
     processingUuidRef.value = undefined
-
     if (currentAssistantIndex >= 0 && !dataSources.value[currentAssistantIndex].inversion)
       updateChatSome(roomId, currentAssistantIndex, { loading: false })
-
-    // 4) 稍后再拉一次最终内容（后端可能已落库 partial）
     setTimeout(() => {
       void fetchLatestAndUpdateUI(roomId, true)
     }, 300)
@@ -512,28 +496,22 @@ async function onRegenerate(index: number) {
   if (loading.value) return
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
   controller = new AbortController()
-
   const { requestOptions } = dataSources.value[index]
   let responseCount = dataSources.value[index].responseCount || 1
   responseCount++
-
   const message = requestOptions?.prompt ?? ''
   let options: Chat.ConversationRequest = {}
   if (requestOptions.options) options = { ...requestOptions.options }
-
   let uploadFileKeys: string[] = []
   if (index > 0) {
     const previousMessage = dataSources.value[index - 1]
     if (previousMessage && previousMessage.inversion && previousMessage.images && previousMessage.images.length > 0)
       uploadFileKeys = previousMessage.images
   }
-
   loading.value = true
   const chatUuid = dataSources.value[index].uuid || Date.now()
   processingUuidRef.value = chatUuid
-
   updateChat(roomId, index, {
     dateTime: new Date().toLocaleString(),
     text: '',
@@ -544,7 +522,6 @@ async function onRegenerate(index: number) {
     conversationOptions: null,
     requestOptions: { prompt: message, options: { ...options } },
   })
-
   try {
     await fetchChatAPIProcess<{ jobId: string }>({
       roomId,
@@ -631,7 +608,6 @@ function handleDelete(index: number, fast: boolean) {
   if (loading.value) return
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
   if (fast === true) {
     chatStore.deleteChatByUuid(roomId, index)
   }
@@ -656,7 +632,6 @@ function handleClear() {
   if (loading.value) return
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
   dialog.warning({
     title: t('chat.clearChat'),
     content: t('chat.clearChatConfirm'),
@@ -686,13 +661,10 @@ function handleEnter(event: KeyboardEvent) {
 async function loadMoreMessage(event: any) {
   const roomId = getCurrentRoomId()
   if (!roomId) return
-
   const chatIndex = chatStore.chat.findIndex(d => d.uuid === roomId)
   if (chatIndex <= -1 || chatStore.chat[chatIndex].data.length <= 0) return
-
   const scrollPosition = event.target.scrollHeight - event.target.scrollTop
   const lastId = chatStore.chat[chatIndex].data[0].uuid
-
   await chatStore.syncChat(
     { uuid: roomId } as Chat.History,
     lastId,
@@ -759,40 +731,6 @@ function formatTooltip(value: number) {
   return `${t('setting.maxContextCount')}: ${value}`
 }
 
-function handleBeforeUpload(data: { file: UploadFileInfo }) {
-  if (data.file.file?.size && data.file.file.size / 1024 / 1024 > 100) {
-    ms.error('文件大小不能超过 100MB')
-    return false
-  }
-  return true
-}
-
-function handleFinishImage(options: { file: UploadFileInfo; event?: ProgressEvent }) {
-  if (options.file.status === 'finished') {
-    const response = (options.event?.target as XMLHttpRequest).response
-    const key = `${response.data.fileKey}`
-    imageUploadFileKeysRef.value.push(key)
-    ms.success('图片上传成功')
-  }
-}
-
-function handleFinishText(options: { file: UploadFileInfo; event?: ProgressEvent }) {
-  if (options.file.status === 'finished') {
-    const response = (options.event?.target as XMLHttpRequest).response
-    const key = `${response.data.fileKey}`
-    textUploadFileKeysRef.value.push(key)
-    ms.success('文件上传成功')
-  }
-}
-
-function handleDeleteImageFile(index: number) {
-  imageUploadFileKeysRef.value.splice(index, 1)
-}
-
-function handleDeleteTextFile(index: number) {
-  textUploadFileKeysRef.value.splice(index, 1)
-}
-
 const uploadHeaders = computed(() => {
   const token = useAuthStore().token
   return { Authorization: `Bearer ${token}` }
@@ -806,11 +744,9 @@ onMounted(async () => {
 watch(
   () => chatStore.active,
   () => {
-    // 切换房间：停止旧轮询，重置状态
     stopPolling()
     processingUuidRef.value = undefined
     loading.value = false
-
     if (chatStore.active) {
       firstLoading.value = true
       debouncedLoad()
@@ -820,6 +756,7 @@ watch(
 
 onUnmounted(() => stopPolling())
 </script>
+
 <template>
   <div class="flex flex-col w-full h-full">
     <HeaderComponent
@@ -832,7 +769,11 @@ onUnmounted(() => stopPolling())
     />
     <main class="flex-1 overflow-hidden">
       <div id="scrollRef" ref="scrollRef" class="h-full overflow-hidden overflow-y-auto" @scroll="handleScroll">
-        <div id="image-wrapper" class="w-full max-w-screen-xl m-auto dark:bg-[#101014]" :class="[isMobile ? 'p-2' : 'p-4']">
+        <div
+          id="image-wrapper"
+          class="w-full max-w-screen-xl m-auto dark:bg-[#101014]"
+          :class="[isMobile ? 'p-2' : 'p-4']"
+        >
           <NSpin :show="firstLoading">
             <template v-if="!dataSources.length">
               <div class="flex items-center justify-center mt-4 text-center text-neutral-300">
@@ -862,7 +803,9 @@ onUnmounted(() => stopPolling())
                 />
                 <div class="sticky bottom-0 left-0 flex justify-center">
                   <NButton v-if="loading" type="warning" @click="handleStop">
-                    <template #icon><SvgIcon icon="ri:stop-circle-line" /></template>
+                    <template #icon>
+                      <SvgIcon icon="ri:stop-circle-line" />
+                    </template>
                     Stop Responding
                   </NButton>
                 </div>
@@ -876,69 +819,141 @@ onUnmounted(() => stopPolling())
     <footer :class="footerClass">
       <div class="w-full max-w-screen-xl m-auto">
         <NSpace vertical>
-          <div v-if="imageUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div v-for="(key, index) in imageUploadFileKeysRef" :key="`img-${index}`" class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700">
-              <SvgIcon icon="ri:image-line" class="mr-1" />
-              <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteImageFile(index)">
-                <SvgIcon icon="ri:close-line" />
-              </button>
-            </div>
-          </div>
-
-          <div v-if="textUploadFileKeysRef.length > 0" class="flex flex-wrap items-center gap-2 mb-2">
-            <div v-for="(key, index) in textUploadFileKeysRef" :key="`txt-${index}`" class="flex items-center px-2 py-1 text-xs bg-gray-100 rounded dark:bg-neutral-700">
-              <SvgIcon icon="ri:file-text-line" class="mr-1" />
-              <span class="truncate max-w-[150px]">{{ key }}</span>
-              <button class="ml-1 text-red-500 hover:text-red-700" @click="handleDeleteTextFile(index)">
-                <SvgIcon icon="ri:close-line" />
+          <!-- 已上传文件预览区域 -->
+          <div v-if="uploadedFilesRef.length > 0" class="flex flex-wrap items-center gap-2 mb-1">
+            <div
+              v-for="(file, index) in uploadedFilesRef"
+              :key="`uploaded-${index}`"
+              class="flex items-center px-2 py-1 text-xs rounded-md border"
+              :style="{ borderColor: getFileTypeColor(file.type) + '40', backgroundColor: getFileTypeColor(file.type) + '10' }"
+            >
+              <SvgIcon :icon="getFileTypeIcon(file.type)" class="mr-1 flex-shrink-0" :style="{ color: getFileTypeColor(file.type) }" />
+              <span class="truncate max-w-[120px]" :title="file.name">{{ file.name }}</span>
+              <button class="ml-1.5 text-red-400 hover:text-red-600 flex-shrink-0" @click="handleDeleteUploadedFile(index)">
+                <SvgIcon icon="ri:close-line" class="text-sm" />
               </button>
             </div>
           </div>
 
           <div class="flex items-center space-x-2">
-            <div>
-              <NUpload
-                action="/api/upload-image"
-                multiple
-                :max="100"
-                :headers="uploadHeaders"
-                :show-file-list="false"
-                response-type="json"
-                accept="image/*"
-                @finish="handleFinishImage"
-                @before-upload="handleBeforeUpload"
-              >
-                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                  <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:image-add-line" /></span>
+            <!-- 统一上传按钮 + Popover 弹出菜单 -->
+            <NPopover
+              v-model:show="showUploadPopover"
+              trigger="click"
+              placement="top-start"
+              :style="{ padding: '8px 0' }"
+            >
+              <template #trigger>
+                <div
+                  class="flex items-center justify-center h-10 w-10 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer"
+                  :class="{ 'bg-green-50 dark:bg-green-900/20': uploadedFilesRef.length > 0 }"
+                >
+                  <span class="text-xl text-[#4f555e] dark:text-white relative">
+                    <SvgIcon icon="ri:attachment-2" />
+                    <span
+                      v-if="uploadedFilesRef.length > 0"
+                      class="absolute -top-1.5 -right-1.5 w-4 h-4 text-[10px] leading-4 text-center text-white bg-green-500 rounded-full"
+                    >
+                      {{ uploadedFilesRef.length }}
+                    </span>
+                  </span>
                 </div>
-              </NUpload>
-            </div>
-
-            <div>
-              <NUpload
-                action="/api/upload-image"
-                multiple
-                :max="100"
-                :headers="uploadHeaders"
-                :show-file-list="false"
-                response-type="json"
-                accept=".txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log,.ini,.config"
-                @finish="handleFinishText"
-                @before-upload="handleBeforeUpload"
-              >
-                <div class="flex items-center justify-center h-10 px-2 transition rounded-md hover:bg-neutral-100 dark:hover:bg-[#414755] cursor-pointer">
-                  <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:attachment-2" /></span>
+              </template>
+              <div class="w-[200px]">
+                <div class="px-3 py-1.5 text-xs text-gray-400 select-none">
+                  选择上传文件类型
                 </div>
-              </NUpload>
-            </div>
+                <!-- 图片 -->
+                <div
+                  class="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-neutral-100 dark:hover:bg-neutral-700 transition-colors"
+                  @click="triggerImageUpload"
+                >
+                  <SvgIcon icon="ri:image-add-line" class="text-lg" style="color: #10b981;" />
+                  <div>
+                    <div class="text-sm font-medium">图片</div>
+                    <div class="text-[11px] text-gray-400">PNG, JPG, WebP, GIF...</div>
+                  </div>
+                </div>
+                <!-- 文本文件 -->
+                <div
+                  class="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-neutral-100 dark:hover:bg-neutral-700 transition-colors"
+                  @click="triggerTextUpload"
+                >
+                  <SvgIcon icon="ri:file-text-line" class="text-lg" style="color: #3b82f6;" />
+                  <div>
+                    <div class="text-sm font-medium">文本 / 代码</div>
+                    <div class="text-[11px] text-gray-400">TXT, MD, JSON, PY, JS...</div>
+                  </div>
+                </div>
+                <!-- PDF / 音视频 -->
+                <div
+                  class="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-neutral-100 dark:hover:bg-neutral-700 transition-colors"
+                  @click="triggerMediaUpload"
+                >
+                  <SvgIcon icon="ri:file-music-line" class="text-lg" style="color: #f59e0b;" />
+                  <div>
+                    <div class="text-sm font-medium">PDF / 音频 / 视频</div>
+                    <div class="text-[11px] text-gray-400">PDF, MP4, MP3, WAV...</div>
+                  </div>
+                </div>
+              </div>
+            </NPopover>
 
-            <!-- ✅ 联网搜索开关（高亮逻辑同"上下文"按钮；后台未启用则禁用） -->
+            <!-- 隐藏的三个 NUpload 组件（通过点击菜单项触发） -->
+            <NUpload
+              ref="imageUploadRef"
+              action="/api/upload-image"
+              multiple
+              :max="100"
+              :headers="uploadHeaders"
+              :show-file-list="false"
+              response-type="json"
+              accept="image/*"
+              :style="{ display: 'none' }"
+              @finish="handleFinishImage"
+              @before-upload="handleBeforeUpload"
+            >
+              <button id="unified-upload-image" style="display: none;" />
+            </NUpload>
+
+            <NUpload
+              ref="textUploadRef"
+              action="/api/upload-image"
+              multiple
+              :max="100"
+              :headers="uploadHeaders"
+              :show-file-list="false"
+              response-type="json"
+              accept=".txt,.md,.json,.csv,.js,.ts,.py,.java,.html,.css,.xml,.yml,.yaml,.log,.ini,.config,.c,.cpp,.h,.go,.rs,.rb,.php,.sh,.bat,.sql,.r,.m,.swift,.kt"
+              :style="{ display: 'none' }"
+              @finish="handleFinishText"
+              @before-upload="handleBeforeUpload"
+            >
+              <button id="unified-upload-text" style="display: none;" />
+            </NUpload>
+
+            <NUpload
+              ref="mediaUploadRef"
+              action="/api/upload-image"
+              multiple
+              :max="10"
+              :headers="uploadHeaders"
+              :show-file-list="false"
+              response-type="json"
+              accept=".pdf,.mp4,.mpeg,.mov,.mpg,.avi,.wmv,.flv,.webm,.mpegps,.mp3,.wav,.ogg"
+              :style="{ display: 'none' }"
+              @finish="handleFinishMedia"
+              @before-upload="handleBeforeUpload"
+            >
+              <button id="unified-upload-media" style="display: none;" />
+            </NUpload>
+
+            <!-- 联网搜索开关 -->
             <HoverButton
               :tooltip="!webSearchAllowed
                 ? '联网搜索：管理员未启用'
                 : searchMode
-                  ? '联网搜索：开（模型将自动决定是否搜索并可多轮调整关键词）'
+                  ? '联网搜索：开'
                   : '联网搜索：关'"
               :class="{
                 'text-[#4b9e5f]': searchMode && webSearchAllowed,
@@ -953,15 +968,21 @@ onUnmounted(() => stopPolling())
             </HoverButton>
 
             <HoverButton @click="handleClear">
-              <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:delete-bin-line" /></span>
+              <span class="text-xl text-[#4f555e] dark:text-white">
+                <SvgIcon icon="ri:delete-bin-line" />
+              </span>
             </HoverButton>
 
             <HoverButton v-if="!isMobile" @click="handleExport">
-              <span class="text-xl text-[#4f555e] dark:text-white"><SvgIcon icon="ri:download-2-line" /></span>
+              <span class="text-xl text-[#4f555e] dark:text-white">
+                <SvgIcon icon="ri:download-2-line" />
+              </span>
             </HoverButton>
 
             <HoverButton v-if="!isMobile" @click="showPrompt = true">
-              <span class="text-xl text-[#4f555e] dark:text-white"><IconPrompt class="w-[20px] m-auto" /></span>
+              <span class="text-xl text-[#4f555e] dark:text-white">
+                <IconPrompt class="w-[20px] m-auto" />
+              </span>
             </HoverButton>
 
             <HoverButton
@@ -970,7 +991,9 @@ onUnmounted(() => stopPolling())
               :class="{ 'text-[#4b9e5f]': usingContext, 'text-[#a8071a]': !usingContext }"
               @click="handleToggleUsingContext"
             >
-              <span class="text-xl"><SvgIcon icon="ri:chat-history-line" /></span>
+              <span class="text-xl">
+                <SvgIcon icon="ri:chat-history-line" />
+              </span>
             </HoverButton>
 
             <NSelect
@@ -1011,7 +1034,11 @@ onUnmounted(() => stopPolling())
             </NAutoComplete>
 
             <NButton type="primary" :disabled="buttonDisabled" @click="onConversation">
-              <template #icon><span class="dark:text-black"><SvgIcon icon="ri:send-plane-fill" /></span></template>
+              <template #icon>
+                <span class="dark:text-black">
+                  <SvgIcon icon="ri:send-plane-fill" />
+                </span>
+              </template>
             </NButton>
           </div>
         </NSpace>
