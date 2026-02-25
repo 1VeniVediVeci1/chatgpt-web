@@ -1026,7 +1026,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const requestBody = {
         contents: [...historyNative, { role: 'user', parts: nativeUserParts }],
         generationConfig: { temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined,
-          ...(isGemini3ProImageModel ? { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } } : {}) },
+          ...(isGemini3ProImageModel ? { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: '16:9' } } : {}) },
       }
       const res = await fetch(fetchUrl, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key.key, 'Authorization': `Bearer ${key.key}` },
@@ -1099,9 +1099,21 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
   catch (error: any) {
     if (isAbortError(error, abort.signal)) throw error
-    const code = error.statusCode || error.status || error.response?.status
-    const errorMsgRaw = error.message ?? String(error)
-    if (code === 429 && (errorMsgRaw.includes('Too Many Requests') || errorMsgRaw.includes('Rate limit'))) {
+
+    // 完全修复 OneAPI 与 Vercel AI SDK 嵌套 Error 的解析过程
+    const realError = error?.lastError ?? error?.cause ?? error
+    const code = realError?.statusCode || realError?.status || realError?.response?.status || error?.statusCode
+
+    let safeMessage = realError?.message ?? String(realError)
+    if (realError?.responseBody) {
+      try {
+        const parsed = JSON.parse(realError.responseBody)
+        if (parsed?.error?.message) safeMessage = parsed.error.message
+      } catch {}
+    }
+    const errorMsgRaw = safeMessage
+
+    if (code === 429 && (errorMsgRaw.includes('Too Many Requests') || errorMsgRaw.includes('Rate limit') || errorMsgRaw.includes('负载已饱和') || errorMsgRaw.includes('耗尽') || errorMsgRaw.includes('insufficient'))) {
       if (key && options.tryCount++ < 3) {
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
@@ -1110,13 +1122,18 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         return await chatReplyProcess(options)
       }
     }
-    globalThis.console.error('[ChatReply Process Error]:', error)
+
+    globalThis.console.error(`[ChatReply Process Error]:`, realError)
+
     let displayErrorMsg = errorMsgRaw
     if (code && Reflect.has(ErrorCodeMessage, code)) displayErrorMsg = `${ErrorCodeMessage[code]} (${errorMsgRaw})`
     else if (code) displayErrorMsg = `[Status ${code}] ${errorMsgRaw}`
+
     const finalErrorText = searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`
     processCb?.({ id: customMessageId, text: finalErrorText, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
-    return sendResponse({ type: 'Fail', message: displayErrorMsg })
+    
+    // 如果抛出错误，触发 catch 到 fail 层
+    return Promise.reject({ message: displayErrorMsg, data: null, status: 'Fail' })
   }
   finally {
     const index = processThreads.findIndex(d => d.key === threadKey)
