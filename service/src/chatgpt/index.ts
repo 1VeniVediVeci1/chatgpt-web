@@ -64,11 +64,7 @@ function isMultiModalFile(filename: string): boolean {
   if (filename.startsWith('file:')) return true
   if (filename.startsWith('img:') || filename.startsWith('txt:')) return false
   const ext = path.extname(stripTypePrefix(filename)).toLowerCase()
-  return [
-    '.pdf',
-    '.mp4', '.mpeg', '.mov', '.mpg', '.avi', '.wmv', '.flv', '.webm', '.mpegps',
-    '.mp3', '.wav', '.ogg',
-  ].includes(ext)
+  return ['.pdf', '.mp4', '.mpeg', '.mov', '.mpg', '.avi', '.wmv', '.flv', '.webm', '.mpegps', '.mp3', '.wav', '.ogg'].includes(ext)
 }
 
 async function getFileBase64(filename: string): Promise<{ mime: string; data: string } | null> {
@@ -112,9 +108,7 @@ function estimateTokenCount(messages: Array<{ role: string; content: any }>): nu
     allText = (messages ?? []).map(m => {
       const c = m?.content
       if (typeof c === 'string') return c
-      if (Array.isArray(c)) {
-        return c.map((p: any) => p?.type === 'text' ? String(p.text || '') : '').join('')
-      }
+      if (Array.isArray(c)) { return c.map((p: any) => p?.type === 'text' ? String(p.text || '') : '').join('') }
       return ''
     }).join('\n')
     const count = textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
@@ -134,37 +128,24 @@ function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal
   if (typeof anyFn === 'function') return anyFn(list)
   const ac = new AbortController()
   const onAbort = () => { try { ac.abort() } catch { } }
-  for (const s of list) {
-    if (s.aborted) { try { ac.abort() } catch { } break }
-    s.addEventListener('abort', onAbort, { once: true })
-  }
+  for (const s of list) { if (s.aborted) { try { ac.abort() } catch { } break }; s.addEventListener('abort', onAbort, { once: true }) }
   return ac.signal
 }
 
 function toCoreMessages(messages: Array<{ role: string; content: any }>): CoreMessage[] {
   return (messages || []).map((m) => {
-    const role = (m.role === 'system' || m.role === 'user' || m.role === 'assistant')
-      ? m.role
-      : 'user'
+    const role = (m.role === 'system' || m.role === 'user' || m.role === 'assistant') ? m.role : 'user'
     const c = m.content
-
-    if (typeof c === 'string') {
-      return { role, content: c }
-    }
-
+    if (typeof c === 'string') { return { role, content: c } }
     if (Array.isArray(c)) {
       const parts = c.map((p: any) => {
-        if (p?.type === 'text')
-          return { type: 'text' as const, text: String(p.text ?? '') }
-        if (p?.type === 'image_url')
-          return { type: 'image' as const, image: String(p.image_url?.url ?? '') }
-        if (p?.type === 'file')
-          return { type: 'file' as const, data: p.data, mimeType: p.mimeType }
+        if (p?.type === 'text') return { type: 'text' as const, text: String(p.text ?? '') }
+        if (p?.type === 'image_url') return { type: 'image' as const, image: String(p.image_url?.url ?? '') }
+        if (p?.type === 'file') return { type: 'file' as const, data: p.data, mimeType: p.mimeType }
         return { type: 'text' as const, text: String(p?.text ?? '') }
       })
       return { role, content: parts as any }
     }
-
     return { role, content: String(c ?? '') }
   })
 }
@@ -174,12 +155,7 @@ function toUsageResponse(usage: any): any | undefined {
   const input = Number(usage.inputTokens ?? usage.promptTokens ?? usage.prompt_tokens ?? 0)
   const output = Number(usage.outputTokens ?? usage.completionTokens ?? usage.completion_tokens ?? 0)
   const total = Number(usage.totalTokens ?? usage.total_tokens ?? (input + output))
-  return {
-    prompt_tokens: input,
-    completion_tokens: output,
-    total_tokens: total,
-    estimated: false,
-  }
+  return { prompt_tokens: input, completion_tokens: output, total_tokens: total, estimated: false }
 }
 
 const DATA_URL_IMAGE_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g
@@ -194,36 +170,23 @@ async function loadContextMessages(params: {
   let { lastMessageId } = params
 
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = []
-
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId) break
     const message = await getMessageById(lastMessageId)
     if (!message) break
-
     let safeContent = message.text as any
-    if (typeof safeContent === 'string') {
-      safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
-    }
+    if (typeof safeContent === 'string') safeContent = safeContent.replace(DATA_URL_IMAGE_RE, '[Image Data Removed]')
     messages.push({ role: message.role, content: safeContent })
     lastMessageId = message.parentMessageId
   }
 
-  if (systemMessage)
-    messages.push({ role: 'system', content: systemMessage })
-
+  if (systemMessage) messages.push({ role: 'system', content: systemMessage })
   messages.reverse()
   messages.push({ role: 'user', content: content as any })
-
   return messages
 }
 
-type SearchPlan = {
-  action: 'search' | 'stop'
-  query?: string
-  reason?: string
-  selected_ids?: string[]
-  context_summary?: string
-}
+type SearchPlan = { action: 'search' | 'stop'; query?: string; reason?: string; selected_ids?: string[]; context_summary?: string }
 type SearchRound = { query: string; items: Array<{ title: string; url: string; content: string }>; note?: string }
 
 function safeParseJsonFromText(text: string): any | null {
@@ -231,9 +194,7 @@ function safeParseJsonFromText(text: string): any | null {
   const s = String(text).trim()
   try { return JSON.parse(s) } catch { }
   const i = s.indexOf('{'); const j = s.lastIndexOf('}')
-  if (i >= 0 && j > i) {
-    try { return JSON.parse(s.slice(i, j + 1)) } catch { }
-  }
+  if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)) } catch { } }
   return null
 }
 
@@ -349,7 +310,7 @@ async function aiStreamTextWithIdleTimeout(params: {
     const callSignal = mergeAbortSignals([ac.signal, parentSignal])
     const result = streamText({
       model, system, messages, temperature, topP, providerOptions,
-      abortSignal: callSignal,
+      abortSignal: callSignal, maxRetries: 0 // 屏蔽内置重试以防死锁
     })
     streamStarted = true
     for await (const part of (result as any).fullStream as AsyncIterable<any>) {
@@ -1054,7 +1015,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const callSignal = mergeAbortSignals([abort.signal, globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined])
 
     if (isImage) {
-      const result: any = await generateText({ model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal })
+      // 禁用重试以免锁死队列
+      const result: any = await generateText({ model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal, maxRetries: 0 })
       let answerText = result.text || ''
       if (result.files?.length) {
         for (const f of result.files) {
@@ -1071,8 +1033,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: answerText }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext?.conversationId, model, text: answerText, id: customMessageId, detail: { usage: usageRes } } })
     }
 
+    // 禁用重试以免锁死队列
     const result: any = streamText({
-      model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal,
+      model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal, maxRetries: 0,
       providerOptions: provider === 'openai-compatible'
         ? { openai: (() => { const siteCfg = globalConfig.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') return { reasoning_effort: reasoningEffort }; return {} })() }
         : undefined,
@@ -1087,7 +1050,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       else if (part?.type === 'error') {
         globalThis.console.error('[Stream Error Part]', part.error)
-        throw part.error  // 关键修复：主动抛出隐藏的流错误来触发 fail/retry 层
+        throw part.error // 主动抛出隐藏的流错误暴露到异常捕获机制
       }
     }
 
@@ -1099,7 +1062,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   catch (error: any) {
     if (isAbortError(error, abort.signal)) throw error
 
-    // 解析完全嵌套的最深层的真实报错内容（适配 AI SDK 最新特性）
+    // 完全修复 OneAPI 与 Vercel AI SDK 嵌套 Error 的解析过程
     const realError = error?.lastError ?? error?.cause ?? error
     const code = realError?.statusCode || realError?.status || realError?.response?.status || error?.statusCode
 
@@ -1112,21 +1075,32 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
     const errorMsgRaw = safeMessage
 
-    if (code === 429 && (errorMsgRaw.includes('Too Many Requests') || errorMsgRaw.includes('Rate limit') || errorMsgRaw.includes('负载已饱和') || errorMsgRaw.includes('耗尽') || errorMsgRaw.includes('insufficient'))) {
-      if (key && options.tryCount++ < 3) {
+    let displayErrorMsg = errorMsgRaw
+    if (code && Reflect.has(ErrorCodeMessage, code)) displayErrorMsg = `${ErrorCodeMessage[code]} (${errorMsgRaw})`
+    else if (code) displayErrorMsg = `[Status ${code}] ${errorMsgRaw}`
+
+    if ((code === 429 || code === 503) && (errorMsgRaw.includes('Too Many Requests') || errorMsgRaw.includes('Rate limit') || errorMsgRaw.includes('负载已饱和') || errorMsgRaw.includes('耗尽') || errorMsgRaw.includes('insufficient'))) {
+      if (key && options.tryCount < 3) {
+        options.tryCount++
         _lockedKeys.push({ key: key.key, lockedTime: Date.now() })
         await new Promise(resolve => setTimeout(resolve, 2000))
         const index = processThreads.findIndex(d => d.key === threadKey)
         if (index > -1) processThreads.splice(index, 1)
-        return await chatReplyProcess(options)
+        
+        try {
+          return await chatReplyProcess(options)
+        } catch (retryError: any) {
+          // 若触发了找不着Key的次生异常，抹去它，还原最初的429异常信息给到用户！
+          if (String(retryError?.message).includes('没有对应的 apikeys 配置')) {
+            processCb?.({ id: customMessageId, text: searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
+            return Promise.reject({ message: displayErrorMsg, data: null, status: 'Fail' })
+          }
+          throw retryError
+        }
       }
     }
 
     globalThis.console.error(`[ChatReply Process Error]:`, realError)
-
-    let displayErrorMsg = errorMsgRaw
-    if (code && Reflect.has(ErrorCodeMessage, code)) displayErrorMsg = `${ErrorCodeMessage[code]} (${errorMsgRaw})`
-    else if (code) displayErrorMsg = `[Status ${code}] ${errorMsgRaw}`
 
     const finalErrorText = searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`
     processCb?.({ id: customMessageId, text: finalErrorText, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
