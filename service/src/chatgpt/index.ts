@@ -1050,15 +1050,19 @@ const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = {
   prev_ai: '倒数第二条AI回复',
 }
 
-type AiPart = { type: 'text'; text: string } | { type: 'image'; image: string }
+type AiPart = { type: 'text'; text: string } | { type: 'image'; image: string } | { inlineData: { mimeType: string, data: string } }
 
 async function imageUrlToAiSdkImagePart(urlStr: string): Promise<AiPart | null> {
   if (!urlStr) return null
-  if (urlStr.startsWith('data:image/')) return { type: 'image', image: urlStr }
+  if (urlStr.startsWith('data:image/')) {
+    const match = urlStr.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (match) return { inlineData: { mimeType: match[1], data: match[2] } };
+    return { type: 'image', image: urlStr }
+  }
   if (urlStr.includes('/uploads/')) {
     const fileData = await getFileBase64(path.basename(urlStr))
     if (!fileData) return null
-    return { type: 'image', image: `data:${fileData.mime};base64,${fileData.data}` }
+    return { inlineData: { mimeType: fileData.mime, data: fileData.data } };
   }
   return null
 }
@@ -1302,6 +1306,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       return `${searchProcessLog}\n\n---\n\n${currentAnswerText}`
     }
 
+    // 针对被拦截参数的最终修复：拦截所有的 Gemini Image 逻辑直接用原生 fetch （不再走 AI SDK 的文本生成）
     const isGeminiImageModel = isImage && provider === 'google' && model.includes('gemini')
 
     if (isGeminiImageModel) {
@@ -1327,9 +1332,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       const bindings = selectRecentTwoRoundsImages(metasNormalized, currentUrls)
 
-      const historyCore: CoreMessage[] = metasNormalized.map(m => ({
-        role: m.role === 'model' ? 'assistant' : 'user',
-        content: [{ type: 'text', text: applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings) || '[Empty]' }] as any,
+      // 使用原生的 contents 结构，完全避开 AI SDK 的 Zod Parser
+      const historyNative = metasNormalized.map(m => ({
+        role: m.role === 'model' ? 'model' : 'user',
+        parts: [{ text: applyImageBindingsToCleanedText(m.cleanedText, m.urls, bindings) || '[Empty]' }]
       }))
 
       const userInstructionBase = (currentCleanedText && currentCleanedText.trim())
@@ -1337,65 +1343,108 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         : '请继续生成/修改图片。'
       const labeledUserInstruction = applyImageBindingsToCleanedText(userInstructionBase, currentUrls, bindings)
 
-      const userParts: AiPart[] = []
+      const nativeUserParts: any[] = []
       if (bindings.length) {
-        userParts.push({
-          type: 'text',
-          text: `【最近两轮图片映射表】\n${bindings.map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`).join('\n')}\n`,
-        })
+        nativeUserParts.push({ text: `【最近两轮图片映射表】\n${bindings.map(b => `${b.tag}=${IMAGE_SOURCE_LABEL[b.source]}(${shortUrlForLog(b.url)})`).join('\n')}\n` })
       }
 
       for (const b of bindings) {
-        userParts.push({ type: 'text', text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
+        nativeUserParts.push({ text: `【${b.tag}｜${IMAGE_SOURCE_LABEL[b.source]}】` })
         const img = await imageUrlToAiSdkImagePart(b.url)
-        if (img) userParts.push(img)
-        else userParts.push({ type: 'text', text: `（该图片无法上传：${shortUrlForLog(b.url)}）` })
+        if (img) {
+            // 直接剥离出 inlineData 结构给原生 Payload 组装
+            if ('inlineData' in img) {
+                nativeUserParts.push({ inlineData: img.inlineData });
+            } else if (img.type === 'text') {
+                nativeUserParts.push({ text: img.text });
+            }
+        } 
+        else nativeUserParts.push({ text: `（该图片无法上传：${shortUrlForLog(b.url)}）` })
       }
 
-      userParts.push({ type: 'text', text: `【编辑指令】${labeledUserInstruction}` })
+      nativeUserParts.push({ text: `【编辑指令】${labeledUserInstruction}` })
 
       const callSignal = mergeAbortSignals([
         abort.signal,
         globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined,
       ])
 
-      // 针对 Gemini-3-pro-image 注入专属生图参数 (如 4K)
-      const isGemini3ProImageModel = model.includes('gemini-3-pro-image')
-      const googleProviderOpts: any = {
-        responseModalities: ['TEXT', 'IMAGE'],
+      // === 直接发起原生 FETCH 通信绕开 SDK === //
+      let fetchUrl = `${resolvedBaseUrl ? resolvedBaseUrl.replace(/\/+$/, '') : 'https://generativelanguage.googleapis.com/v1beta'}`;
+      if (!fetchUrl.includes('/models/')) {
+        fetchUrl += `/models/${model}:generateContent`;
       }
-      if (isGemini3ProImageModel) {
-        googleProviderOpts.imageConfig = {
-          imageSize: '4K',
-          aspectRatio: '16:9'
+      
+      const isGemini3ProImageModel = model.includes('gemini-3-pro-image');
+      const requestBody = {
+        contents: [...historyNative, { role: 'user', parts: nativeUserParts }],
+        generationConfig: {
+          temperature: finalTemperature,
+          topP: shouldUseTopP ? top_p : undefined,
+          ...(isGemini3ProImageModel ? {
+             responseModalities: ['TEXT', 'IMAGE'],
+             // 完美透传给底层的参数，这里是必须能够触达底部的关键
+             imageConfig: {
+               imageSize: '4K',
+               aspectRatio: '16:9'
+             }
+          } : {})
+        }
+      };
+
+      const res = await fetch(fetchUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': key.key,
+          'Authorization': `Bearer ${key.key}`  // 为支持 OneAPI 类系统的多重认证头保持兼容
+        },
+        body: JSON.stringify(requestBody),
+        signal: callSignal
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => 'No Content Formatted Error');
+        throw new Error(`Downstream API Error (${res.status}): ${errText}`);
+      }
+
+      const jsonRes = await res.json();
+      let answerText = '';
+      let outputParts = jsonRes.candidates?.[0]?.content?.parts || [];
+
+      // 原生态解包返回的图片编码并进行本地存盘替换
+      for (const part of outputParts) {
+        if (part.text) {
+          answerText += part.text;
+        }
+        if (part.inlineData && part.inlineData.data) {
+          const mime = part.inlineData.mimeType || 'image/png';
+          const ext = mime.split('/')[1] || 'png';
+          const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
+          
+          await fs.writeFile(path.join(UPLOAD_DIR, filename), Buffer.from(part.inlineData.data, 'base64'));
+          answerText += `${answerText ? '\n\n' : ''}![Generated Image](/uploads/${filename})`;
         }
       }
 
-      // 修复：移除多余的 system 参数，避免合并出两个 system/developer
-      const result: any = await generateText({
-        model: lm,
-        messages: [...historyCore, { role: 'user', content: userParts as any }],
-        temperature: finalTemperature,
-        topP: shouldUseTopP ? top_p : undefined,
-        abortSignal: callSignal,
-        providerOptions: {
-          google: googleProviderOpts,
-        } as any,
-      })
-
-      let answerText = result.text || ''
-      if (result.files?.length) {
-        for (const f of result.files) {
-          if (!f?.mediaType?.startsWith('image/')) continue
-          const ext = f.mediaType.split('/')[1] || 'png'
-          const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
-          await fs.writeFile(path.join(UPLOAD_DIR, filename), Buffer.from(f.uint8Array))
-          answerText += `${answerText ? '\n\n' : ''}![Generated Image](/uploads/${filename})`
+      if (!answerText) {
+        if (jsonRes.promptFeedback && jsonRes.promptFeedback.blockReason) {
+             answerText = `[Gemini] 系统拦截了此请求，原因: ${jsonRes.promptFeedback.blockReason}`;
+        } else {
+             answerText = '[Gemini] Success but no content returned. Check generation configuration and token.';
+             globalThis.console.error('Google API empty inner content return detail:', JSON.stringify(jsonRes));
         }
       }
-      if (!answerText) answerText = '[Gemini] Success but no text/image returned.'
 
-      const usageRes = toUsageResponse(result.usage)
+      let usageRes: any = undefined;
+      if (jsonRes.usageMetadata) {
+        usageRes = {
+          prompt_tokens: jsonRes.usageMetadata.promptTokenCount || 0,
+          completion_tokens: jsonRes.usageMetadata.candidatesTokenCount || 0,
+          total_tokens: jsonRes.usageMetadata.totalTokenCount || 0,
+          estimated: false,
+        };
+      }
 
       processCb?.({
         id: customMessageId,
@@ -1420,6 +1469,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         },
       })
     }
+    // ============== 原生对接剥离修复模块 END ===============
 
     const coreMessages = toCoreMessages(finalMessages)
 
@@ -1428,29 +1478,15 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined,
     ])
 
+    // 因为所有的 google gemini 生图已经被上面 isGeminiImageModel 拦截处理完毕
+    // 如果还走到这里，说明是其他厂商如 OpenAI 的 DALL-E 通用生图处理逻辑
     if (isImage) {
-      // 动态构造 Google 的专属参数
-      let basicGoogleOpts: any = undefined
-      if (provider === 'google') {
-        basicGoogleOpts = { responseModalities: ['TEXT', 'IMAGE'] }
-        if (model.includes('gemini-3-pro-image')) {
-          basicGoogleOpts.imageConfig = {
-            imageSize: '4K',
-            aspectRatio: '16:9'
-          }
-        }
-      }
-
-      // 修复：移除系统传参
       const result: any = await generateText({
         model: lm,
         messages: coreMessages,
         temperature: finalTemperature,
         topP: shouldUseTopP ? top_p : undefined,
         abortSignal: callSignal,
-        providerOptions: provider === 'google'
-          ? { google: basicGoogleOpts } as any
-          : undefined,
       })
 
       let answerText = result.text || ''
@@ -1494,7 +1530,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
-    // 修复：移除可能导致系统 Prompt 重复的参数
     const result: any = streamText({
       model: lm,
       messages: coreMessages,
@@ -1520,7 +1555,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     let answerText = ''
     for await (const part of (result as any).fullStream as AsyncIterable<any>) {
       if (part?.type === 'text-delta') {
-        // 关键改动: ai-sdk v3+ 的 streamText 返回的文本在 textDelta，不在 text！
         const delta = String(part.textDelta ?? '')
         answerText += delta
         processCb?.({
