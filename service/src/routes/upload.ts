@@ -5,28 +5,32 @@ import path from 'path'
 
 export const router = Router()
 
-// 配置multer的存储选项
 const storage = multer.diskStorage({
   destination(req, file, cb) {
-    cb(null, 'uploads/') // 确保这个文件夹存在
+    cb(null, 'uploads/')
   },
   filename(req, file, cb) {
-    // 获取文件扩展名
     const ext = path.extname(file.originalname)
-    // 生成文件名，保留扩展名
     cb(null, `${Date.now()}-${Math.round(Math.random() * 1E9)}${ext}`)
   },
 })
 
-const upload = multer({ storage })
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100MB
+  },
+})
+
 router.post('/upload-image', auth, upload.single('file'), async (req, res) => {
   try {
-    if (!req.file)
+    if (!req.file) {
       res.send({ status: 'Fail', message: '没有文件被上传', data: null })
+      return
+    }
     const data = {
       fileKey: req.file.filename,
     }
-    // 文件已上传
     res.send({ status: 'Success', message: '文件上传成功', data })
   }
   catch (error) {
