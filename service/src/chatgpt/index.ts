@@ -1386,7 +1386,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
              // 完美透传给底层的参数，这里是必须能够触达底部的关键
              imageConfig: {
                imageSize: '4K',
-               aspectRatio: '16:9'
+               //aspectRatio: '16:9'
              }
           } : {})
         }
