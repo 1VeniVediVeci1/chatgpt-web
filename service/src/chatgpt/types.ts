@@ -6,6 +6,7 @@ export type ChatRole = 'system' | 'user' | 'assistant'
 export type MessagePart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'file'; mimeType: string; data: string }
 
 export type MessageContent = string | MessagePart[]
 
@@ -22,9 +23,6 @@ export interface ChatMessage {
 
 export interface RequestOptions {
   message: string
-  /**
-   * ✅ 是否开启联网搜索（前端开关传入）
-   */
   searchMode?: boolean
   uploadFileKeys?: string[]
   lastContext?: { conversationId?: string; parentMessageId?: string }
@@ -48,7 +46,6 @@ export type ChatResponse = {
     usage?: UsageResponse
   }
   conversationId?: string
-  // 保持兼容旧结构
   object?: string
   choices?: any[]
   created?: number
