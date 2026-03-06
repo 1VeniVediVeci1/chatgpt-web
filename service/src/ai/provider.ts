@@ -6,19 +6,25 @@ import nodeFetch from 'node-fetch'
 const API_DEBUG = true
 const API_DEBUG_FETCH = true
 
-export type KeyProvider = 'openai-compatible' | 'google'
+export type KeyProvider = 'openai-completions' | 'openai-responses' | 'google'
 
 export function normalizeProvider(keyModel: string | undefined): KeyProvider {
   const m = String(keyModel || '').trim()
-  if (!m || m === 'ChatGPTAPI')
-    return 'openai-compatible'
-  if (m === 'ChatGPTUnofficialProxyAPI')
-    return 'openai-compatible' // 兼容旧数据
-  if (m === 'openai-compatible')
-    return 'openai-compatible'
+
+  // ✅ 新增：openai-responses
+  if (m === 'openai-responses')
+    return 'openai-responses'
+
+  // ✅ openai-completions（含向后兼容旧值）
+  if (m === 'openai-completions')
+    return 'openai-completions'
+  if (!m || m === 'ChatGPTAPI' || m === 'ChatGPTUnofficialProxyAPI' || m === 'openai-compatible')
+    return 'openai-completions'
+
   if (m === 'google')
     return 'google'
-  return 'openai-compatible'
+
+  return 'openai-completions'
 }
 
 function normalizeBaseUrl(baseUrl?: string) {
@@ -143,6 +149,7 @@ export function createLanguageModel(params: {
   const { provider, apiKey, model } = params
   const baseUrl = normalizeBaseUrl(params.baseUrl)
 
+  // ===== Google =====
   if (provider === 'google') {
     const fetchWithBase = baseUrl ? wrapFetchWithBaseUrl(baseFetch, baseUrl) : baseFetch
     const fetchWithDebug = wrapFetchWithDebug(fetchWithBase)
@@ -156,11 +163,17 @@ export function createLanguageModel(params: {
     return google(model)
   }
 
+  // ===== OpenAI compatible =====
   const openai = createOpenAI({
     apiKey,
     ...(baseUrl ? { baseURL: baseUrl } : {}),
     fetch: wrapFetchWithDebug(baseFetch),
   })
 
+  // ✅ openai-responses → /v1/responses
+  if (provider === 'openai-responses')
+    return openai.responses(model)
+
+  // ✅ openai-completions → /v1/chat/completions（默认）
   return openai(model)
 }
