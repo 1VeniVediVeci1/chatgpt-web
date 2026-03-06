@@ -219,7 +219,7 @@ export class SiteConfig {
     public webSearchMaxResults?: number,
     public webSearchMaxRounds?: number,
     public webSearchPlannerModel?: string,
-    // ===== ✅ 隐藏模型（不在用户列表中显示，但后端可用于 planner 等内部用途）=====
+    // ===== 隐藏模型 =====
     public hiddenModels?: string,
   ) { }
 }
@@ -302,7 +302,8 @@ export class UserPrompt {
 
 /**
  * ✅ keyModel（前端 Key 配置页里选）
- * - openai-compatible：走 OpenAI 兼容接口（可对接各类聚合/反代）
+ * - openai-completions：走 OpenAI /v1/chat/completions
+ * - openai-responses：走 OpenAI /v1/responses（新版 API）
  * - google：Gemini 官方/反代
  */
-export type APIMODEL = 'openai-compatible' | 'google'
+export type APIMODEL = 'openai-completions' | 'openai-responses' | 'google'
