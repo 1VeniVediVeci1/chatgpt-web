@@ -23,10 +23,12 @@ export async function getCacheConfig(): Promise<Config> {
   return Promise.resolve(cachedConfig)
 }
 
-function normalizeApiModel(input: any): 'openai-compatible' | 'google' {
+function normalizeApiModel(input: any): 'openai-completions' | 'openai-responses' | 'google' {
   const v = String(input ?? '').trim()
   if (v === 'google') return 'google'
-  return 'openai-compatible'
+  if (v === 'openai-responses') return 'openai-responses'
+  // 向后兼容旧值 'openai-compatible' → completions
+  return 'openai-completions'
 }
 
 export async function getOriginConfig() {
@@ -84,8 +86,10 @@ export async function getOriginConfig() {
     }
     if (config.siteConfig.registerReview === undefined)
       config.siteConfig.registerReview = process.env.REGISTER_REVIEW === 'true'
-    if (!config.apiModel)
-      config.apiModel = 'openai-compatible'
+
+    // ✅ 向后兼容旧值
+    if (!config.apiModel || config.apiModel === ('openai-compatible' as any))
+      config.apiModel = 'openai-completions'
   }
 
   if (config.auditConfig === undefined) {
@@ -131,7 +135,7 @@ export async function getOriginConfig() {
   if (config.siteConfig.reasoningEffort === undefined)
     config.siteConfig.reasoningEffort = 'medium'
 
-  // ===== ✅ 联网搜索默认值 =====
+  // ===== 联网搜索默认值 =====
   if (config.siteConfig.webSearchEnabled === undefined)
     config.siteConfig.webSearchEnabled = false
   if (config.siteConfig.webSearchProvider === undefined)
@@ -198,14 +202,18 @@ export async function getApiKeys() {
   const result = await getKeys()
   const config = await getCacheConfig()
 
-  // ✅ 没有 key 时：用全局 apiKey 自动补一条 openai-compatible（兼容旧行为）
+  // ✅ 没有 key 时：用全局 apiKey 自动补一条 openai-completions（兼容旧行为）
   if (result.keys.length <= 0) {
     if (isNotEmptyString(config.apiKey))
-      result.keys.push(await upsertKey(new KeyConfig(config.apiKey, 'openai-compatible', [], [], '')))
+      result.keys.push(await upsertKey(new KeyConfig(config.apiKey, 'openai-completions', [], [], '')))
     result.total = result.keys.length
   }
 
   result.keys.forEach((key) => {
+    // ✅ 向后兼容旧 keyModel 值
+    if ((key.keyModel as any) === 'openai-compatible' || (key.keyModel as any) === 'ChatGPTAPI' || !key.keyModel)
+      key.keyModel = 'openai-completions'
+
     if (key.userRoles == null || key.userRoles.length <= 0) {
       key.userRoles.push(UserRole.Admin)
       key.userRoles.push(UserRole.User)
