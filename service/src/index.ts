@@ -291,8 +291,8 @@ router.post('/session', async (req, res) => {
     const allowRegister = config.siteConfig.registerEnabled
 
     // ✅ 统一：如果为空则默认 openai-compatible（不再出现 ChatGPTUnofficialProxyAPI）
-    if (!config.apiModel)
-      config.apiModel = 'openai-compatible'
+    if (!config.apiModel || config.apiModel === ('openai-compatible' as any))
+      config.apiModel = 'openai-completions'
 
     const userId = await getUserId(req)
     const chatModels: { label; key: string; value: string }[] = []
