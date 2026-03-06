@@ -29,7 +29,7 @@ const { isMobile } = useBasicLayout()
 const loading = ref(false)
 const show = ref(false)
 const handleSaving = ref(false)
-const keyConfig = ref(new KeyConfig('', 'openai-compatible', [], [], ''))
+const keyConfig = ref(new KeyConfig('', 'openai-completions', [], [], ''))
 
 // 只保留 Token Policy（不再提供备注栏）
 const editingMaxTokens = ref<number | null>(null)
@@ -212,7 +212,13 @@ async function handleGetKeys(page: number) {
 
   const size = pagination.pageSize
   const data = (await fetchGetKeys(page, size)).data
-  data.keys.forEach((key: any) => keys.value.push(key))
+  data.keys.forEach((key: any) => {
+    // 兼容历史值，如果遇到不支持的，转为 completions
+    if (!key.keyModel || key.keyModel === 'openai-compatible' || key.keyModel === 'ChatGPTAPI') {
+      key.keyModel = 'openai-completions'
+    }
+    keys.value.push(key)
+  })
 
   keyConfig.value = keys.value[0]
   pagination.page = page
@@ -258,7 +264,7 @@ async function handleUpdateKeyConfig() {
 }
 
 function handleNewKey() {
-  keyConfig.value = new KeyConfig('', 'openai-compatible', [], [], '')
+  keyConfig.value = new KeyConfig('', 'openai-completions', [], [], '')
   editingMaxTokens.value = null
   editingMinTokens.value = null
   show.value = true
@@ -314,9 +320,20 @@ onMounted(async () => {
               :options="apiModelOptions"
               @update-value="value => keyConfig.keyModel = value"
             />
+            <p v-if="!isMobile" class="text-xs text-[#b4bbc4] mt-1">
+              <template v-if="keyConfig.keyModel === 'openai-completions'">
+                标准 Chat Completions 接口，兼容所有 OpenAI 兼容网关
+              </template>
+              <template v-else-if="keyConfig.keyModel === 'openai-responses'">
+                OpenAI 新版 Responses API，支持工具调用 / 内建搜索等
+              </template>
+              <template v-else-if="keyConfig.keyModel === 'google'">
+                Google Gemini 原生接口
+              </template>
+            </p>
           </div>
           <p v-if="!isMobile">
-            <a v-if="keyConfig.keyModel === 'openai-compatible'" target="_blank" href="https://platform.openai.com/account/api-keys">Get OpenAI API Key</a>
+            <a v-if="keyConfig.keyModel === 'openai-completions' || keyConfig.keyModel === 'openai-responses'" target="_blank" href="https://platform.openai.com/account/api-keys">Get OpenAI API Key</a>
             <a v-else-if="keyConfig.keyModel === 'google'" target="_blank" href="https://aistudio.google.com/app/apikey">Get Gemini API Key</a>
           </p>
         </div>
@@ -339,7 +356,7 @@ onMounted(async () => {
             <NInput
               v-model:value="keyConfig.baseUrl"
               style="width: 100%"
-              placeholder="可选：该 Key 专用 baseUrl（优先级最高）。openai-compatible 填 OpenAI/兼容网关；google 填 Gemini 反代域名"
+              placeholder="可选：该 Key 专用 baseUrl（优先级最高）。"
             />
           </div>
         </div>
