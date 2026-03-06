@@ -20,6 +20,7 @@ import { generateMessageId } from '../utils/id-generator'
 import { isAbortError } from './abortable'
 import { webSearch } from '../utils/webSearch'
 import { createLanguageModel, normalizeProvider } from '../ai/provider'
+import type { KeyProvider } from '../ai/provider'
 
 dotenv.config()
 
@@ -33,6 +34,13 @@ function trunc(s: any, n = API_DEBUG_MAX_TEXT): string {
 }
 function safeJson(obj: any): string { try { return JSON.stringify(obj, null, 2) } catch (e: any) { return `[Unserializable: ${e?.message ?? e}]` } }
 function debugLog(...args: any[]) { if (!API_DEBUG) return; console.log(...args) }
+
+/**
+ * ✅ 判断是否为 OpenAI 兼容类型（包含 completions 和 responses）
+ */
+function isOpenAILike(provider: string): boolean {
+  return provider === 'openai-completions' || provider === 'openai-responses'
+}
 
 const MODEL_CONFIGS: Record<string, { supportTopP: boolean; defaultTemperature?: number }> = {
   'gpt-5-search-api': { supportTopP: false, defaultTemperature: 0.8 },
@@ -310,7 +318,7 @@ async function aiStreamTextWithIdleTimeout(params: {
     const callSignal = mergeAbortSignals([ac.signal, parentSignal])
     const result = streamText({
       model, system, messages, temperature, topP, providerOptions,
-      abortSignal: callSignal, maxRetries: 0 // 屏蔽内置重试以防死锁
+      abortSignal: callSignal, maxRetries: 0
     })
     streamStarted = true
     for await (const part of (result as any).fullStream as AsyncIterable<any>) {
@@ -1015,7 +1023,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const callSignal = mergeAbortSignals([abort.signal, globalConfig.timeoutMs ? AbortSignal.timeout(globalConfig.timeoutMs) : undefined])
 
     if (isImage) {
-      // 禁用重试以免锁死队列
       const result: any = await generateText({ model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal, maxRetries: 0 })
       let answerText = result.text || ''
       if (result.files?.length) {
@@ -1033,10 +1040,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       return sendResponse({ type: 'Success', data: { object: 'chat.completion', choices: [{ message: { role: 'assistant', content: answerText }, finish_reason: 'stop', index: 0, logprobs: null }], created: Date.now(), conversationId: lastContext?.conversationId, model, text: answerText, id: customMessageId, detail: { usage: usageRes } } })
     }
 
-    // 禁用重试以免锁死队列
+    // ✅ providerOptions：对所有 OpenAI 类型（completions + responses）都传 reasoning_effort
     const result: any = streamText({
       model: lm, messages: coreMessages, temperature: finalTemperature, topP: shouldUseTopP ? top_p : undefined, abortSignal: callSignal, maxRetries: 0,
-      providerOptions: provider === 'openai-compatible'
+      providerOptions: isOpenAILike(provider)
         ? { openai: (() => { const siteCfg = globalConfig.siteConfig; const reasoningModelsStr = siteCfg?.reasoningModels || ''; const reasoningEffort = siteCfg?.reasoningEffort || 'medium'; const reasoningModelList = reasoningModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean); if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') return { reasoning_effort: reasoningEffort }; return {} })() }
         : undefined,
     })
@@ -1050,7 +1057,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       else if (part?.type === 'error') {
         globalThis.console.error('[Stream Error Part]', part.error)
-        throw part.error // 主动抛出隐藏的流错误暴露到异常捕获机制
+        throw part.error
       }
     }
 
@@ -1062,7 +1069,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   catch (error: any) {
     if (isAbortError(error, abort.signal)) throw error
 
-    // 完全修复 OneAPI 与 Vercel AI SDK 嵌套 Error 的解析过程
     const realError = error?.lastError ?? error?.cause ?? error
     const code = realError?.statusCode || realError?.status || realError?.response?.status || error?.statusCode
 
@@ -1090,7 +1096,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         try {
           return await chatReplyProcess(options)
         } catch (retryError: any) {
-          // 若触发了找不着Key的次生异常，抹去它，还原最初的429异常信息给到用户！
           if (String(retryError?.message).includes('没有对应的 apikeys 配置')) {
             processCb?.({ id: customMessageId, text: searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
             return Promise.reject({ message: displayErrorMsg, data: null, status: 'Fail' })
@@ -1105,7 +1110,6 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     const finalErrorText = searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`
     processCb?.({ id: customMessageId, text: finalErrorText, role: 'assistant', conversationId: lastContext?.conversationId, parentMessageId: lastContext?.parentMessageId, detail: undefined })
     
-    // 主动拒绝以切断任务状态，释放前端等待
     return Promise.reject({ message: displayErrorMsg, data: null, status: 'Fail' })
   }
   finally {
