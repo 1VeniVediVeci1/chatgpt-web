@@ -36,7 +36,7 @@ export class SiteConfig {
   // ===== 推理模型配置 =====
   reasoningModels?: string
   reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh'
-  // ===== ✅ 联网搜索配置 =====
+  // ===== 联网搜索配置 =====
   webSearchEnabled?: boolean
   webSearchProvider?: 'searxng' | 'tavily'
   searxngApiUrl?: string
@@ -138,14 +138,29 @@ export class UserPrompt {
 
 /**
  * ✅ provider（Key 配置页里选）
- * - openai-compatible：走 OpenAI 兼容接口（可接各种网关/聚合/反代）
+ * - openai-completions：走 /v1/chat/completions
+ * - openai-responses：走 /v1/responses（OpenAI 新 API）
  * - google：Gemini 官方/反代
  */
-export type APIMODEL = 'openai-compatible' | 'google' | undefined
+export type APIMODEL = 'openai-completions' | 'openai-responses' | 'google' | undefined
 
-export const apiModelOptions = ['openai-compatible', 'google'].map((model: string) => {
-  return { label: model, key: model, value: model }
-})
+export const apiModelOptions = [
+  {
+    label: 'OpenAI Completions (/v1/chat/completions)',
+    key: 'openai-completions',
+    value: 'openai-completions',
+  },
+  {
+    label: 'OpenAI Responses (/v1/responses)',
+    key: 'openai-responses',
+    value: 'openai-responses',
+  },
+  {
+    label: 'Google Gemini',
+    key: 'google',
+    value: 'google',
+  },
+]
 
 export const userRoleOptions = Object.values(UserRole).filter(d => Number.isNaN(Number(d))).map((role) => {
   return { label: role as string, key: role as string, value: UserRole[role as keyof typeof UserRole] }
