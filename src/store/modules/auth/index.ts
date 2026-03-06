@@ -13,10 +13,8 @@ interface SessionResponse {
   authProxyEnabled: boolean
   /**
    * ✅ 后端返回的“全局默认 provider”
-   * - openai-compatible | google
-   * 注意：实际调用走哪个 provider 由 KeyConfig.keyModel 决定
    */
-  model: 'openai-compatible' | 'google'
+  model: 'openai-completions' | 'openai-responses' | 'google'
   allowRegister: boolean
   title: string
   chatModels: {
@@ -33,9 +31,6 @@ interface SessionResponse {
   nonStreamChatModels: string[]
   usageCountLimit: boolean
   showWatermark: boolean
-  /**
-   * ✅ 后端管理员配置：是否启用联网搜索功能
-   */
   webSearchEnabled: boolean
   userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; config: UserConfig }
 }
