@@ -20,7 +20,6 @@ import { generateMessageId } from '../utils/id-generator'
 import { isAbortError } from './abortable'
 import { webSearch } from '../utils/webSearch'
 import { createLanguageModel, normalizeProvider } from '../ai/provider'
-import type { KeyProvider } from '../ai/provider'
 
 dotenv.config()
 
@@ -32,7 +31,6 @@ function trunc(s: any, n = API_DEBUG_MAX_TEXT): string {
   if (!str) return ''
   return str.length > n ? `${str.slice(0, n)}...(truncated,total=${str.length})` : str
 }
-function safeJson(obj: any): string { try { return JSON.stringify(obj, null, 2) } catch (e: any) { return `[Unserializable: ${e?.message ?? e}]` } }
 function debugLog(...args: any[]) { if (!API_DEBUG) return; console.log(...args) }
 
 /**
@@ -116,7 +114,7 @@ function estimateTokenCount(messages: Array<{ role: string; content: any }>): nu
     allText = (messages ?? []).map(m => {
       const c = m?.content
       if (typeof c === 'string') return c
-      if (Array.isArray(c)) { return c.map((p: any) => p?.type === 'text' ? String(p.text || '') : '').join('') }
+      if (Array.isArray(c)) return c.map((p: any) => p?.type === 'text' ? String(p.text || '') : '').join('')
       return ''
     }).join('\n')
     const count = textTokens(allText, 'gpt-3.5-turbo' as TiktokenModel)
@@ -135,8 +133,14 @@ function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal
   const anyFn = (AbortSignal as any).any
   if (typeof anyFn === 'function') return anyFn(list)
   const ac = new AbortController()
-  const onAbort = () => { try { ac.abort() } catch { } }
-  for (const s of list) { if (s.aborted) { try { ac.abort() } catch { } break }; s.addEventListener('abort', onAbort, { once: true }) }
+  const onAbort = () => { try { ac.abort() } catch {} }
+  for (const s of list) {
+    if (s.aborted) {
+      try { ac.abort() } catch {}
+      break
+    }
+    s.addEventListener('abort', onAbort, { once: true })
+  }
   return ac.signal
 }
 
@@ -144,7 +148,7 @@ function toCoreMessages(messages: Array<{ role: string; content: any }>): CoreMe
   return (messages || []).map((m) => {
     const role = (m.role === 'system' || m.role === 'user' || m.role === 'assistant') ? m.role : 'user'
     const c = m.content
-    if (typeof c === 'string') { return { role, content: c } }
+    if (typeof c === 'string') return { role, content: c }
     if (Array.isArray(c)) {
       const parts = c.map((p: any) => {
         if (p?.type === 'text') return { type: 'text' as const, text: String(p.text ?? '') }
@@ -194,8 +198,34 @@ async function loadContextMessages(params: {
   return messages
 }
 
-type SearchPlan = { action: 'search' | 'stop'; query?: string; reason?: string; selected_ids?: string[]; context_summary?: string }
+type SearchPlan = {
+  action: 'search' | 'stop'
+  query?: string
+  reason?: string
+  selected_ids?: string[]
+  context_summary?: string
+}
+
 type SearchRound = { query: string; items: Array<{ title: string; url: string; content: string }>; note?: string }
+
+type PersistedPlannerMemory = {
+  contextSummary: string
+  anchorMessageId: string
+}
+
+const plannerMemoryMap = new Map<string, PersistedPlannerMemory>()
+
+function getPlannerMemoryKey(userId: string, roomId: number) {
+  return `${userId}:${roomId}`
+}
+
+function getPersistedPlannerMemory(userId: string, roomId: number): PersistedPlannerMemory | null {
+  return plannerMemoryMap.get(getPlannerMemoryKey(userId, roomId)) ?? null
+}
+
+function setPersistedPlannerMemory(userId: string, roomId: number, memory: PersistedPlannerMemory) {
+  plannerMemoryMap.set(getPlannerMemoryKey(userId, roomId), memory)
+}
 
 function tryParseJsonString(text: string): any | null {
   if (!text) return null
@@ -287,7 +317,7 @@ function safeParseJsonFromText(text: string): any | null {
 
 function removeImagesFromText(text: string): string {
   if (!text) return ''
-  let clean = text.replace(/!$$[^$$]*\]\s*$[^)]+?$\s*/g, '')
+  let clean = text.replace(/!$$[^$$]*\]$[^)]+?$\s*/g, '')
   clean = clean.replace(/<img[^>]*>/gi, '')
   clean = clean.replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, '')
   return clean.trim()
@@ -305,7 +335,7 @@ class PlannerTimeoutError extends Error {
     this.name = 'PlannerTimeoutError'
     this.kind = kind
     this.original = original
-    try { (this as any).cause = original } catch { }
+    try { (this as any).cause = original } catch {}
   }
 }
 
@@ -389,7 +419,7 @@ function buildPlannerProviderOptions(provider: string, modelName: string, global
           selected_ids: { type: 'array', items: { type: 'string' } },
           context_summary: { type: 'string' },
         },
-        required: ['action', 'query', 'reason', 'selected_ids'],
+        required: ['action', 'query', 'reason', 'selected_ids', 'context_summary'],
       },
     },
   }
@@ -503,6 +533,35 @@ async function buildConversationContext(lastMessageId: string | undefined, maxCo
   return messages.reverse().join('\n')
 }
 
+async function buildIncrementalConversationContext(params: {
+  fromExclusiveMessageId?: string
+  toInclusiveMessageId?: string
+  maxCount: number
+}): Promise<string> {
+  const { fromExclusiveMessageId, toInclusiveMessageId, maxCount } = params
+  if (!toInclusiveMessageId) return ''
+
+  const messages: string[] = []
+  let currentId = toInclusiveMessageId
+
+  for (let i = 0; i < maxCount; i++) {
+    if (!currentId) break
+    if (fromExclusiveMessageId && currentId === fromExclusiveMessageId) break
+
+    const msg = await getMessageById(currentId)
+    if (!msg) break
+    const role = msg.role === 'assistant' ? 'AI' : 'User'
+    let content = ''
+    if (typeof msg.text === 'string') content = msg.text
+    else if (Array.isArray(msg.text)) content = msg.text.map((p: any) => p?.type === 'text' ? p.text : '[File]').join('')
+    else content = '[Complex Content]'
+    messages.push(`${role}: ${content}`)
+    currentId = msg.parentMessageId
+  }
+
+  return messages.reverse().join('\n')
+}
+
 function truncateForPlanner(text: string, maxChars = 800): string {
   const s = String(text || '').replace(/\s+/g, ' ').trim()
   if (!s) return ''
@@ -520,32 +579,31 @@ function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   }).join('\n\n')
 }
 
-function normalizeSearchPlan(parsed: any, isFirstRound: boolean): SearchPlan {
+function normalizeSearchPlan(parsed: any): SearchPlan {
   const action = parsed?.action === 'search' ? 'search' : 'stop'
   const query = typeof parsed?.query === 'string' ? parsed.query.trim() : ''
   const reason = typeof parsed?.reason === 'string' ? parsed.reason.trim() : ''
   const selected_ids = Array.isArray(parsed?.selected_ids)
     ? parsed.selected_ids.map((x: any) => String(x).trim()).filter(Boolean)
     : []
-  const context_summary = typeof parsed?.context_summary === 'string' ? parsed.context_summary.trim() : undefined
+  const context_summary = typeof parsed?.context_summary === 'string' ? parsed.context_summary.trim() : ''
 
   return {
     action,
     query: action === 'search' ? query : '',
     reason: reason || (action === 'search' ? '模型判断仍需补充搜索。' : '模型判断现有信息已足够。'),
     selected_ids,
-    context_summary: isFirstRound ? (context_summary || '') : undefined,
+    context_summary,
   }
 }
 
 function fallbackSearchPlan(params: {
   rounds: SearchRound[]
-  isFirstRound: boolean
   fullContext: string
   rawPlanText?: string
   error?: any
 }): SearchPlan {
-  const { rounds, isFirstRound, fullContext, rawPlanText, error } = params
+  const { rounds, fullContext, rawPlanText, error } = params
   const selected_ids: string[] = []
   rounds.forEach((r, rIdx) => {
     const maxPick = Math.min(3, r.items?.length || 0)
@@ -562,7 +620,78 @@ function fallbackSearchPlan(params: {
     query: '',
     reason: errBase,
     selected_ids,
-    context_summary: isFirstRound ? summaryBase : undefined,
+    context_summary: summaryBase,
+  }
+}
+
+async function refreshPlannerContextSummary(params: {
+  plannerModel: any
+  plannerProvider?: string
+  plannerModelName?: string
+  globalConfig?: any
+  previousSummary?: string | null
+  incrementalContext: string
+  userQuestion: string
+  date: string
+  abortSignal?: AbortSignal
+  timeoutScheduleMs?: number[]
+}): Promise<string> {
+  const {
+    plannerModel,
+    plannerProvider = '',
+    plannerModelName = '',
+    globalConfig,
+    previousSummary,
+    incrementalContext,
+    userQuestion,
+    date,
+    abortSignal,
+    timeoutScheduleMs,
+  } = params
+
+  const system = [
+    '你是对话上下文总结器。',
+    `当前时间：${date}`,
+    '你的任务是根据旧的上下文总结，以及之后新增的完整对话上下文，生成一份新的、完整的上下文总结。',
+    '这份总结将用于后续联网搜索规划。',
+    '请保留用户当前真实需求、约束条件、已确认的信息、尚未解决的问题。',
+    '如果新增上下文修正了旧信息，应以新增内容为准。',
+    '只输出纯文本总结，不要输出 JSON，不要输出 Markdown，不要解释。',
+  ].join('\n')
+
+  const user = [
+    '【当前用户问题】',
+    userQuestion,
+    '',
+    previousSummary ? `【旧的上下文总结】\n${truncateForPlanner(previousSummary, 2000)}` : '【旧的上下文总结】\n（无）',
+    '',
+    `【自上次搜索后新增的完整上下文】\n${truncateForPlanner(incrementalContext || '（无）', 6000)}`,
+    '',
+    '请输出一份新的上下文总结，长度控制在 100-220 字左右。',
+  ].join('\n')
+
+  const providerOptions = buildPlannerProviderOptions(plannerProvider, plannerModelName, globalConfig)
+  const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [20_000, 30_000, 40_000])
+
+  try {
+    const result: any = await generateText({
+      model: plannerModel,
+      system,
+      prompt: user,
+      temperature: 0,
+      abortSignal: mergeAbortSignals([abortSignal, AbortSignal.timeout(schedule[0] ?? 20_000)]),
+      maxRetries: 0,
+      providerOptions: isOpenAILike(plannerProvider) ? undefined : providerOptions,
+    })
+    const text = String(result?.text ?? '').trim()
+    return text || truncateForPlanner(`${previousSummary || ''}\n${incrementalContext || ''}`, 220)
+  }
+  catch (e) {
+    console.error('[Planner Summary Refresh Error]', summarizeAnyError(e))
+    return truncateForPlanner(
+      [previousSummary || '', incrementalContext || ''].filter(Boolean).join('\n'),
+      220,
+    )
   }
 }
 
@@ -581,20 +710,40 @@ async function planNextSearchAction(params: {
   onTimeoutRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number; reason: string; error: any }) => void
   onValidationRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number; reason: string; error: any; rawText: string }) => void
 }): Promise<SearchPlan> {
-  const { plannerModel, plannerProvider = '', plannerModelName = '', globalConfig, userQuestion, rounds, fullContext, priorContextSummary, date, abortSignal, timeoutScheduleMs, onTimeoutRetry, onValidationRetry } = params
-  const isFirstRound = !priorContextSummary
+  const {
+    plannerModel,
+    plannerProvider = '',
+    plannerModelName = '',
+    globalConfig,
+    userQuestion,
+    rounds,
+    fullContext,
+    priorContextSummary,
+    date,
+    abortSignal,
+    timeoutScheduleMs,
+    onTimeoutRetry,
+    onValidationRetry,
+  } = params
+
+  const hasSummary = !!priorContextSummary?.trim()
 
   const plannerSystem = [
     '你是“联网搜索规划器 & 结果筛选器”。你的唯一任务是输出一个可被 JSON.parse 直接解析的单个 JSON 对象。',
     `当前时间：${date}`,
     '',
     '规则：',
-    '1. 先判断是否真的需要继续联网搜索。',
-    '2. 如果用户问题是常识、闲聊、写作、代码、翻译、推理，通常不需要搜索。',
-    '3. 如果已有搜索结果足以回答，必须 action="stop"。',
-    '4. 如果仍缺关键信息，action="search"，并给出更精准 query。',
-    '5. selected_ids 里放入对最终回答有价值的条目编号，例如 ["1.1", "2.3"]。',
-    isFirstRound ? '6. 第一轮必须给出 context_summary，100-200字。' : '6. 非第一轮可以省略 context_summary。',
+    '1. 先判断是否需要联网搜索来提升答案的真实性、时效性、完整性。',
+    '2. 只要问题涉及以下任一情况，应提高搜索倾向：最新信息、时效性事实、价格/政策/版本/发布日期、人物/公司/产品近况、新闻事件、网页内容、资料核验、外部资料引用。',
+    '3. 如果用户问题可能依赖外部事实，即使你能凭常识作答，也优先考虑先搜索再回答。',
+    '4. 只有当问题明显属于纯常识、纯创作、纯语言改写、纯代码变换、纯逻辑演绎，且不依赖外部事实时，才可直接 stop。',
+    '5. 如果已有搜索结果足以支撑回答，可以 action="stop"；但如果结果来源单薄、关键信息仍缺失、或信息可能过时，应继续 search。',
+    '6. selected_ids 里放入对最终回答有价值的条目编号，例如 ["1.1", "2.3"]。',
+    '7. 每一轮都必须给出新的 context_summary，100-220字。',
+    '',
+    '决策倾向：',
+    '- 在“可搜可不搜”之间犹豫时，优先选择 search。',
+    '- 宁可多做一次短搜索确认，也不要过早停止。',
     '',
     '强制输出要求：',
     '- 只能输出单个 JSON 对象。',
@@ -608,13 +757,13 @@ async function planNextSearchAction(params: {
     '  "query": string,',
     '  "reason": string,',
     '  "selected_ids": string[],',
-    isFirstRound ? '  "context_summary": string' : '  "context_summary": string',
+    '  "context_summary": string',
     '}',
   ].join('\n')
 
-  const contextBlock = isFirstRound
-    ? `【完整对话上下文】\n${truncateForPlanner(fullContext || '（无）', 6000)}`
-    : `【历史上下文总结】\n${truncateForPlanner(priorContextSummary || '', 1200)}`
+  const contextBlock = hasSummary
+    ? `【历史上下文总结】\n${truncateForPlanner(priorContextSummary || '', 1200)}`
+    : `【完整对话上下文】\n${truncateForPlanner(fullContext || '（无）', 6000)}`
 
   const plannerUser = [
     '【用户问题】',
@@ -625,6 +774,7 @@ async function planNextSearchAction(params: {
     '【已进行的搜索与结果】',
     formatSearchRoundsForPlanner(rounds),
     '',
+    '如果用户问题包含事实判断、现实世界信息、具体对象信息或可能受时间影响的信息，请优先考虑联网验证。',
     '请直接输出 JSON 对象。不要输出任何额外文字。',
   ].join('\n')
 
@@ -662,15 +812,30 @@ async function planNextSearchAction(params: {
     const parsed = safeParseJsonFromText(rawText)
     if (!parsed) {
       console.error('[Planner Raw Output][FinalParseFailed]', trunc(rawText, 4000))
-      return fallbackSearchPlan({ rounds, isFirstRound, fullContext, rawPlanText: rawText })
+      return fallbackSearchPlan({ rounds, fullContext, rawPlanText: rawText })
     }
-    return normalizeSearchPlan(parsed, isFirstRound)
+    return normalizeSearchPlan(parsed)
   }
   catch (e: any) {
     console.error('[Planner Error]', summarizeAnyError(e))
     if (e?.rawText) console.error('[Planner Raw Output][Error]', trunc(e.rawText, 4000))
-    return fallbackSearchPlan({ rounds, isFirstRound, fullContext, rawPlanText: rawText || e?.rawText, error: e })
+    return fallbackSearchPlan({ rounds, fullContext, rawPlanText: rawText || e?.rawText, error: e })
   }
+}
+
+function formatPlannerDecisionForMainModel(params: {
+  action: 'search' | 'stop'
+  reason: string
+  contextSummary?: string
+}): string {
+  const { action, reason, contextSummary } = params
+  return [
+    '【联网搜索规划器判断】',
+    `- 规划器决定：${action === 'search' ? '继续联网搜索' : '暂不联网搜索'}`,
+    `- 规划器理由：${reason || '（无）'}`,
+    contextSummary ? `- 规划上下文总结：${contextSummary}` : '',
+    '- 注意：规划器判断可能有误。你作为主模型必须独立判断其行为是否妥当；如果你认为规划器本应联网搜索却没有搜索，或搜索方向不合理，请在回答中明确指出这一点，并尽量弥补其问题。',
+  ].filter(Boolean).join('\n')
 }
 
 async function runIterativeWebSearch(params: {
@@ -689,14 +854,34 @@ async function runIterativeWebSearch(params: {
   fullContext: string
   date: string
   plannerTimeoutScheduleMs?: number[]
-}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string>; planFailed: boolean }> {
-  const { plannerModel, plannerProvider, plannerModelName, globalConfig, userQuestion, maxRounds, maxResults, abortSignal, provider, searxngApiUrl, tavilyApiKey, onProgress, fullContext, date, plannerTimeoutScheduleMs } = params
+  initialContextSummary?: string | null
+}): Promise<{ rounds: SearchRound[]; selectedIds: Set<string>; planFailed: boolean; finalPlan: SearchPlan | null }> {
+  const {
+    plannerModel,
+    plannerProvider,
+    plannerModelName,
+    globalConfig,
+    userQuestion,
+    maxRounds,
+    maxResults,
+    abortSignal,
+    provider,
+    searxngApiUrl,
+    tavilyApiKey,
+    onProgress,
+    fullContext,
+    date,
+    plannerTimeoutScheduleMs,
+    initialContextSummary,
+  } = params
+
   const rounds: SearchRound[] = []
   const usedQueries = new Set<string>()
   const selectedIds = new Set<string>()
-  let currentContextSummary: string | null = null
+  let currentContextSummary: string | null = initialContextSummary ?? null
   const schedule = (plannerTimeoutScheduleMs && plannerTimeoutScheduleMs.length ? plannerTimeoutScheduleMs : [20_000, 30_000, 40_000])
   let planFailed = false
+  let finalPlan: SearchPlan | null = null
 
   for (let i = 0; i < maxRounds; i++) {
     if (i === 0) onProgress?.('⏳ 正在分析用户意图，规划搜索策略...')
@@ -729,9 +914,11 @@ async function runIterativeWebSearch(params: {
 
     if (!plan) {
       planFailed = true
-      onProgress?.(`❌ 规划服务暂时不可用，已停止继续搜索。`)
+      onProgress?.('❌ 规划服务暂时不可用，已停止继续搜索。')
       break
     }
+
+    finalPlan = plan
 
     if (plan.context_summary && typeof plan.context_summary === 'string') currentContextSummary = plan.context_summary
     if (Array.isArray(plan.selected_ids)) plan.selected_ids.forEach(id => selectedIds.add(String(id).trim()))
@@ -746,7 +933,7 @@ async function runIterativeWebSearch(params: {
 
     const q = String(plan.query || '').trim()
     if (!q) {
-      onProgress?.(`⚠️ 规划器未返回有效搜索词，结束搜索。`)
+      onProgress?.('⚠️ 规划器未返回有效搜索词，结束搜索。')
       break
     }
     if (usedQueries.has(q)) {
@@ -774,7 +961,8 @@ async function runIterativeWebSearch(params: {
       break
     }
   }
-  return { rounds, selectedIds, planFailed }
+
+  return { rounds, selectedIds, planFailed, finalPlan }
 }
 
 function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
@@ -797,8 +985,10 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
   })
   if (n === 0) return ''
   lines.push('', '【参考来源列表】', ...refLines, '', '【回答要求】',
-    '- 基于以上来源回答用户问题。', '- 引用格式必须为 markdown 链接：[编号](url)。',
-    '- 在回答末尾列出所有引用过的参考来源。', '- 若来源不足以支持结论，请明确说明。')
+    '- 基于以上来源回答用户问题。',
+    '- 引用格式必须为 markdown 链接：[编号](url)。',
+    '- 在回答末尾列出所有引用过的参考来源。',
+    '- 若来源不足以支持结论，请明确说明。')
   return lines.join('\n')
 }
 
@@ -818,15 +1008,19 @@ function appendTextToMessageContent(content: MessageContent, appendix: string): 
 }
 
 const ErrorCodeMessage: Record<string, string> = {
-  401: '提供错误的API密钥', 403: '服务器拒绝访问', 502: '错误的网关',
-  503: '服务器繁忙，请稍后再试', 504: '网关超时', 500: '服务器繁忙，请稍后再试',
+  401: '提供错误的API密钥',
+  403: '服务器拒绝访问',
+  502: '错误的网关',
+  503: '服务器繁忙，请稍后再试',
+  504: '网关超时',
+  500: '服务器繁忙，请稍后再试',
 }
 
 let auditService: TextAuditService
 const _lockedKeys: { key: string; lockedTime: number }[] = []
 
 const DATA_URL_IMAGE_CAPTURE_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g
-const MARKDOWN_IMAGE_RE = /!$$[^$$]*\]\s*$([^)]+?)$\s*/g
+const MARKDOWN_IMAGE_RE = /!$$[^$$]*\]$([^)]+?)$\s*/g
 const UPLOADS_URL_RE = /(\/uploads\/[^)\s>"']+\.(?:png|jpe?g|webp|gif|bmp|heic))/gi
 const HTML_IMAGE_RE = /<img[^>]*\ssrc=["']([^"']+)["'][^>]*>/gi
 
@@ -837,7 +1031,10 @@ async function replaceDataUrlImagesWithUploads(text: string): Promise<{ text: st
   let lastIndex = 0
   const matches = text.matchAll(DATA_URL_IMAGE_CAPTURE_RE)
   for (const m of matches) {
-    const full = m[0]; const mime = m[1]; const base64 = m[2]; const idx = m.index ?? -1
+    const full = m[0]
+    const mime = m[1]
+    const base64 = m[2]
+    const idx = m.index ?? -1
     if (idx < 0) continue
     out += text.slice(lastIndex, idx)
     const buffer = Buffer.from(base64, 'base64')
@@ -875,7 +1072,10 @@ function mimeToExt(mime: string): string {
 async function saveDataUrlImageToUploads(dataUrl: string, cache?: DataUrlCache): Promise<{ url: string; saved: SavedUpload } | null> {
   try {
     if (!dataUrl?.startsWith('data:image/')) return null
-    if (cache?.has(dataUrl)) { const url = cache.get(dataUrl)!; return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } } }
+    if (cache?.has(dataUrl)) {
+      const url = cache.get(dataUrl)!
+      return { url, saved: { mime: 'image/*', filename: path.basename(url), bytes: 0 } }
+    }
     const parsed = parseDataUrlImage(dataUrl)
     if (!parsed) return null
     await ensureUploadDir()
@@ -888,7 +1088,10 @@ async function saveDataUrlImageToUploads(dataUrl: string, cache?: DataUrlCache):
     cache?.set(dataUrl, url)
     return { url, saved: { mime: parsed.mime, filename, bytes: buffer.length } }
   }
-  catch (e) { globalThis.console.error('[saveDataUrlImageToUploads] failed:', e); return null }
+  catch (e) {
+    globalThis.console.error('[saveDataUrlImageToUploads] failed:', e)
+    return null
+  }
 }
 
 async function normalizeMessageContentDataUrlsToUploads(content: MessageContent, cache?: DataUrlCache): Promise<{ content: MessageContent; saved: SavedUpload[] }> {
@@ -911,9 +1114,14 @@ async function normalizeMessageContentDataUrlsToUploads(content: MessageContent,
         const u = p.image_url.url as string
         if (u.startsWith('data:image/')) {
           const r = await saveDataUrlImageToUploads(u, cache)
-          if (r?.url) { savedAll.push(r.saved); newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } }); continue }
+          if (r?.url) {
+            savedAll.push(r.saved)
+            newParts.push({ ...p, image_url: { ...p.image_url, url: r.url } })
+            continue
+          }
         }
-        newParts.push(p); continue
+        newParts.push(p)
+        continue
       }
       newParts.push(p)
     }
@@ -923,12 +1131,18 @@ async function normalizeMessageContentDataUrlsToUploads(content: MessageContent,
 }
 
 async function normalizeUrlsDataUrlsToUploads(urls: string[], cache?: DataUrlCache): Promise<{ urls: string[]; saved: SavedUpload[] }> {
-  const out: string[] = []; const savedAll: SavedUpload[] = []
+  const out: string[] = []
+  const savedAll: SavedUpload[] = []
   for (const u of urls || []) {
     if (typeof u === 'string' && u.startsWith('data:image/')) {
       const r = await saveDataUrlImageToUploads(u, cache)
-      if (r?.url) { out.push(r.url); savedAll.push(r.saved) } else out.push(u)
-    } else out.push(u)
+      if (r?.url) {
+        out.push(r.url)
+        savedAll.push(r.saved)
+      }
+      else out.push(u)
+    }
+    else out.push(u)
   }
   return { urls: out, saved: savedAll }
 }
@@ -951,7 +1165,10 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
     }
     return '[Image]'
   })
-  cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => { if (url) urls.push(url); return '[Image]' })
+  cleaned = cleaned.replace(HTML_IMAGE_RE, (_m, url) => {
+    if (url) urls.push(url)
+    return '[Image]'
+  })
   const rawDataUrls = cleaned.match(DATA_URL_IMAGE_RE)
   if (rawDataUrls?.length) urls.push(...rawDataUrls)
   cleaned = cleaned.replace(DATA_URL_IMAGE_RE, '[Image]')
@@ -962,7 +1179,8 @@ function extractImageUrlsFromText(text: string): { cleanedText: string; urls: st
 }
 
 async function extractImageUrlsFromMessageContent(content: MessageContent): Promise<{ cleanedText: string; urls: string[] }> {
-  const urls: string[] = []; let cleanedText = ''
+  const urls: string[] = []
+  let cleanedText = ''
   if (typeof content === 'string') {
     const r = extractImageUrlsFromText(content)
     cleanedText = r.cleanedText
@@ -989,8 +1207,13 @@ async function extractImageUrlsFromMessageContent(content: MessageContent): Prom
 }
 
 function dedupeUrlsPreserveOrder(urls: string[]): string[] {
-  const seen = new Set<string>(); const out: string[] = []
-  for (const u of urls) { if (!u || seen.has(u)) continue; seen.add(u); out.push(u) }
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const u of urls) {
+    if (!u || seen.has(u)) continue
+    seen.add(u)
+    out.push(u)
+  }
   return out
 }
 
@@ -1011,7 +1234,8 @@ function applyImageBindingsToCleanedText(cleanedText: string, urls: string[], bi
 
 async function buildGeminiHistoryFromLastMessageId(params: { lastMessageId?: string; maxContextCount: number; forGeminiImageModel: boolean }): Promise<{ metas: HistoryMessageMeta[]; allUrls: string[] }> {
   const { lastMessageId: startId, maxContextCount, forGeminiImageModel } = params
-  const metasRev: HistoryMessageMeta[] = []; const urlsRev: string[] = []
+  const metasRev: HistoryMessageMeta[] = []
+  const urlsRev: string[] = []
   let lastMessageId = startId
   for (let i = 0; i < maxContextCount; i++) {
     if (!lastMessageId) break
@@ -1022,7 +1246,8 @@ async function buildGeminiHistoryFromLastMessageId(params: { lastMessageId?: str
       const { cleanedText, urls } = await extractImageUrlsFromMessageContent(msg.text)
       if (urls.length) urlsRev.push(...urls)
       metasRev.push({ role, cleanedText: cleanedText?.trim() ? cleanedText : (urls.length ? '[Image]' : '[Empty]'), urls, messageId: msg.id })
-    } else {
+    }
+    else {
       metasRev.push({ role, cleanedText: typeof msg.text === 'string' ? msg.text : '[Complex Content]', urls: [], messageId: msg.id })
     }
     lastMessageId = msg.parentMessageId
@@ -1041,14 +1266,16 @@ function getLastNByRole(metas: HistoryMessageMeta[], role: 'user' | 'model', n: 
 }
 
 function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: string[]): ImageBinding[] {
-  const lastModels = getLastNByRole(metas, 'model', 2); const lastUsers = getLastNByRole(metas, 'user', 1)
+  const lastModels = getLastNByRole(metas, 'model', 2)
+  const lastUsers = getLastNByRole(metas, 'user', 1)
   const groups = [
     { source: 'current_user' as const, tagPrefix: 'U0', urls: currentUrls },
     { source: 'last_ai' as const, tagPrefix: 'A0', urls: lastModels[0]?.urls ?? [] },
     { source: 'prev_user' as const, tagPrefix: 'U1', urls: lastUsers[0]?.urls ?? [] },
     { source: 'prev_ai' as const, tagPrefix: 'A1', urls: lastModels[1]?.urls ?? [] },
   ]
-  const seen = new Set<string>(); const bindings: ImageBinding[] = []
+  const seen = new Set<string>()
+  const bindings: ImageBinding[] = []
   for (const g of groups) {
     let idx = 0
     for (const u of g.urls) {
@@ -1062,7 +1289,10 @@ function selectRecentTwoRoundsImages(metas: HistoryMessageMeta[], currentUrls: s
 }
 
 const IMAGE_SOURCE_LABEL: Record<ImageBinding['source'], string> = {
-  current_user: '本次用户消息', last_ai: '最近一条AI回复', prev_user: '上一次用户消息', prev_ai: '倒数第二条AI回复',
+  current_user: '本次用户消息',
+  last_ai: '最近一条AI回复',
+  prev_user: '上一次用户消息',
+  prev_ai: '倒数第二条AI回复',
 }
 
 type AiPart = { type: 'text'; text: string } | { type: 'image'; image: string } | { inlineData: { mimeType: string; data: string } }
@@ -1095,7 +1325,10 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   const threadKey = makeThreadKey(userId, roomId)
 
   const existingIdx = processThreads.findIndex(t => t.key === threadKey)
-  if (existingIdx > -1) { processThreads[existingIdx].abort.abort(); processThreads.splice(existingIdx, 1) }
+  if (existingIdx > -1) {
+    processThreads[existingIdx].abort.abort()
+    processThreads.splice(existingIdx, 1)
+  }
   processThreads.push({ key: threadKey, userId, abort, messageId, roomId })
 
   await ensureUploadDir()
@@ -1166,14 +1399,17 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerModelCfg = String(globalConfig.siteConfig?.webSearchPlannerModel ?? '').trim()
       const plannerModelEnv = String(process.env.WEB_SEARCH_PLANNER_MODEL ?? '').trim()
       const plannerModelName = plannerModelCfg || plannerModelEnv || model
+
       let plannerKey = await getRandomApiKey(options.user, model, undefined, preTokens)
       if (!plannerKey) throw new Error('没有对应的 apikeys 配置 (Planner)')
+
       let actualPlannerModel = plannerModelName
       if (plannerModelName !== model) {
         const candidateKey = await getRandomApiKey(options.user, plannerModelName, undefined, preTokens)
         if (candidateKey) plannerKey = candidateKey
         else actualPlannerModel = model
       }
+
       const plannerProvider = normalizeProvider((plannerKey as any).keyModel)
       const plannerBaseUrl = isNotEmptyString(plannerKey.baseUrl) ? plannerKey.baseUrl : (isNotEmptyString(globalConfig.apiBaseUrl) ? globalConfig.apiBaseUrl : undefined)
       const maxRounds = Math.max(1, Math.min(6, Number(globalConfig.siteConfig?.webSearchMaxRounds ?? process.env.WEB_SEARCH_MAX_ROUNDS ?? 3)))
@@ -1182,6 +1418,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const searchSearxngUrl = String(globalConfig.siteConfig?.searxngApiUrl ?? '').trim() || undefined
       const searchTavilyKey = String(globalConfig.siteConfig?.tavilyApiKey ?? '').trim() || undefined
       const progressMessages: string[] = []
+
       const onProgressLocal = (status: string) => {
         progressMessages.push(status)
         searchProcessLog = progressMessages.join('\n')
@@ -1196,11 +1433,41 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           detail: undefined,
         })
       }
+
       const historyContextStr = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
       const plannerTimeoutScheduleMs = parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS) ?? [20_000, 30_000, 40_000]
       const plannerModel = createLanguageModel({ provider: plannerProvider, apiKey: plannerKey.key, baseUrl: plannerBaseUrl, model: actualPlannerModel })
-      const { rounds, selectedIds, planFailed } = await runIterativeWebSearch({
+
+      let initialContextSummary: string | null = null
+      const persistedMemory = getPersistedPlannerMemory(userId, roomId)
+      if (persistedMemory?.contextSummary) {
+        const incrementalContext = await buildIncrementalConversationContext({
+          fromExclusiveMessageId: persistedMemory.anchorMessageId,
+          toInclusiveMessageId: lastContext?.parentMessageId,
+          maxCount: maxContextCount,
+        })
+
+        if (incrementalContext.trim()) {
+          initialContextSummary = await refreshPlannerContextSummary({
+            plannerModel,
+            plannerProvider,
+            plannerModelName: actualPlannerModel,
+            globalConfig,
+            previousSummary: persistedMemory.contextSummary,
+            incrementalContext,
+            userQuestion: message,
+            date: currentDate,
+            abortSignal: abort.signal,
+            timeoutScheduleMs: plannerTimeoutScheduleMs,
+          })
+        }
+        else {
+          initialContextSummary = persistedMemory.contextSummary
+        }
+      }
+
+      const { rounds, selectedIds, planFailed, finalPlan } = await runIterativeWebSearch({
         plannerModel,
         plannerProvider,
         plannerModelName: actualPlannerModel,
@@ -1216,8 +1483,27 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         fullContext: historyContextStr,
         date: currentDate,
         plannerTimeoutScheduleMs,
+        initialContextSummary,
       })
+
+      if (finalPlan?.context_summary?.trim()) {
+        setPersistedPlannerMemory(userId, roomId, {
+          contextSummary: finalPlan.context_summary.trim(),
+          anchorMessageId: customMessageId,
+        })
+      }
+
       if (progressMessages.length > 0) searchProcessLog = progressMessages.join('\n')
+
+      if (finalPlan) {
+        const plannerNote = formatPlannerDecisionForMainModel({
+          action: finalPlan.action,
+          reason: finalPlan.reason || '',
+          contextSummary: finalPlan.context_summary,
+        })
+        content = appendTextToMessageContent(content, plannerNote)
+      }
+
       const filteredRounds = rounds.map((r, rIdx) => ({
         query: r.query,
         note: r.note,
@@ -1231,12 +1517,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
 
       processCb?.({
         id: customMessageId,
-        text: (searchProcessLog ? searchProcessLog + '\n\n---\n\n' : '') + `⚡️ ${finalStatusMessage}`,
+        text: (searchProcessLog ? `${searchProcessLog}\n\n---\n\n` : '') + `⚡️ ${finalStatusMessage}`,
         role: 'assistant',
         conversationId: lastContext?.conversationId,
         parentMessageId: lastContext?.parentMessageId,
         detail: undefined,
       })
+
       if (ctx) content = appendTextToMessageContent(content, ctx)
     }
     catch (e: any) {
@@ -1320,7 +1607,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       const res = await fetch(fetchUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key.key, 'Authorization': `Bearer ${key.key}` },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key.key, Authorization: `Bearer ${key.key}` },
         body: JSON.stringify(requestBody),
         signal: callSignal,
       })
@@ -1329,11 +1616,13 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         throw new Error(`API Error (${res.status}): ${errText}`)
       }
       const jsonRes = await res.json()
-      let answerText = ''; const outputParts = jsonRes.candidates?.[0]?.content?.parts || []
+      let answerText = ''
+      const outputParts = jsonRes.candidates?.[0]?.content?.parts || []
       for (const part of outputParts) {
         if (part.text) answerText += part.text
         if (part.inlineData && part.inlineData.data) {
-          const mime = part.inlineData.mimeType || 'image/png'; const ext = mime.split('/')[1] || 'png'
+          const mime = part.inlineData.mimeType || 'image/png'
+          const ext = mime.split('/')[1] || 'png'
           const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`
           await fs.writeFile(path.join(UPLOAD_DIR, filename), Buffer.from(part.inlineData.data, 'base64'))
           answerText += `${answerText ? '\n\n' : ''}![Generated Image](/uploads/${filename})`
@@ -1341,14 +1630,19 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
       if (!answerText) {
         if (jsonRes.promptFeedback?.blockReason) answerText = `[Gemini] 系统拦截了此请求，原因: ${jsonRes.promptFeedback.blockReason}`
-        else { answerText = '[Gemini] No content returned.'; globalThis.console.error('Empty return:', JSON.stringify(jsonRes)) }
+        else {
+          answerText = '[Gemini] No content returned.'
+          globalThis.console.error('Empty return:', JSON.stringify(jsonRes))
+        }
       }
       let usageRes: any = undefined
-      if (jsonRes.usageMetadata) usageRes = {
-        prompt_tokens: jsonRes.usageMetadata.promptTokenCount || 0,
-        completion_tokens: jsonRes.usageMetadata.candidatesTokenCount || 0,
-        total_tokens: jsonRes.usageMetadata.totalTokenCount || 0,
-        estimated: false,
+      if (jsonRes.usageMetadata) {
+        usageRes = {
+          prompt_tokens: jsonRes.usageMetadata.promptTokenCount || 0,
+          completion_tokens: jsonRes.usageMetadata.candidatesTokenCount || 0,
+          total_tokens: jsonRes.usageMetadata.totalTokenCount || 0,
+          estimated: false,
+        }
       }
       processCb?.({
         id: customMessageId,
@@ -1395,7 +1689,9 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
           answerText += `${answerText ? '\n\n' : ''}![Generated Image](/uploads/${filename})`
         }
       }
-      if (answerText && !answerText.startsWith('![') && (answerText.startsWith('http') || answerText.startsWith('data:image'))) answerText = `![Generated Image](${answerText})`
+      if (answerText && !answerText.startsWith('![') && (answerText.startsWith('http') || answerText.startsWith('data:image'))) {
+        answerText = `![Generated Image](${answerText})`
+      }
       const usageRes = toUsageResponse(result.usage)
       processCb?.({
         id: customMessageId,
@@ -1462,7 +1758,11 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
     }
 
     let usageRes: any
-    try { const usage = await (result.usage as Promise<any> | undefined); usageRes = toUsageResponse(usage) } catch { }
+    try {
+      const usage = await (result.usage as Promise<any> | undefined)
+      usageRes = toUsageResponse(usage)
+    }
+    catch {}
 
     return sendResponse({
       type: 'Success',
@@ -1489,7 +1789,8 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       try {
         const parsed = JSON.parse(realError.responseBody)
         if (parsed?.error?.message) safeMessage = parsed.error.message
-      } catch {}
+      }
+      catch {}
     }
     const errorMsgRaw = safeMessage
 
@@ -1525,7 +1826,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       }
     }
 
-    globalThis.console.error(`[ChatReply Process Error]:`, realError)
+    globalThis.console.error('[ChatReply Process Error]:', realError)
 
     const finalErrorText = searchProcessLog ? `${searchProcessLog}\n\n---\n\n❌ 模型请求失败：${displayErrorMsg}` : `❌ 模型请求失败：${displayErrorMsg}`
     processCb?.({
@@ -1600,7 +1901,7 @@ async function getMessageById(id: string): Promise<ChatMessage | undefined> {
           const fileContent = await fs.readFile(filePath, 'utf-8')
           fileContext += `\n\n--- Context File: ${stripTypePrefix(fileKey)} ---\n${fileContent}\n--- End File ---\n`
         }
-        catch { }
+        catch {}
       }
       promptText += (fileContext ? `\n\n[Attached Files History]:\n${fileContext}` : '')
     }
@@ -1654,8 +1955,14 @@ async function getRandomApiKey(user: UserInfo, chatModel: string, _accountId?: s
       const maxMatch = remark.match(/MAX_TOKENS?[:=]\s*(\d+)/i)
       const minMatch = remark.match(/MIN_TOKENS?[:=]\s*(\d+)/i)
       let valid = true
-      if (maxMatch) { const max = parseInt(maxMatch[1], 10); if (tokenCount > max) valid = false }
-      if (minMatch) { const min = parseInt(minMatch[1], 10); if (tokenCount <= min) valid = false }
+      if (maxMatch) {
+        const max = parseInt(maxMatch[1], 10)
+        if (tokenCount > max) valid = false
+      }
+      if (minMatch) {
+        const min = parseInt(minMatch[1], 10)
+        if (tokenCount <= min) valid = false
+      }
       return valid
     })
   }
