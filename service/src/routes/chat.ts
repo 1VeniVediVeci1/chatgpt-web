@@ -3,13 +3,13 @@ import type { TiktokenModel } from 'gpt-token'
 import { textTokens } from 'gpt-token'
 import Router from 'express'
 import { limiter } from '../middleware/limiter'
-import { abortChatProcess, chatReplyProcess, containsSensitiveWords } from '../chatgpt'
+import { abortChatProcess, chatReplyProcess, containsSensitiveWords, forceResetChatProcess } from '../chatgpt'
 import { auth } from '../middleware/auth'
 import { getCacheConfig } from '../storage/config'
 import type { ChatInfo, ChatOptions, UserInfo } from '../storage/model'
 import { Status, UsageResponse, UserRole } from '../storage/model'
 import {
-  clearChat,
+  clearChatAndCleanup,
   deleteAllChatRooms,
   deleteChat,
   existsChatRoom,
@@ -302,7 +302,14 @@ router.post('/chat-clear', auth, async (req, res) => {
       res.send({ status: 'Fail', message: 'Unknown room', data: null })
       return
     }
-    await clearChat(roomId)
+
+    forceResetChatProcess(userId, roomId)
+
+    const key = jobKey(userId, roomId)
+    jobStates.delete(key)
+
+    await clearChatAndCleanup(userId, roomId)
+
     res.send({ status: 'Success', message: null, data: null })
   }
   catch (error) {
@@ -408,7 +415,6 @@ async function runChatJobInBackground(params: {
 
     console.error('[Job] chatReplyProcess error:', error?.message ?? error)
 
-    // ✅ 关键修复：只要是 abort，就按“成功结束”处理（即使 lastResponse.text 为空字符串）
     if (isAbort && lastResponse) {
       result = {
         status: 'Success',
@@ -421,7 +427,6 @@ async function runChatJobInBackground(params: {
       }
     }
     else if (isAbort) {
-      // 极端情况：还没来得及触发 process() 就 abort（理论上已被后端“占位 process”修复）
       result = {
         status: 'Success',
         data: {
@@ -545,7 +550,6 @@ router.post('/chat-process', [auth, limiter], async (req, res) => {
     return
   }
 
-  // ✅ 限制每个用户最多 3 个并发（跨房间）
   const maxJobs = Number(process.env.MAX_RUNNING_JOBS_PER_USER ?? 3)
   if (countRunningJobs(userId) >= maxJobs) {
     res.send({ status: 'Fail', message: `并发生成达到上限(${maxJobs})，请先等待已有任务完成或停止。`, data: null })
@@ -635,17 +639,14 @@ router.post('/chat-abort', auth, async (req, res) => {
       return
     }
 
-    // 1) 真正 abort（会触发 AbortController.abort）
     const chatId = await abortChatProcess(userId, Number(roomId))
 
-    // 2) 立刻把 jobStates 标记为 done，让前端轮询尽快结束
     const key = jobKey(userId, Number(roomId))
     const job = jobStates.get(key)
     if (job?.status === 'running') {
       jobStates.set(key, { ...job, status: 'done', updatedAt: Date.now() })
     }
 
-    // 3) 把“当前已输出内容”落库（前端传过来的 text）
     if (chatId && typeof text === 'string') {
       try { await updateChatResponsePartial(chatId, text) } catch {}
     }
@@ -654,6 +655,44 @@ router.post('/chat-abort', auth, async (req, res) => {
   }
   catch (error: any) {
     res.send({ status: 'Fail', message: error?.message ?? 'Abort failed', data: null })
+  }
+})
+
+router.post('/chat-reset-room', auth, async (req, res) => {
+  try {
+    const userId = req.headers.userId.toString()
+    const { roomId, clearPartialResponse } = req.body as { roomId: number; clearPartialResponse?: boolean }
+
+    if (!roomId) {
+      res.send({ status: 'Fail', message: 'roomId required', data: null })
+      return
+    }
+
+    const resetResult = forceResetChatProcess(userId, Number(roomId))
+
+    const key = jobKey(userId, Number(roomId))
+    const job = jobStates.get(key)
+
+    if (job?.chatId && clearPartialResponse === true) {
+      try {
+        await updateChatResponsePartial(job.chatId, '')
+      }
+      catch {}
+    }
+
+    jobStates.delete(key)
+
+    res.send({
+      status: 'Success',
+      message: 'Room state reset successfully',
+      data: {
+        resetThread: resetResult.reset,
+        messageId: resetResult.messageId ?? null,
+      },
+    })
+  }
+  catch (error: any) {
+    res.send({ status: 'Fail', message: error?.message ?? 'Reset room failed', data: null })
   }
 })
 
