@@ -15,6 +15,7 @@ import {
   createUser,
   deleteChatRoom,
   disableUser2FA,
+  ensureMongoIndexes,
   existsChatRoom,
   getAmtByCardNo,
   getChatRooms,
@@ -290,14 +291,12 @@ router.post('/session', async (req, res) => {
     const authProxyEnabled = config.siteConfig.authProxyEnabled
     const allowRegister = config.siteConfig.registerEnabled
 
-    // ✅ 统一：如果为空则默认 openai-compatible（不再出现 ChatGPTUnofficialProxyAPI）
     if (!config.apiModel || config.apiModel === ('openai-compatible' as any))
       config.apiModel = 'openai-completions'
 
     const userId = await getUserId(req)
     const chatModels: { label; key: string; value: string }[] = []
 
-    // ✅ 所有模型选项（包含隐藏模型）—— 给管理员 Key 配置页用
     const chatModelOptions = config.siteConfig.chatModels.split(',').map((model: string) => {
       let label = model
       if (model === 'text-davinci-002-render-sha-mobile')
@@ -305,7 +304,6 @@ router.post('/session', async (req, res) => {
       return { label, key: model, value: model }
     })
 
-    // ✅ 隐藏模型集合
     const hiddenModelSet = new Set(
       (config.siteConfig?.hiddenModels || '')
         .split(/[,，]/)
@@ -313,7 +311,6 @@ router.post('/session', async (req, res) => {
         .filter(Boolean),
     )
 
-    // ✅ 用户可见的模型选项（过滤掉隐藏模型）—— 给聊天页下拉用
     const visibleChatModelOptions = chatModelOptions.filter(
       (opt: any) => !hiddenModelSet.has(opt.value),
     )
@@ -321,7 +318,6 @@ router.post('/session', async (req, res) => {
     const imageModelsStr = config.siteConfig?.imageModels || ''
     const nonStreamModelMatchers = imageModelsStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
 
-    // ✅ 联网搜索全局开关
     const webSearchEnabled = config.siteConfig?.webSearchEnabled === true
 
     let userInfo: { name: string; description: string; avatar: string; userId: string; root: boolean; roles: UserRole[]; config: UserConfig; advanced: AdvancedConfig }
@@ -359,7 +355,6 @@ router.post('/session', async (req, res) => {
 
       const keys = (await getCacheApiKeys()).filter(d => hasAnyRole(d.userRoles, user.roles))
 
-      // ✅ 构建用户可见的 chatModels 列表时，只用 visibleChatModelOptions
       const count: { key: string; count: number }[] = []
       visibleChatModelOptions.forEach((chatModel) => {
         keys.forEach((key) => {
@@ -406,7 +401,6 @@ router.post('/session', async (req, res) => {
       return
     }
 
-    // 未登录
     const allValues = visibleChatModelOptions.map(m => m.value)
     const geminiChatModels = allValues.filter(m => m.includes('gemini'))
     const nonStreamChatModels = allValues.filter(m => nonStreamModelMatchers.some(x => m.includes(x)))
@@ -800,7 +794,6 @@ router.post('/setting-base', rootAuth, async (req, res) => {
     const { apiKey, apiModel, apiBaseUrl, accessToken, timeoutMs, reverseProxy, socksProxy, socksAuth, httpsProxy } = req.body as Config
     const thisConfig = await getOriginConfig()
     thisConfig.apiKey = apiKey
-    // ✅ apiModel 允许为空；为空则不覆盖（避免变成 undefined）
     if (apiModel)
       thisConfig.apiModel = apiModel
     thisConfig.apiBaseUrl = apiBaseUrl
@@ -1012,4 +1005,16 @@ app.use('/api', uploadRouter)
 app.use('', router)
 app.use('/api', router)
 
-app.listen(3002, () => globalThis.console.log('Server is running on port 3002'))
+async function bootstrap() {
+  try {
+    await ensureMongoIndexes()
+    globalThis.console.log('Mongo indexes ensured')
+  }
+  catch (e) {
+    globalThis.console.error('Ensure Mongo indexes failed:', e)
+  }
+
+  app.listen(3002, () => globalThis.console.log('Server is running on port 3002'))
+}
+
+bootstrap()
