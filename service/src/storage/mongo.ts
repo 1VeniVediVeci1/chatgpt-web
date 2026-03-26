@@ -2,14 +2,35 @@ import type { WithId } from 'mongodb'
 import { MongoClient, ObjectId } from 'mongodb'
 import * as dotenv from 'dotenv'
 import dayjs from 'dayjs'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import { md5 } from '../utils/security'
-import type { AdvancedConfig, ChatOptions, Config, GiftCard, KeyConfig, UsageResponse, UserPrompt } from './model'
-import { ChatInfo, ChatRoom, ChatUsage, Status, UserConfig, UserInfo, UserRole } from './model'
+import type {
+  AdvancedConfig,
+  ChatOptions,
+  Config,
+  GiftCard,
+  KeyConfig,
+  PlannerMemory,
+  UsageResponse,
+  UserPrompt,
+} from './model'
+import {
+  ChatInfo,
+  ChatRoom,
+  ChatUsage,
+  PlannerMemory as PlannerMemoryModel,
+  Status,
+  UserConfig,
+  UserInfo,
+  UserRole,
+} from './model'
 import { getCacheConfig } from './config'
 
 dotenv.config()
 
 const url = process.env.MONGODB_URL
+const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads')
 
 let client: MongoClient
 let dbName: string
@@ -30,16 +51,61 @@ const configCol = client.db(dbName).collection<Config>('config')
 const usageCol = client.db(dbName).collection<ChatUsage>('chat_usage')
 const keyCol = client.db(dbName).collection<KeyConfig>('key_config')
 const userPromptCol = client.db(dbName).collection<UserPrompt>('user_prompt')
+const plannerMemoryCol = client.db(dbName).collection<PlannerMemory>('planner_memory')
 // 新增兑换券的数据库
-// {
-//   "_id": { "$comment": "Mongodb系统自动" , "$type": "ObjectId" },
-//   "cardno": { "$comment": "卡号（可以用csv导入）", "$type": "String" },
-//   "amount": { "$comment": "卡号对应的额度", "$type": "Int32" },
-//   "redeemed": { "$comment": "标记是否已被兑换，0｜1表示false｜true，目前类型为Int是为图方便和测试考虑以后识别泄漏啥的（多次被兑换）", "$type": "Int32" },
-//   "redeemed_by": { "$comment": "执行成功兑换的用户", "$type": "String" },
-//   "redeemed_date": { "$comment": "执行成功兑换的日期，考虑通用性选择了String类型，由new Date().toLocaleString()产生", "$type": "String" }
-// }
 const redeemCol = client.db(dbName).collection<GiftCard>('giftcards')
+
+const RESPONSE_UPLOADS_RE = /\/uploads\/([A-Za-z0-9._-]+)/g
+
+function stripTypePrefix(key: string): string {
+  return String(key || '').replace(/^(img:|txt:|file:)/, '')
+}
+
+function extractUploadsFromText(text?: string): string[] {
+  if (!text) return []
+  const out: string[] = []
+  const matches = text.matchAll(RESPONSE_UPLOADS_RE)
+  for (const m of matches) {
+    const file = String(m[1] || '').trim()
+    if (file) out.push(file)
+  }
+  return out
+}
+
+function extractChatReferencedFiles(chat: ChatInfo): string[] {
+  const files = new Set<string>()
+
+  for (const k of chat.images || []) {
+    const real = stripTypePrefix(k)
+    if (real) files.add(real)
+  }
+
+  for (const f of extractUploadsFromText(chat.response || ''))
+    files.add(f)
+
+  for (const prev of chat.previousResponse || []) {
+    for (const f of extractUploadsFromText(prev?.response || ''))
+      files.add(f)
+  }
+
+  return [...files]
+}
+
+async function safeDeleteUploadFile(filename: string) {
+  if (!filename) return
+  try {
+    const fp = path.join(UPLOAD_DIR, path.basename(filename))
+    await fs.unlink(fp)
+  }
+  catch {
+    // ignore
+  }
+}
+
+export async function ensureMongoIndexes() {
+  await plannerMemoryCol.createIndex({ userId: 1, roomId: 1 }, { unique: true })
+  await plannerMemoryCol.createIndex({ updatedAt: -1 })
+}
 
 /**
  * 插入聊天信息
@@ -52,27 +118,30 @@ const redeemCol = client.db(dbName).collection<GiftCard>('giftcards')
 
 // 获取、比对兑换券号码
 export async function getAmtByCardNo(redeemCardNo: string) {
-  // const chatInfo = new ChatInfo(roomId, uuid, text, options)
   const amt_isused = await redeemCol.findOne({ cardno: redeemCardNo.trim() }) as GiftCard
   return amt_isused
 }
+
 // 兑换后更新兑换券信息
 export async function updateGiftCard(redeemCardNo: string, userId: string) {
-  return await redeemCol.updateOne({ cardno: redeemCardNo.trim() }
-    , { $set: { redeemed: 1, redeemed_date: new Date().toLocaleString(), redeemed_by: userId } })
+  return await redeemCol.updateOne(
+    { cardno: redeemCardNo.trim() },
+    { $set: { redeemed: 1, redeemed_date: new Date().toLocaleString(), redeemed_by: userId } },
+  )
 }
+
 // 使用对话后更新用户额度
 export async function updateAmountMinusOne(userId: string) {
-  const result = await userCol.updateOne({ _id: new ObjectId(userId) }
-    , { $inc: { useAmount: -1 } })
+  const result = await userCol.updateOne(
+    { _id: new ObjectId(userId) },
+    { $inc: { useAmount: -1 } },
+  )
   return result.modifiedCount > 0
 }
 
 // update giftcards database
 export async function updateGiftCards(data: GiftCard[], overRide = true) {
   if (overRide) {
-    // i am not sure is there a drop option for the node driver reference https://mongodb.github.io/node-mongodb-native/6.4/
-    // await redeemCol.deleteMany({})
     await redeemCol.drop()
   }
   const insertResult = await redeemCol.insertMany(data)
@@ -107,8 +176,8 @@ export async function updateChat(chatId: string, response: string, messageId: st
   const query = { _id: new ObjectId(chatId) }
   const update = {
     $set: {
-      'response': response,
-      'model': model || '',
+      response,
+      model: model || '',
       'options.messageId': messageId,
       'options.conversationId': conversationId,
       'options.prompt_tokens': usage?.prompt_tokens,
@@ -153,9 +222,30 @@ export async function renameChatRoom(userId: string, title: string, roomId: numb
   return result.modifiedCount > 0
 }
 
+export async function deletePlannerMemory(userId: string, roomId: number) {
+  await plannerMemoryCol.deleteOne({ userId, roomId })
+}
+
+export async function getRoomChats(roomId: number): Promise<ChatInfo[]> {
+  return await chatCol.find({ roomId }).toArray()
+}
+
+export async function deleteRoomReferencedUploads(roomId: number) {
+  const chats = await getRoomChats(roomId)
+  const files = new Set<string>()
+  for (const chat of chats) {
+    for (const f of extractChatReferencedFiles(chat))
+      files.add(f)
+  }
+  for (const f of files)
+    await safeDeleteUploadFile(f)
+}
+
 export async function deleteChatRoom(userId: string, roomId: number) {
+  await deleteRoomReferencedUploads(roomId)
   const result = await roomCol.updateOne({ roomId, userId }, { $set: { status: Status.Deleted } })
   await clearChat(roomId)
+  await deletePlannerMemory(userId, roomId)
   return result.modifiedCount > 0
 }
 
@@ -309,6 +399,11 @@ export async function existsChatRoom(userId: string, roomId: number) {
 }
 
 export async function deleteAllChatRooms(userId: string) {
+  const rooms = await roomCol.find({ userId, status: Status.Normal }).toArray()
+  for (const room of rooms) {
+    await deleteRoomReferencedUploads(room.roomId)
+    await deletePlannerMemory(userId, room.roomId)
+  }
   await roomCol.updateMany({ userId, status: Status.Normal }, { $set: { status: Status.Deleted } })
   await chatCol.updateMany({ userId, status: Status.Normal }, { $set: { status: Status.Deleted } })
 }
@@ -339,6 +434,12 @@ export async function clearChat(roomId: number) {
     },
   }
   await chatCol.updateMany(query, update)
+}
+
+export async function clearChatAndCleanup(userId: string, roomId: number) {
+  await deleteRoomReferencedUploads(roomId)
+  await clearChat(roomId)
+  await deletePlannerMemory(userId, roomId)
 }
 
 export async function deleteChat(roomId: number, uuid: number, inversion: boolean) {
@@ -633,4 +734,35 @@ export async function clearUserPrompt(userId: string) {
 
 export async function importUserPrompt(userPromptList: UserPrompt[]) {
   await userPromptCol.insertMany(userPromptList)
+}
+
+export async function getPlannerMemory(userId: string, roomId: number): Promise<PlannerMemory | null> {
+  return await plannerMemoryCol.findOne({ userId, roomId })
+}
+
+export async function upsertPlannerMemory(
+  userId: string,
+  roomId: number,
+  contextSummary: string,
+  anchorMessageId: string,
+): Promise<PlannerMemory> {
+  const doc = new PlannerMemoryModel(userId, roomId, contextSummary, anchorMessageId)
+
+  await plannerMemoryCol.updateOne(
+    { userId, roomId },
+    {
+      $set: {
+        contextSummary: doc.contextSummary,
+        anchorMessageId: doc.anchorMessageId,
+        updatedAt: doc.updatedAt,
+      },
+      $setOnInsert: {
+        userId: doc.userId,
+        roomId: doc.roomId,
+      },
+    },
+    { upsert: true },
+  )
+
+  return doc as PlannerMemory
 }
