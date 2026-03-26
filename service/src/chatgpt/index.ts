@@ -12,7 +12,7 @@ import { getCacheApiKeys, getCacheConfig, getOriginConfig } from '../storage/con
 import { sendResponse } from '../utils'
 import { hasAnyRole, isNotEmptyString } from '../utils/is'
 import type { ModelConfig } from '../types'
-import { getChatByMessageId, updateRoomChatModel } from '../storage/mongo'
+import { getChatByMessageId, getPlannerMemory, updateRoomChatModel, upsertPlannerMemory } from '../storage/mongo'
 import type { ChatMessage, ChatResponse, MessageContent, RequestOptions } from './types'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -211,20 +211,6 @@ type SearchRound = { query: string; items: Array<{ title: string; url: string; c
 type PersistedPlannerMemory = {
   contextSummary: string
   anchorMessageId: string
-}
-
-const plannerMemoryMap = new Map<string, PersistedPlannerMemory>()
-
-function getPlannerMemoryKey(userId: string, roomId: number) {
-  return `${userId}:${roomId}`
-}
-
-function getPersistedPlannerMemory(userId: string, roomId: number): PersistedPlannerMemory | null {
-  return plannerMemoryMap.get(getPlannerMemoryKey(userId, roomId)) ?? null
-}
-
-function setPersistedPlannerMemory(userId: string, roomId: number, memory: PersistedPlannerMemory) {
-  plannerMemoryMap.set(getPlannerMemoryKey(userId, roomId), memory)
 }
 
 function tryParseJsonString(text: string): any | null {
@@ -1440,7 +1426,14 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const plannerModel = createLanguageModel({ provider: plannerProvider, apiKey: plannerKey.key, baseUrl: plannerBaseUrl, model: actualPlannerModel })
 
       let initialContextSummary: string | null = null
-      const persistedMemory = getPersistedPlannerMemory(userId, roomId)
+      const persistedMemoryDoc = await getPlannerMemory(userId, roomId)
+      const persistedMemory: PersistedPlannerMemory | null = persistedMemoryDoc
+        ? {
+            contextSummary: persistedMemoryDoc.contextSummary,
+            anchorMessageId: persistedMemoryDoc.anchorMessageId,
+          }
+        : null
+
       if (persistedMemory?.contextSummary) {
         const incrementalContext = await buildIncrementalConversationContext({
           fromExclusiveMessageId: persistedMemory.anchorMessageId,
@@ -1487,10 +1480,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
 
       if (finalPlan?.context_summary?.trim()) {
-        setPersistedPlannerMemory(userId, roomId, {
-          contextSummary: finalPlan.context_summary.trim(),
-          anchorMessageId: customMessageId,
-        })
+        await upsertPlannerMemory(
+          userId,
+          roomId,
+          finalPlan.context_summary.trim(),
+          customMessageId,
+        )
       }
 
       if (progressMessages.length > 0) searchProcessLog = progressMessages.join('\n')
@@ -1854,6 +1849,22 @@ export function abortChatProcess(userId: string, roomId: number) {
   processThreads[index].abort.abort()
   processThreads.splice(index, 1)
   return messageId
+}
+
+export function forceResetChatProcess(userId: string, roomId: number) {
+  const key = makeThreadKey(userId, roomId)
+  const index = processThreads.findIndex(d => d.key === key)
+  if (index <= -1) {
+    return { messageId: undefined, reset: false }
+  }
+
+  const messageId = processThreads[index].messageId
+  try {
+    processThreads[index].abort.abort()
+  }
+  catch {}
+  processThreads.splice(index, 1)
+  return { messageId, reset: true }
 }
 
 export function initAuditService(audit: AuditConfig) {
