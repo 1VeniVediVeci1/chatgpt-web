@@ -300,6 +300,23 @@ export class UserPrompt {
   }
 }
 
+export class PlannerMemory {
+  _id?: ObjectId
+  userId: string
+  roomId: number
+  contextSummary: string
+  anchorMessageId: string
+  updatedAt: number
+
+  constructor(userId: string, roomId: number, contextSummary: string, anchorMessageId: string) {
+    this.userId = userId
+    this.roomId = roomId
+    this.contextSummary = contextSummary
+    this.anchorMessageId = anchorMessageId
+    this.updatedAt = Date.now()
+  }
+}
+
 /**
  * ✅ keyModel（前端 Key 配置页里选）
  * - openai-completions：走 OpenAI /v1/chat/completions
