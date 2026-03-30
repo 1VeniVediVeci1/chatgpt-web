@@ -327,6 +327,118 @@ class PlannerTimeoutError extends Error {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
+function createIdleTimeoutController(params: {
+  idleTimeoutMs: number
+  parentSignal?: AbortSignal
+}) {
+  const { idleTimeoutMs, parentSignal } = params
+  const ac = new AbortController()
+  let timer: NodeJS.Timeout | null = null
+
+  const stop = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+
+  const reset = () => {
+    stop()
+    timer = setTimeout(() => {
+      try {
+        ac.abort(new PlannerTimeoutError(idleTimeoutMs, { kind: 'stream_idle_timeout' }))
+      }
+      catch {
+        try { ac.abort() } catch {}
+      }
+    }, idleTimeoutMs)
+  }
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      try { ac.abort((parentSignal as any).reason) } catch { ac.abort() }
+    }
+    else {
+      parentSignal.addEventListener('abort', () => {
+        stop()
+        try { ac.abort((parentSignal as any).reason) } catch { ac.abort() }
+      }, { once: true })
+    }
+  }
+
+  reset()
+
+  return {
+    signal: ac.signal,
+    reset,
+    stop,
+    abort: (reason?: any) => {
+      stop()
+      try { ac.abort(reason) } catch { ac.abort() }
+    },
+  }
+}
+
+async function streamGenerateTextWithIdleTimeout(params: {
+  model: any
+  system: string
+  user: string
+  idleTimeoutMs: number
+  parentSignal?: AbortSignal
+  providerOptions?: any
+}): Promise<string> {
+  const { model, system, user, idleTimeoutMs, parentSignal, providerOptions } = params
+
+  const idle = createIdleTimeoutController({
+    idleTimeoutMs,
+    parentSignal,
+  })
+
+  let text = ''
+
+  try {
+    const result: any = streamText({
+      model,
+      system,
+      prompt: user,
+      temperature: 0,
+      abortSignal: idle.signal,
+      maxRetries: 0,
+      providerOptions,
+    })
+
+    for await (const part of result.fullStream as AsyncIterable<any>) {
+      if (part?.type === 'text-delta') {
+        const delta = String(part.textDelta ?? '')
+        if (delta) {
+          text += delta
+          idle.reset()
+        }
+      }
+      else if (part?.type === 'error') {
+        throw part.error
+      }
+    }
+
+    idle.stop()
+    return text
+  }
+  catch (e: any) {
+    idle.stop()
+
+    if (parentSignal?.aborted) throw e
+
+    if (idle.signal.aborted) {
+      throw new PlannerTimeoutError(idleTimeoutMs, {
+        kind: 'stream_idle_timeout',
+        original: e,
+      })
+    }
+
+    throw e
+  }
+}
+
 function oneLine(s: any, maxLen = 260): string {
   const str = String(s ?? '').replace(/\s+/g, ' ').trim()
   if (!str) return ''
@@ -433,18 +545,15 @@ async function aiGenerateJsonWithTimeoutRetry(params: {
 
   for (let attempt = 1; attempt <= totalAttempts; attempt++) {
     const timeoutMs = timeoutsMs[attempt - 1]
-    const callSignal = mergeAbortSignals([parentSignal, AbortSignal.timeout(timeoutMs)])
     try {
-      const result: any = await generateText({
+      const text = await streamGenerateTextWithIdleTimeout({
         model,
         system,
-        prompt: user,
-        temperature: 0,
-        abortSignal: callSignal,
-        maxRetries: 0,
+        user,
+        idleTimeoutMs: timeoutMs,
+        parentSignal,
         providerOptions,
       })
-      const text = String(result?.text ?? '')
       if (validator) await validator(text)
       return text
     }
@@ -455,8 +564,12 @@ async function aiGenerateJsonWithTimeoutRetry(params: {
       const nextAttempt = attempt + 1
       if (attempt >= totalAttempts) throw e
 
-      const timeoutReason = isLikelySdkOrNetworkTimeout(e) || callSignal?.aborted
-        ? summarizePlannerTimeoutReason(new PlannerTimeoutError(timeoutMs, { kind: 'generate_timeout', original: e }))
+      const timeoutReason = e instanceof PlannerTimeoutError || isLikelySdkOrNetworkTimeout(e)
+        ? summarizePlannerTimeoutReason(
+            e instanceof PlannerTimeoutError
+              ? e
+              : new PlannerTimeoutError(timeoutMs, { kind: 'generate_timeout', original: e }),
+          )
         : summarizeAnyError(e)
 
       const rawText = String(e?.rawText ?? '')
@@ -660,16 +773,15 @@ async function refreshPlannerContextSummary(params: {
   const schedule = (timeoutScheduleMs && timeoutScheduleMs.length ? timeoutScheduleMs : [20_000, 30_000, 40_000])
 
   try {
-    const result: any = await generateText({
+    const text = (await streamGenerateTextWithIdleTimeout({
       model: plannerModel,
       system,
-      prompt: user,
-      temperature: 0,
-      abortSignal: mergeAbortSignals([abortSignal, AbortSignal.timeout(schedule[0] ?? 20_000)]),
-      maxRetries: 0,
+      user,
+      idleTimeoutMs: schedule[0] ?? 20_000,
+      parentSignal: abortSignal,
       providerOptions: isOpenAILike(plannerProvider) ? undefined : providerOptions,
-    })
-    const text = String(result?.text ?? '').trim()
+    })).trim()
+
     return text || truncateForPlanner(`${previousSummary || ''}\n${incrementalContext || ''}`, 220)
   }
   catch (e) {
@@ -1583,7 +1695,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
         const img = await imageUrlToAiSdkImagePart(b.url)
         if (img) {
           if ('inlineData' in img) nativeUserParts.push({ inlineData: img.inlineData })
-          else if (img.type === 'text') nativeUserParts.push({ text: img.text })
+          else if ((img as any).type === 'text') nativeUserParts.push({ text: (img as any).text })
         }
         else nativeUserParts.push({ text: `（该图片无法上传：${shortUrlForLog(b.url)}）` })
       }
