@@ -494,15 +494,20 @@ function isLikelySdkOrNetworkTimeout(e: any): boolean {
 }
 
 function buildPlannerProviderOptions(provider: string, modelName: string, globalConfig: any) {
+  if (!isOpenAILike(provider)) return undefined
+
   const siteCfg = globalConfig?.siteConfig
   const reasoningModelsStr = siteCfg?.reasoningModels || ''
   const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
   const reasoningModelList = reasoningModelsStr.split(/[,，]/).map((s: string) => s.trim()).filter(Boolean)
-  const openaiOpts: any = {}
-  if (reasoningModelList.includes(modelName) && reasoningEffort && reasoningEffort !== 'none')
-    openaiOpts.reasoning_effort = reasoningEffort
 
-  openaiOpts.response_format = {
+  const openaiOpts: any = {}
+
+  if (reasoningModelList.includes(modelName) && reasoningEffort && reasoningEffort !== 'none') {
+    openaiOpts.reasoningEffort = reasoningEffort
+  }
+
+  openaiOpts.responseFormat = {
     type: 'json_schema',
     json_schema: {
       name: 'search_plan',
@@ -522,8 +527,7 @@ function buildPlannerProviderOptions(provider: string, modelName: string, global
     },
   }
 
-  if (isOpenAILike(provider)) return { openai: openaiOpts }
-  return undefined
+  return { openai: openaiOpts }
 }
 
 async function aiGenerateJsonWithTimeoutRetry(params: {
@@ -779,7 +783,7 @@ async function refreshPlannerContextSummary(params: {
       user,
       idleTimeoutMs: schedule[0] ?? 20_000,
       parentSignal: abortSignal,
-      providerOptions: isOpenAILike(plannerProvider) ? undefined : providerOptions,
+      providerOptions,
     })).trim()
 
     return text || truncateForPlanner(`${previousSummary || ''}\n${incrementalContext || ''}`, 220)
@@ -1414,6 +1418,30 @@ type ProcessThread = { key: string; userId: string; roomId: number; abort: Abort
 const processThreads: ProcessThread[] = []
 const makeThreadKey = (userId: string, roomId: number) => `${userId}:${roomId}`
 
+function buildOpenAIReasoningProviderOptions(params: {
+  provider: string
+  modelName: string
+  globalConfig: any
+}) {
+  const { provider, modelName, globalConfig } = params
+  if (!isOpenAILike(provider)) return undefined
+
+  const siteCfg = globalConfig?.siteConfig
+  const reasoningModelsStr = siteCfg?.reasoningModels || ''
+  const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
+  const reasoningModelList = reasoningModelsStr.split(/[,，]/).map((s: string) => s.trim()).filter(Boolean)
+
+  if (reasoningModelList.includes(modelName) && reasoningEffort && reasoningEffort !== 'none') {
+    return {
+      openai: {
+        reasoningEffort,
+      },
+    }
+  }
+
+  return undefined
+}
+
 async function chatReplyProcess(options: RequestOptions): Promise<{ message: string; data: ChatResponse; status: string }> {
   const userId = options.user._id.toString()
   const messageId = options.messageId
@@ -1823,6 +1851,12 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       })
     }
 
+    const reasoningProviderOptions = buildOpenAIReasoningProviderOptions({
+      provider,
+      modelName: model,
+      globalConfig,
+    })
+
     const result: any = streamText({
       model: lm,
       messages: coreMessages,
@@ -1830,18 +1864,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       topP: shouldUseTopP ? top_p : undefined,
       abortSignal: callSignal,
       maxRetries: 0,
-      providerOptions: isOpenAILike(provider)
-        ? {
-            openai: (() => {
-              const siteCfg = globalConfig.siteConfig
-              const reasoningModelsStr = siteCfg?.reasoningModels || ''
-              const reasoningEffort = siteCfg?.reasoningEffort || 'medium'
-              const reasoningModelList = reasoningModelsStr.split(/[,，]/).map((s: string) => s.trim()).filter(Boolean)
-              if (reasoningModelList.includes(model) && reasoningEffort && reasoningEffort !== 'none') return { reasoning_effort: reasoningEffort }
-              return {}
-            })(),
-          }
-        : undefined,
+      providerOptions: reasoningProviderOptions,
     })
 
     let answerText = ''
