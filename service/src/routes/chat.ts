@@ -438,10 +438,18 @@ async function runChatJobInBackground(params: {
       }
     }
     else {
+      const failMessage = error?.message ?? 'Please check the back-end console'
+      const partialText = typeof lastResponse?.text === 'string' ? lastResponse.text.trim() : ''
       result = {
         status: 'Fail',
-        message: error?.message ?? 'Please check the back-end console',
-        data: (lastResponse ?? { text: error?.message ?? '' }),
+        message: failMessage,
+        data: {
+          ...(lastResponse && typeof lastResponse === 'object' ? lastResponse : {}),
+          text: partialText ? `${partialText}\n\n⚠️ ${failMessage}` : failMessage,
+          id: lastResponse?.id ?? message._id?.toString(),
+          conversationId: lastResponse?.conversationId ?? options?.conversationId,
+          detail: lastResponse?.detail,
+        },
       }
     }
   }
@@ -463,8 +471,12 @@ async function runChatJobInBackground(params: {
     }
 
     if (safeResult.status !== 'Success') {
-      lastResponse = lastResponse ?? { text: safeResult.message }
-      safeResult.data = lastResponse
+      if (typeof safeResult.data !== 'object' || safeResult.data === null) {
+        safeResult.data = lastResponse ?? { text: safeResult.message }
+      }
+      else if (typeof (safeResult.data as any).text !== 'string' || !(safeResult.data as any).text.trim()) {
+        ;(safeResult.data as any).text = safeResult.message
+      }
     }
 
     const resultData = safeResult.data as any

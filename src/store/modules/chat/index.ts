@@ -15,6 +15,34 @@ import {
   fetchUpdateUserChatModel,
 } from '@/api'
 
+function getChatMessageKey(chat: Chat.Chat) {
+  return `${chat.uuid ?? 'pending'}:${chat.inversion ? 'user' : 'assistant'}`
+}
+
+function sortChatMessages(a: Chat.Chat, b: Chat.Chat) {
+  const uuidDiff = (a.uuid ?? 0) - (b.uuid ?? 0)
+  if (uuidDiff !== 0)
+    return uuidDiff
+  if (!!a.inversion === !!b.inversion)
+    return 0
+  return a.inversion ? -1 : 1
+}
+
+function mergeSyncedChatData(existing: Chat.Chat[], incoming: Chat.Chat[]) {
+  const merged = new Map<string, Chat.Chat>()
+
+  for (const message of existing)
+    merged.set(getChatMessageKey(message), message)
+
+  for (const message of incoming) {
+    const key = getChatMessageKey(message)
+    const previous = merged.get(key)
+    merged.set(key, previous ? { ...previous, ...message } : message)
+  }
+
+  return Array.from(merged.values()).sort(sortChatMessages)
+}
+
 export const useChatStore = defineStore('chat-store', {
   state: (): Chat.ChatState => getLocalState(),
 
@@ -87,9 +115,9 @@ export const useChatStore = defineStore('chat-store', {
             hisroty.all = true
 
           if (chatIndex <= -1)
-            this.chat.unshift({ uuid: h.uuid, data: chatData })
+            this.chat.unshift({ uuid: h.uuid, data: mergeSyncedChatData([], chatData) })
           else
-            this.chat[chatIndex].data.unshift(...chatData)
+            this.chat[chatIndex].data = mergeSyncedChatData(this.chat[chatIndex].data, chatData)
         }
       }
       finally {
