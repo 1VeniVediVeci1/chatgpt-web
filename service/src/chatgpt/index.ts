@@ -2022,6 +2022,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
   }
 
   let searchProcessLog = ''
+  let searchAnswerIdleTimeoutMs = 0
   const allowSearch = globalConfig.siteConfig?.webSearchEnabled === true
   const finalSearchMode = allowSearch && options.searchMode === true && !isImage
 
@@ -2070,6 +2071,7 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       const historyContextStr = await buildConversationContext(lastContext?.parentMessageId, maxContextCount)
       const currentDate = new Date().toLocaleString()
       const plannerTimeoutScheduleMs = parseTimeoutScheduleToMs((globalConfig.siteConfig as any)?.webSearchPlannerTimeoutScheduleMs ?? process.env.WEB_SEARCH_PLANNER_TIMEOUT_SCHEDULE_MS) ?? [20_000, 30_000, 40_000]
+      searchAnswerIdleTimeoutMs = plannerTimeoutScheduleMs[plannerTimeoutScheduleMs.length - 1] ?? plannerTimeoutScheduleMs[0] ?? 40_000
       const plannerModel = createLanguageModel({ provider: plannerProvider, apiKey: plannerKey.key, baseUrl: plannerBaseUrl, model: actualPlannerModel })
 
       let initialContextSummary: string | null = null
@@ -2364,34 +2366,59 @@ async function chatReplyProcess(options: RequestOptions): Promise<{ message: str
       globalConfig,
     })
 
+    const answerStreamIdle = searchAnswerIdleTimeoutMs > 0
+      ? createIdleTimeoutController({
+          idleTimeoutMs: searchAnswerIdleTimeoutMs,
+          parentSignal: callSignal,
+        })
+      : null
+
     const result: any = streamText({
       model: lm,
       messages: coreMessages,
       temperature: finalTemperature,
       topP: shouldUseTopP ? top_p : undefined,
-      abortSignal: callSignal,
+      abortSignal: answerStreamIdle?.signal ?? callSignal,
       maxRetries: 0,
       providerOptions: reasoningProviderOptions,
     })
 
     let answerText = ''
-    for await (const part of (result as any).fullStream as AsyncIterable<any>) {
-      if (part?.type === 'text-delta') {
-        const delta = String(part.textDelta ?? '')
-        answerText += delta
-        processCb?.({
-          id: customMessageId,
-          text: getCombineStreamText(answerText),
-          role: 'assistant',
-          conversationId: lastContext?.conversationId,
-          parentMessageId: lastContext?.parentMessageId,
-          detail: undefined,
-        })
+    try {
+      for await (const part of (result as any).fullStream as AsyncIterable<any>) {
+        if (part?.type === 'text-delta') {
+          const delta = String(part.textDelta ?? '')
+          if (!delta) continue
+          answerText += delta
+          answerStreamIdle?.reset()
+          processCb?.({
+            id: customMessageId,
+            text: getCombineStreamText(answerText),
+            role: 'assistant',
+            conversationId: lastContext?.conversationId,
+            parentMessageId: lastContext?.parentMessageId,
+            detail: undefined,
+          })
+        }
+        else if (part?.type === 'error') {
+          globalThis.console.error('[Stream Error Part]', part.error)
+          throw part.error
+        }
       }
-      else if (part?.type === 'error') {
-        globalThis.console.error('[Stream Error Part]', part.error)
-        throw part.error
+    }
+    catch (streamError: any) {
+      const parentAborted = !!callSignal?.aborted
+      answerStreamIdle?.stop()
+      if (answerStreamIdle?.signal.aborted && !parentAborted) {
+        const timeoutError: any = new Error(`模型响应超时，${Math.round(searchAnswerIdleTimeoutMs / 1000)}s 内没有新的输出`)
+        timeoutError.code = 'MODEL_STREAM_IDLE_TIMEOUT'
+        try { timeoutError.cause = streamError } catch {}
+        throw timeoutError
       }
+      throw streamError
+    }
+    finally {
+      answerStreamIdle?.stop()
     }
 
     let usageRes: any
