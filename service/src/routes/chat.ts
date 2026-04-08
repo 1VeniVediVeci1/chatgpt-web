@@ -363,7 +363,7 @@ async function runChatJobInBackground(params: {
 
   const FLUSH_INTERVAL_MS = Number(process.env.JOB_FLUSH_MS ?? 800)
   let lastFlushTime = 0
-  let lastFlushedLen = 0
+  let lastFlushedText = ''
 
   try { await updateChatResponsePartial(message._id.toString(), '') } catch {}
 
@@ -377,15 +377,15 @@ async function runChatJobInBackground(params: {
         lastResponse = chat
         if (typeof chat?.text !== 'string') return
 
+        const nextText = chat.text
         const now = Date.now()
-        const len = chat.text.length
+        if (nextText === lastFlushedText) return
         if (now - lastFlushTime < FLUSH_INTERVAL_MS) return
-        if (len <= lastFlushedLen) return
 
         lastFlushTime = now
-        lastFlushedLen = len
+        lastFlushedText = nextText
 
-        void updateChatResponsePartial(message._id.toString(), chat.text).catch(() => {})
+        void updateChatResponsePartial(message._id.toString(), nextText).catch(() => {})
       },
       systemMessage,
       temperature,
