@@ -127,6 +127,40 @@ function estimateTokenCount(messages: Array<{ role: string; content: any }>): nu
   }
 }
 
+type SearchItem = { title: string; url: string; content: string }
+
+function estimateTextTokenCount(text: string): number {
+  const s = String(text ?? '')
+  if (!s) return 0
+  try {
+    const n = textTokens(s, 'gpt-3.5-turbo' as TiktokenModel)
+    return n > 0 ? n : Math.ceil(s.length / 3)
+  }
+  catch {
+    return Math.ceil(s.length / 4)
+  }
+}
+
+function truncateTextByApproxTokens(text: string, maxTokens: number): string {
+  const s = String(text ?? '').trim()
+  if (!s) return ''
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) return s
+
+  const total = estimateTextTokenCount(s)
+  if (total <= maxTokens) return s
+
+  const keepChars = Math.max(64, Math.floor(s.length * (maxTokens / Math.max(1, total))))
+  return `${s.slice(0, keepChars)}...(truncated,tokens≈${total})`
+}
+
+function estimateSearchItemsTokenCount(items: SearchItem[]): number {
+  return estimateTextTokenCount(
+    (items || []).map((it, idx) =>
+      `[${idx + 1}] ${it.title || ''}\n${it.url || ''}\n${it.content || ''}`
+    ).join('\n\n'),
+  )
+}
+
 function mergeAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
   const list = signals.filter(Boolean) as AbortSignal[]
   if (!list.length) return undefined
@@ -206,7 +240,7 @@ type SearchPlan = {
   context_summary?: string
 }
 
-type SearchRound = { query: string; items: Array<{ title: string; url: string; content: string }>; note?: string }
+type SearchRound = { query: string; items: SearchItem[]; note?: string }
 
 type PersistedPlannerMemory = {
   contextSummary: string
@@ -327,6 +361,9 @@ class PlannerTimeoutError extends Error {
 
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
+/**
+ * idle timeout：从最近一次流式输出收到新字开始重新计时
+ */
 function createIdleTimeoutController(params: {
   idleTimeoutMs: number
   parentSignal?: AbortSignal
@@ -493,7 +530,14 @@ function isLikelySdkOrNetworkTimeout(e: any): boolean {
   return false
 }
 
-function buildPlannerProviderOptions(provider: string, modelName: string, globalConfig: any) {
+function buildOpenAIJsonSchemaProviderOptions(params: {
+  provider: string
+  modelName: string
+  globalConfig: any
+  name: string
+  schema: any
+}) {
+  const { provider, modelName, globalConfig, name, schema } = params
   if (!isOpenAILike(provider)) return undefined
 
   const siteCfg = globalConfig?.siteConfig
@@ -510,24 +554,34 @@ function buildPlannerProviderOptions(provider: string, modelName: string, global
   openaiOpts.responseFormat = {
     type: 'json_schema',
     json_schema: {
-      name: 'search_plan',
+      name,
       strict: true,
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          action: { type: 'string', enum: ['search', 'stop'] },
-          query: { type: 'string' },
-          reason: { type: 'string' },
-          selected_ids: { type: 'array', items: { type: 'string' } },
-          context_summary: { type: 'string' },
-        },
-        required: ['action', 'query', 'reason', 'selected_ids', 'context_summary'],
-      },
+      schema,
     },
   }
 
   return { openai: openaiOpts }
+}
+
+function buildPlannerProviderOptions(provider: string, modelName: string, globalConfig: any) {
+  return buildOpenAIJsonSchemaProviderOptions({
+    provider,
+    modelName,
+    globalConfig,
+    name: 'search_plan',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['search', 'stop'] },
+        query: { type: 'string' },
+        reason: { type: 'string' },
+        selected_ids: { type: 'array', items: { type: 'string' } },
+        context_summary: { type: 'string' },
+      },
+      required: ['action', 'query', 'reason', 'selected_ids', 'context_summary'],
+    },
+  })
 }
 
 async function aiGenerateJsonWithTimeoutRetry(params: {
@@ -542,8 +596,8 @@ async function aiGenerateJsonWithTimeoutRetry(params: {
   onValidationRetry?: (info: { attempt: number; timeoutMs: number; nextAttempt: number; nextTimeoutMs: number; reason: string; error: any; rawText: string }) => void
 }): Promise<string> {
   const { model, system, user, parentSignal, onTimeoutRetry, onValidationRetry, validator, providerOptions } = params
-  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [20_000, 30_000, 40_000]).map(n => Number(n)).filter(n => Number.isFinite(n) && n > 0)
-  const timeoutsMs = timeoutsMsRaw.length ? timeoutsMsRaw : [20_000]
+  const timeoutsMsRaw = (params.timeoutsMs?.length ? params.timeoutsMs : [40_000, 60_000, 80_000]).map(n => Number(n)).filter(n => Number.isFinite(n) && n > 0)
+  const timeoutsMs = timeoutsMsRaw.length ? timeoutsMsRaw : [40_000]
   const totalAttempts = timeoutsMs.length
   let lastErr: any
 
@@ -675,9 +729,11 @@ function formatSearchRoundsForPlanner(rounds: SearchRound[]): string {
   if (!rounds.length) return '（无）'
   return rounds.map((r, idx) => {
     const items = (r.items || []).map((it, i) =>
-      `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n  ${String(it.url || '').trim()}\n  内容: ${String(it.content || '').trim()}`
+      `- [${idx + 1}.${i + 1}] ${String(it.title || '').trim()}\n` +
+      `  ${String(it.url || '').trim()}\n` +
+      `  内容: ${truncateTextByApproxTokens(String(it.content || '').trim(), 1500)}`
     ).join('\n\n')
-    const note = r.note ? `\n（注：${truncateForPlanner(r.note, 300)}）` : ''
+    const note = r.note ? `\n（注：${truncateForPlanner(r.note, 500)}）` : ''
     return `### 第${idx + 1}轮 query="${truncateForPlanner(r.query, 120)}"\n${items || '（无结果）'}${note}`
   }).join('\n\n')
 }
@@ -724,6 +780,425 @@ function fallbackSearchPlan(params: {
     reason: errBase,
     selected_ids,
     context_summary: summaryBase,
+  }
+}
+
+type IndexedSearchItem = SearchItem & {
+  index: number
+  approxTokens: number
+}
+
+type SearchJudgeChunkDecision = {
+  selected_indexes: number[]
+  summary: string
+  reason: string
+}
+
+function splitSearchItemsIntoChunks(params: {
+  items: SearchItem[]
+  maxItemsPerChunk: number
+  maxChunkTokens: number
+  perItemMaxTokens: number
+}): Array<{
+  items: IndexedSearchItem[]
+  approxTokens: number
+  startIndex: number
+  endIndex: number
+}> {
+  const { items, maxItemsPerChunk, maxChunkTokens, perItemMaxTokens } = params
+  const chunks: Array<{
+    items: IndexedSearchItem[]
+    approxTokens: number
+    startIndex: number
+    endIndex: number
+  }> = []
+
+  let current: IndexedSearchItem[] = []
+  let currentTokens = 0
+
+  const flush = () => {
+    if (!current.length) return
+    chunks.push({
+      items: current,
+      approxTokens: currentTokens,
+      startIndex: current[0].index,
+      endIndex: current[current.length - 1].index,
+    })
+    current = []
+    currentTokens = 0
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const raw = items[i]
+    const normalized: SearchItem = {
+      title: String(raw?.title || ''),
+      url: String(raw?.url || ''),
+      content: truncateTextByApproxTokens(
+        removeImagesFromText(String(raw?.content || '')),
+        perItemMaxTokens,
+      ),
+    }
+
+    const approxTokens = estimateTextTokenCount(
+      `${normalized.title}\n${normalized.url}\n${normalized.content}`,
+    ) + 40
+
+    const entry: IndexedSearchItem = {
+      index: i + 1,
+      approxTokens,
+      ...normalized,
+    }
+
+    const shouldFlushFirst = current.length > 0 && (
+      current.length >= maxItemsPerChunk ||
+      currentTokens + approxTokens > maxChunkTokens
+    )
+
+    if (shouldFlushFirst) flush()
+
+    current.push(entry)
+    currentTokens += approxTokens
+
+    if (current.length >= maxItemsPerChunk || currentTokens >= maxChunkTokens) {
+      flush()
+    }
+  }
+
+  flush()
+  return chunks
+}
+
+function buildSearchChunkJudgeProviderOptions(provider: string, modelName: string, globalConfig: any) {
+  return buildOpenAIJsonSchemaProviderOptions({
+    provider,
+    modelName,
+    globalConfig,
+    name: 'search_chunk_selection',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        selected_indexes: {
+          type: 'array',
+          items: { type: 'integer' },
+        },
+        summary: { type: 'string' },
+        reason: { type: 'string' },
+      },
+      required: ['selected_indexes', 'summary', 'reason'],
+    },
+  })
+}
+
+function formatSearchItemsForChunkJudge(items: IndexedSearchItem[]): string {
+  return items.map((it) => [
+    `[${it.index}] ${truncateForPlanner(it.title, 180)}`,
+    `URL: ${truncateForPlanner(it.url, 260)}`,
+    `内容: ${it.content}`,
+  ].join('\n')).join('\n\n')
+}
+
+function normalizeSearchChunkDecision(parsed: any, allowedIndexes: number[]): SearchJudgeChunkDecision {
+  const allowed = new Set(allowedIndexes)
+  const seen = new Set<number>()
+  const selected_indexes: number[] = []
+
+  if (Array.isArray(parsed?.selected_indexes)) {
+    for (const x of parsed.selected_indexes) {
+      const n = Number(x)
+      if (!Number.isInteger(n) || !allowed.has(n) || seen.has(n)) continue
+      seen.add(n)
+      selected_indexes.push(n)
+    }
+  }
+
+  return {
+    selected_indexes,
+    summary: typeof parsed?.summary === 'string' ? parsed.summary.trim() : '',
+    reason: typeof parsed?.reason === 'string' ? parsed.reason.trim() : '',
+  }
+}
+
+async function judgeSearchItemsChunk(params: {
+  plannerModel: any
+  plannerProvider?: string
+  plannerModelName?: string
+  globalConfig?: any
+  userQuestion: string
+  roundQuery: string
+  contextSummary?: string | null
+  items: IndexedSearchItem[]
+  date: string
+  abortSignal?: AbortSignal
+  timeoutScheduleMs?: number[]
+}): Promise<SearchJudgeChunkDecision> {
+  const {
+    plannerModel,
+    plannerProvider = '',
+    plannerModelName = '',
+    globalConfig,
+    userQuestion,
+    roundQuery,
+    contextSummary,
+    items,
+    date,
+    abortSignal,
+    timeoutScheduleMs,
+  } = params
+
+  const allowedIndexes = items.map(it => it.index)
+
+  const system = [
+    '你是联网搜索结果预筛选器。',
+    `当前时间：${date}`,
+    '你会收到同一轮搜索返回的一组结果。',
+    '请筛选出“可能对最终回答或后续搜索判断有帮助”的结果。',
+    '宁可适当多保留，也不要误删潜在有价值的信息。',
+    '只输出 JSON 对象，不要输出 Markdown，不要解释。',
+    '',
+    'JSON 格式：',
+    '{',
+    '  "selected_indexes": number[],',
+    '  "summary": string,',
+    '  "reason": string',
+    '}',
+  ].join('\n')
+
+  const user = [
+    '【用户问题】',
+    userQuestion,
+    '',
+    contextSummary ? `【上下文总结】\n${truncateTextByApproxTokens(contextSummary, 1200)}` : '',
+    `【当前搜索词】\n${roundQuery}`,
+    '',
+    '【本分组搜索结果】',
+    formatSearchItemsForChunkJudge(items),
+    '',
+    `请从以上编号中选择值得保留的结果，编号范围仅限：${allowedIndexes.join(', ')}`,
+    '如果全部都没有价值，可以返回空数组。',
+    '请直接输出 JSON。',
+  ].filter(Boolean).join('\n')
+
+  const rawText = await aiGenerateJsonWithTimeoutRetry({
+    model: plannerModel,
+    system,
+    user,
+    timeoutsMs: timeoutScheduleMs?.length ? timeoutScheduleMs : [20_000, 30_000, 40_000],
+    parentSignal: abortSignal,
+    providerOptions: buildSearchChunkJudgeProviderOptions(plannerProvider, plannerModelName, globalConfig),
+    validator: async (text) => {
+      const parsed = safeParseJsonFromText(text)
+      if (!parsed) {
+        const err: any = new Error('JSON parsing failed')
+        err.rawText = text
+        throw err
+      }
+      if (!Array.isArray(parsed.selected_indexes)) {
+        const err: any = new Error('Invalid JSON: missing "selected_indexes" field')
+        err.rawText = text
+        throw err
+      }
+    },
+  })
+
+  const parsed = safeParseJsonFromText(rawText)
+  if (!parsed) {
+    return {
+      selected_indexes: allowedIndexes,
+      summary: '',
+      reason: '解析失败，保留本组全部结果。',
+    }
+  }
+
+  return normalizeSearchChunkDecision(parsed, allowedIndexes)
+}
+
+async function reduceSearchItemsForPlanner(params: {
+  plannerModel: any
+  plannerProvider?: string
+  plannerModelName?: string
+  globalConfig?: any
+  userQuestion: string
+  roundQuery: string
+  items: SearchItem[]
+  contextSummary?: string | null
+  date: string
+  abortSignal?: AbortSignal
+  timeoutScheduleMs?: number[]
+}): Promise<{
+  items: SearchItem[]
+  note?: string
+  originalTokenCount: number
+  reducedTokenCount: number
+  chunked: boolean
+  chunkCount: number
+}> {
+  const {
+    plannerModel,
+    plannerProvider,
+    plannerModelName,
+    globalConfig,
+    userQuestion,
+    roundQuery,
+    items,
+    contextSummary,
+    date,
+    abortSignal,
+    timeoutScheduleMs,
+  } = params
+
+  const maxInputTokens = Math.max(
+    4096,
+    Number(
+      globalConfig?.siteConfig?.webSearchPlannerMaxInputTokens
+      ?? process.env.WEB_SEARCH_PLANNER_MAX_INPUT_TOKENS
+      ?? 500000,
+    ),
+  )
+
+  const maxItemsPerChunk = Math.max(
+    1,
+    Number(
+      globalConfig?.siteConfig?.webSearchPlannerChunkSize
+      ?? process.env.WEB_SEARCH_PLANNER_CHUNK_SIZE
+      ?? 5,
+    ),
+  )
+
+  const perItemMaxTokens = Math.max(
+    256,
+    Number(
+      globalConfig?.siteConfig?.webSearchPlannerItemMaxTokens
+      ?? process.env.WEB_SEARCH_PLANNER_ITEM_MAX_TOKENS
+      ?? 30000,
+    ),
+  )
+
+  const reserveTokens = Math.max(
+    512,
+    Number(
+      globalConfig?.siteConfig?.webSearchPlannerReservedTokens
+      ?? process.env.WEB_SEARCH_PLANNER_RESERVED_TOKENS
+      ?? 6000,
+    ),
+  )
+
+  const effectiveBudget = Math.max(1024, maxInputTokens - reserveTokens)
+
+  const normalizedItems = (items || []).map((it) => ({
+    title: String(it?.title || ''),
+    url: String(it?.url || ''),
+    content: removeImagesFromText(String(it?.content || '')),
+  }))
+
+  const originalTokenCount = estimateSearchItemsTokenCount(normalizedItems)
+
+  if (!normalizedItems.length) {
+    return {
+      items: [],
+      note: undefined,
+      originalTokenCount: 0,
+      reducedTokenCount: 0,
+      chunked: false,
+      chunkCount: 0,
+    }
+  }
+
+  if (originalTokenCount <= effectiveBudget) {
+    const lightlyTrimmed = normalizedItems.map((it) => ({
+      ...it,
+      content: truncateTextByApproxTokens(it.content, perItemMaxTokens),
+    }))
+
+    return {
+      items: lightlyTrimmed,
+      note: undefined,
+      originalTokenCount,
+      reducedTokenCount: estimateSearchItemsTokenCount(lightlyTrimmed),
+      chunked: false,
+      chunkCount: 1,
+    }
+  }
+
+  const chunks = splitSearchItemsIntoChunks({
+    items: normalizedItems,
+    maxItemsPerChunk,
+    maxChunkTokens: Math.max(1024, effectiveBudget),
+    perItemMaxTokens,
+  })
+
+  const kept: SearchItem[] = []
+  const summaries: string[] = []
+
+  for (const chunk of chunks) {
+    try {
+      const decision = await judgeSearchItemsChunk({
+        plannerModel,
+        plannerProvider,
+        plannerModelName,
+        globalConfig,
+        userQuestion,
+        roundQuery,
+        contextSummary,
+        items: chunk.items,
+        date,
+        abortSignal,
+        timeoutScheduleMs,
+      })
+
+      const selectedSet = new Set(decision.selected_indexes)
+
+      for (const it of chunk.items) {
+        if (selectedSet.has(it.index)) {
+          kept.push({
+            title: it.title,
+            url: it.url,
+            content: it.content,
+          })
+        }
+      }
+
+      summaries.push(
+        `分组 ${chunk.startIndex}-${chunk.endIndex}：保留 ${decision.selected_indexes.length}/${chunk.items.length} 条。` +
+        `${decision.summary ? ` 摘要：${truncateForPlanner(decision.summary, 180)}` : ''}`,
+      )
+    }
+    catch (e) {
+      console.error('[SearchChunkJudge Error]', summarizeAnyError(e))
+      // 保守降级：整组保留，避免误删
+      for (const it of chunk.items) {
+        kept.push({
+          title: it.title,
+          url: it.url,
+          content: it.content,
+        })
+      }
+      summaries.push(`分组 ${chunk.startIndex}-${chunk.endIndex}：筛选失败，已保留整组。`)
+    }
+  }
+
+  const finalItems = kept.length
+    ? kept
+    : chunks.flatMap(c =>
+        c.items.slice(0, 1).map(it => ({
+          title: it.title,
+          url: it.url,
+          content: it.content,
+        })),
+      )
+
+  const reducedTokenCount = estimateSearchItemsTokenCount(finalItems)
+
+  return {
+    items: finalItems,
+    note: truncateForPlanner(
+      `搜索结果内容约 ${originalTokenCount} tokens，超过规划器预算 ${effectiveBudget}（总阈值 ${maxInputTokens}，预留 ${reserveTokens}）。已按 ${chunks.length} 组（默认每组最多 ${maxItemsPerChunk} 条）交给 LLM 预筛选。保留 ${finalItems.length}/${normalizedItems.length} 条。${summaries.join(' ')}`,
+      900,
+    ),
+    originalTokenCount,
+    reducedTokenCount,
+    chunked: true,
+    chunkCount: chunks.length,
   }
 }
 
@@ -1003,7 +1478,7 @@ async function runIterativeWebSearch(params: {
         date,
         timeoutScheduleMs: schedule,
         onTimeoutRetry: ({ attempt, timeoutMs, nextAttempt, reason }) => {
-          onProgress?.(`⚠️ 规划器第 ${attempt} 次请求失败 >${Math.round(timeoutMs / 1000)}s，正在重试第 ${nextAttempt} 次...\n   原因：${reason}`)
+          onProgress?.(`⚠️ 规划器第 ${attempt} 次请求失败，空闲超过 ${Math.round(timeoutMs / 1000)}s，正在重试第 ${nextAttempt} 次...\n   原因：${reason}`)
         },
         onValidationRetry: ({ attempt, nextAttempt, rawText }) => {
           onProgress?.(`⚠️ 规划器第 ${attempt} 次返回的不是合法 JSON，正在重试第 ${nextAttempt} 次...\n   返回片段：${truncateForPlanner(rawText, 180) || '（空）'}`)
@@ -1047,13 +1522,43 @@ async function runIterativeWebSearch(params: {
     onProgress?.(`🔍 正在搜索：「${q}」\n   🧠 ${reasonText}`)
     try {
       const r = await webSearch(q, { maxResults, signal: abortSignal, provider, searxngApiUrl, tavilyApiKey })
-      const items = (r.results || []).slice(0, maxResults).map(it => ({
+
+      const rawItems = (r.results || []).slice(0, maxResults).map(it => ({
         title: String(it.title || ''),
         url: String(it.url || ''),
         content: removeImagesFromText(String(it.content || '')),
       }))
-      rounds.push({ query: q, items })
-      onProgress?.(`📄 搜索成功，获取到 ${items.length} 个页面，正在判断是否需要进一步搜索...`)
+
+      const reduced = await reduceSearchItemsForPlanner({
+        plannerModel,
+        plannerProvider,
+        plannerModelName,
+        globalConfig,
+        userQuestion,
+        roundQuery: q,
+        items: rawItems,
+        contextSummary: currentContextSummary,
+        date,
+        abortSignal,
+        timeoutScheduleMs: schedule,
+      })
+
+      rounds.push({
+        query: q,
+        items: reduced.items,
+        note: reduced.note,
+      })
+
+      if (reduced.chunked) {
+        onProgress?.(
+          `📄 搜索成功，原始 ${rawItems.length} 个页面，内容约 ${reduced.originalTokenCount} tokens；已按 ${reduced.chunkCount} 组交给 LLM 预筛选，保留 ${reduced.items.length} 条，正在判断是否需要进一步搜索...`,
+        )
+      }
+      else {
+        onProgress?.(
+          `📄 搜索成功，获取到 ${reduced.items.length} 个页面，内容约 ${reduced.originalTokenCount} tokens，正在判断是否需要进一步搜索...`,
+        )
+      }
     }
     catch (e: any) {
       const errMsg = e?.message ?? String(e)
@@ -1080,7 +1585,7 @@ function formatAggregatedSearchForAnswer(rounds: SearchRound[]): string {
       n++
       lines.push(`[${n}] ${String(it.title || '').trim()}`)
       lines.push(`URL: ${String(it.url || '').trim()}`)
-      lines.push(`内容: ${String(it.content || '').trim()}`)
+      lines.push(`内容: ${truncateTextByApproxTokens(String(it.content || '').trim(), 3000)}`)
       lines.push('')
       refLines.push(`[${n}] ${String(it.title || '').trim()} - ${String(it.url || '').trim()}`)
     }
@@ -1158,7 +1663,9 @@ type DataUrlCache = Map<string, string>
 function parseDataUrlImage(dataUrl: string): { mime: string; base64: string } | null {
   const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(dataUrl)
   if (!m) return null
-  return { mime: m[1] || 'image/png', base64: (m[2] || '').replace(/\s+/g, '') || null } as any
+  const base64 = (m[2] || '').replace(/\s+/g, '')
+  if (!base64) return null
+  return { mime: m[1] || 'image/png', base64 }
 }
 function mimeToExt(mime: string): string {
   const t = (mime || '').toLowerCase()
